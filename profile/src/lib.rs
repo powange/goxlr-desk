@@ -1,6 +1,7 @@
 use enum_map::Enum;
 use strum::{Display, EnumIter, EnumProperty};
 
+pub mod atomic;
 pub mod components;
 pub mod error;
 pub mod mic_profile;

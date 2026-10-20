@@ -3,17 +3,36 @@ use crate::profile::DEFAULT_PROFILE_NAME;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use goxlr_ipc::{FirmwareSource, GoXLRCommand, LogLevel};
+use goxlr_profile_loader::atomic::atomic_write;
 use goxlr_types::VodMode;
 use goxlr_types::VodMode::Routable;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::{File, create_dir_all};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+
+// Settings are read before the logger exists (it's configured from them), so a problem found
+// while reading is kept here and logged once logging is set up.
+static LOAD_WARNING: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn take_load_warning() -> Option<String> {
+    LOAD_WARNING.lock().ok()?.take()
+}
+
+/// 'settings.json' + 'bak' -> 'settings.json.bak'
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
 
 #[derive(Debug, Clone)]
 pub struct SettingsHandle {
@@ -730,17 +749,39 @@ impl Settings {
 
                 match settings {
                     Ok(settings) => Ok(Some(settings)),
-                    Err(_) => {
-                        // Something's gone wrong loading the settings, rather than immediately
-                        // exiting, we'll try to backup the original file, and reload the defaults.
-                        let mut backup = PathBuf::from(path);
-                        backup.set_extension(".failed");
+                    Err(error) => {
+                        // Something's gone wrong loading the settings, keep a copy of the broken
+                        // file (each failure gets its own), then use the last good copy if there
+                        // is one, otherwise the defaults.
+                        let stamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|time| time.as_secs())
+                            .unwrap_or_default();
+                        let failed = with_suffix(path, &format!("failed-{stamp}"));
+                        let kept = match fs::copy(path, &failed) {
+                            Ok(_) => format!("a copy was kept at {}", failed.to_string_lossy()),
+                            Err(e) => format!("it could not be copied ({e})"),
+                        };
 
-                        let copy_result = fs::copy(path, backup);
-                        println!("{copy_result:?}");
+                        let backup = Settings::read_backup(path);
+                        let loaded = if backup.is_some() {
+                            "loaded the last good copy"
+                        } else {
+                            "loaded the defaults"
+                        };
 
-                        println!("Error Loading configuration, loading defaults.");
-                        Ok(None)
+                        let message = format!(
+                            "Unable to read the settings at {} ({}), {}, {}.",
+                            path.to_string_lossy(),
+                            error,
+                            kept,
+                            loaded
+                        );
+                        eprintln!("{message}");
+                        if let Ok(mut warning) = LOAD_WARNING.lock() {
+                            *warning = Some(message);
+                        }
+                        Ok(backup)
                     }
                 }
             }
@@ -764,31 +805,21 @@ impl Settings {
             ))?;
         }
 
-        let mut tmp_file_name = path.to_path_buf();
-        tmp_file_name.set_extension("tmp");
-        if tmp_file_name.exists() {
-            debug!("Temporary file already exists? Removing.");
-            fs::remove_file(&tmp_file_name)?;
-        }
+        let write = |file: &File| Ok(serde_json::to_writer_pretty(file, self)?);
+        atomic_write(path, write)?;
 
-        debug!("Creating Temporary Save File: {:?}", tmp_file_name);
-        let temp_file = File::create(&tmp_file_name)?;
-        serde_json::to_writer_pretty(&temp_file, self)?;
-        temp_file.sync_all()?;
-        drop(temp_file);
-
-        debug!("Save Complete and synced, renaming to {:?}", path);
-        if path.exists() {
-            debug!("Target exists, removing..");
-            fs::remove_file(path).unwrap_or_else(|e| {
-                warn!("Error Removing File: {}", e);
-            });
+        // Keep a copy of these known good settings, used if the main file ever can't be read.
+        if let Err(e) = atomic_write(with_suffix(path, "bak"), write) {
+            warn!("Unable to write settings backup: {}", e);
         }
-        debug!("Renaming {:?} to {:?}", tmp_file_name, path);
-        fs::rename(tmp_file_name, path)?;
 
         debug!("Settings Saved.");
         Ok(())
+    }
+
+    fn read_backup(path: &Path) -> Option<Settings> {
+        let reader = File::open(with_suffix(path, "bak")).ok()?;
+        serde_json::from_reader(reader).ok()
     }
 }
 
@@ -845,5 +876,41 @@ impl Default for DeviceSettings {
             sleep_commands: vec![],
             wake_commands: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_settings_fall_back_to_last_good_copy() {
+        let dir = std::env::temp_dir().join(format!("goxlr-settings-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let settings: Settings = serde_json::from_str(r#"{"tts_enabled": true}"#).unwrap();
+        settings.write(&path).unwrap();
+        assert!(with_suffix(&path, "bak").exists());
+
+        // The main file gets corrupted (crash, disk issue..), the backup is used and the broken
+        // file is kept next to it.
+        fs::write(&path, b"{ not json").unwrap();
+        let loaded = Settings::read(&path)
+            .unwrap()
+            .expect("backup should be loaded");
+        assert_eq!(loaded.tts_enabled, Some(true));
+        assert!(take_load_warning().is_some());
+        let kept = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains(".failed-"));
+        assert!(kept);
+
+        // Without a usable backup, the defaults are used.
+        fs::remove_file(with_suffix(&path, "bak")).unwrap();
+        assert!(Settings::read(&path).unwrap().is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

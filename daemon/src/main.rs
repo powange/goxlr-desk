@@ -207,6 +207,11 @@ async fn run_utility() -> Result<()> {
     // Enable the PANIC logger..
     log_panics::init();
 
+    // Report anything that went wrong while reading the settings (before logging was set up).
+    if let Some(warning) = settings::take_load_warning() {
+        warn!("{}", warning);
+    }
+
     if !timezone_calculated {
         warn!("Unable to calculate timezone, using UTC for log timestamps");
     }

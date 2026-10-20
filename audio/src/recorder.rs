@@ -246,11 +246,15 @@ impl BufferedRecorder {
 
         let producer_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-        // Add the producer to our handler
+        // Add the producer to our handler, the guard removes it however this function returns.
         self.add_producer(RingProducer {
             id: producer_id,
             producer: ring_buf_producer,
         });
+        let _producer = ProducerGuard {
+            recorder: self,
+            id: producer_id,
+        };
 
         // Grab the contents of the buffer, and push it into a simple vec
         let pre_samples = self.get_samples_from_buffer();
@@ -313,9 +317,8 @@ impl BufferedRecorder {
                 ) {
                     Ok(result) => writing = result,
                     Err(error) => {
-                        // Something's gone wrong, we need to fail safe..
+                        // Something's gone wrong, stop here, but keep what was already recorded.
                         error!("Error Writing Samples: {}", error);
-                        writing = false;
                         state.stop.store(true, Ordering::Relaxed);
                     }
                 }
@@ -361,7 +364,6 @@ impl BufferedRecorder {
             }
         }
 
-        self.del_producer(producer_id);
         Ok(())
     }
 
@@ -396,8 +398,7 @@ impl BufferedRecorder {
                 let _ = ebu_rec_r128.add_frames_f32(slice);
 
                 for sample in slice {
-                    // Multiply the sample by 2^23, to convert to a pseudo I24
-                    writer.write_sample((*sample * 8388608.0) as i32)?;
+                    writer.write_sample(to_i24(*sample))?;
                 }
             }
         }
@@ -452,6 +453,24 @@ impl BufferedRecorder {
     }
 }
 
+/// Scales a float sample to 24bit. Float input can go past full scale (1.0), which a 24bit sample
+/// can't hold, so it's clipped rather than failing (and discarding) the whole recording.
+fn to_i24(sample: f32) -> i32 {
+    (sample.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32
+}
+
+/// Removes a recording's producer from the recorder when the recording ends, on every path.
+struct ProducerGuard<'a> {
+    recorder: &'a BufferedRecorder,
+    id: u32,
+}
+
+impl Drop for ProducerGuard<'_> {
+    fn drop(&mut self) {
+        self.recorder.del_producer(self.id);
+    }
+}
+
 impl Drop for BufferedRecorder {
     fn drop(&mut self) {
         debug!("Recorder Dropped, stopping thread..");
@@ -459,5 +478,30 @@ impl Drop for BufferedRecorder {
         // We probably don't need to do this, as drop will only be called after the main
         // thread has terminated, but safety first :)
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_scale_samples_can_be_written() {
+        let path = std::env::temp_dir().join(format!("goxlr-test-{}.wav", std::process::id()));
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in [0.0, 0.5, 1.0, -1.0, 1.7, -3.0] {
+            writer.write_sample(to_i24(sample)).unwrap();
+        }
+        writer.finalize().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(to_i24(1.0), 8_388_607);
+        assert_eq!(to_i24(-1.0), -8_388_607);
     }
 }
