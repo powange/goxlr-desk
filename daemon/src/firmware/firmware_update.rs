@@ -76,8 +76,10 @@ pub async fn start_firmware_update(settings: FirmwareUpdateSettings) {
 
     // So we go either one of two ways here, if there's a problem, we set the update as 'Paused' with
     // the file_info, and the UI can then send a 'Continue' if the user is happy with the info, otherwise
-    // we just go with the update.
-    if !settings.force && (file_info.version <= device.current_firmware) {
+    // we just go with the update. A file provided by the user (rather than downloaded from the
+    // official source) always needs that confirmation, so a request can't silently flash one.
+    let user_file = settings.file.is_some();
+    if !settings.force && (user_file || file_info.version <= device.current_firmware) {
         warn!(
             "Pausing, File: {}, Current: {}",
             file_info.version, device.current_firmware

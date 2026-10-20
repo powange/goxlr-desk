@@ -2818,7 +2818,7 @@ impl<'a> Device<'a> {
                                 self.mic_profile = profile;
 
                                 debug!("Overwriting existing corrupt profile..");
-                                self.profile.save(&path, true)?;
+                                self.mic_profile.save(&path, true)?;
                             }
                             Err(e) => {
                                 bail!("Failed to Load backup profile: {}", e);

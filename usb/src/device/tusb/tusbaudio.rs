@@ -4,6 +4,7 @@ use std::ffi::CStr;
 use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
@@ -431,8 +432,10 @@ impl TUSBAudio<'_> {
         }
 
         // Assign useful variables for later :p
-        let buffer = vec![0_u8; 1024];
-        let buffer_ptr = &buffer as *const _ as *mut u8;
+        // The driver writes into the Vec's heap data, so pass that pointer (not the Vec itself).
+        let mut buffer = vec![0_u8; 1024];
+        let buffer_len = buffer.len();
+        let buffer_ptr = buffer.as_mut_ptr();
 
         let mut response_len: u32 = 0;
         let len_ptr: *mut u32 = &mut response_len;
@@ -453,7 +456,13 @@ impl TUSBAudio<'_> {
                 // Check the Queued Events :)
                 loop {
                     let event_result = unsafe {
-                        (self.read_device_notification)(handle, &a, buffer_ptr, 1024, len_ptr)
+                        (self.read_device_notification)(
+                            handle,
+                            &a,
+                            buffer_ptr,
+                            buffer_len as u32,
+                            len_ptr,
+                        )
                     };
                     if event_result != 0 {
                         // We've either hit the end of the list, or something's gone wrong, break
@@ -464,8 +473,10 @@ impl TUSBAudio<'_> {
                         break;
                     }
 
+                    // Never trust the driver's length beyond the size of our buffer.
+                    let read_len = (response_len as usize).min(buffer_len);
                     let event_response =
-                        unsafe { std::slice::from_raw_parts(buffer_ptr, response_len as usize) };
+                        unsafe { std::slice::from_raw_parts(buffer_ptr, read_len) };
 
                     // Generally caused by an 'audio end' event.
                     if event_response.is_empty() {
@@ -601,16 +612,17 @@ impl TUSBAudio<'_> {
         }
         debug!("Spawning Win32 PnP Handler Thread");
 
-        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<bool>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
 
         thread::spawn(move || -> Result<()> {
             let mut ready_sender = Some(ready_tx);
 
             loop {
-                let length = 0_u64;
+                // The API writes the required size (a ULONG) into this value.
+                let mut length: u32 = 0;
                 let result = unsafe {
                     CM_Get_Device_Interface_List_SizeA(
-                        &length as *const _ as *mut _,
+                        &mut length,
                         &GOXLR_GUID as *const _,
                         None,
                         CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
@@ -654,13 +666,22 @@ impl TUSBAudio<'_> {
             }
         });
 
-        // Block until the 'ready' message has been sent..
-        while ready_rx.try_recv().is_err() {
-            sleep(Duration::from_millis(5));
-        }
-        debug!("Win32 PnP Handler Started");
-
+        // The thread is running, so mark it as spawned and release the lock before waiting, this
+        // prevents other callers from being blocked while we wait for the first device scan.
         *spawned = true;
+        drop(spawned);
+
+        // Wait for the first scan to complete, but never forever..
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(_) => debug!("Win32 PnP Handler Started"),
+            Err(RecvTimeoutError::Timeout) => {
+                warn!("Win32 PnP Handler has not completed its first scan yet, continuing..");
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                *self.pnp_thread_running.lock().unwrap() = false;
+                bail!("Win32 PnP Handler Thread stopped before it was ready");
+            }
+        }
         Ok(())
     }
 

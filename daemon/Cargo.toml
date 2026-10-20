@@ -20,6 +20,9 @@ goxlr-audio = { path = "../audio" }
 goxlr-profile-loader = { path = "../profile" }
 goxlr-scribbles = { path = "../scribbles" }
 
+# Used to know the machine's hostname (HTTP Host checks), and for process checks under Windows
+sysinfo = { workspace = true }
+
 # Common Workspace
 log = { workspace = true }
 anyhow = { workspace = true }
@@ -95,7 +98,6 @@ zbus = "5.11.0"
 # Under Windows and MacOS, we use tao's tray feature
 [target.'cfg(target_os = "windows")'.dependencies]
 image = { workspace = true }
-sysinfo = { workspace = true }
 winrt-toast-reborn = "0.3.8"
 mslnk = "0.1.8"
 dunce = "1.0.5"
