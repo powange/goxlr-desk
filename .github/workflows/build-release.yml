@@ -78,10 +78,41 @@ jobs:
         run: "cargo build --manifest-path=goxlr-utility-ui/src-tauri/Cargo.toml --target-dir=goxlr-utility/target --release"
 
       # Prepare NSIS
+      # NSIS is installed here rather than with repolevedavaj/install-nsis: its fixed SourceForge
+      # mirror returns a page instead of the installer on the GitHub runners. The installer is
+      # checked against its SHA-256 before it runs.
       - name: Install NSIS
-        uses: repolevedavaj/install-nsis@265e893c16602d8ccfb0a9ca44173b084078917c # v1.0.3
-        with:
-          nsis-version: '3.11'
+        shell: pwsh
+        env:
+          NSIS_VERSION: '3.11'
+          NSIS_SHA256: '38d49f8fe09b1c332b01d0940e57b7258f4447733643273a01c59959ad9d3b0a'
+        run: |
+          $installer = "$env:RUNNER_TEMP\nsis-setup.exe"
+          $url = "https://downloads.sourceforge.net/project/nsis/NSIS%203/$env:NSIS_VERSION/nsis-$env:NSIS_VERSION-setup.exe"
+          $ok = $false
+          for ($attempt = 1; $attempt -le 5 -and -not $ok; $attempt++) {
+            # A wget user agent gets the file directly instead of SourceForge's download page.
+            curl.exe --location --fail --silent --show-error --retry 3 --user-agent "Wget/1.21" --output $installer $url
+            if ($LASTEXITCODE -eq 0) {
+              $ok = (Get-FileHash $installer -Algorithm SHA256).Hash -eq $env:NSIS_SHA256
+            }
+            if (-not $ok) {
+              Write-Host "Attempt $attempt didn't return the expected installer, retrying.."
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $ok) { throw "Unable to download NSIS $env:NSIS_VERSION" }
+
+          $process = Start-Process $installer -ArgumentList "/S" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS installer failed with exit code $($process.ExitCode)" }
+          "C:\Program Files (x86)\NSIS\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          # The EnVar plugin, previously installed by the same action
+          $plugin = "$env:RUNNER_TEMP\EnVar_plugin.zip"
+          curl.exe --location --fail --silent --show-error --retry 3 --output $plugin https://nsis.sourceforge.io/mediawiki/images/7/7f/EnVar_plugin.zip
+          if ($LASTEXITCODE -ne 0) { throw "Unable to download the EnVar plugin" }
+          Expand-Archive $plugin -DestinationPath "C:\Program Files (x86)\NSIS" -Force
 
       - name: "Preparing NSIS"
         run: mkdir -p ${{ github.workspace }}/NSIS_Plugins/x86-unicode/
