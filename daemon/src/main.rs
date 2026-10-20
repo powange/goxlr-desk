@@ -49,6 +49,7 @@ mod mic_profile;
 mod platform;
 mod primary_worker;
 mod profile;
+mod sample_trash;
 mod servers;
 mod settings;
 mod shutdown;

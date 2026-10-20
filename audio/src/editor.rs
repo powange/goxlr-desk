@@ -144,6 +144,21 @@ impl DecodedAudio {
         Ok(())
     }
 
+    /// Changes the volume so the loudest peak is at `peak_db` (dBFS, eg. -1.0).
+    pub fn normalize(&mut self, peak_db: f32) {
+        let peak = self
+            .samples
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        if peak <= f32::EPSILON {
+            return;
+        }
+        let gain = 10_f32.powf(peak_db / 20.0) / peak;
+        for sample in &mut self.samples {
+            *sample *= gain;
+        }
+    }
+
     /// Writes the audio as a WAV file, keeping the source's bit depth when it was integer PCM
     /// (24 bit otherwise).
     pub fn write_wav<W: Write + Seek>(&self, writer: W) -> Result<()> {
@@ -163,6 +178,21 @@ impl DecodedAudio {
         writer.finalize()?;
         Ok(())
     }
+}
+
+/// Reads a file's length from its headers, without decoding it (None when the format doesn't
+/// say, as with some MP3 files).
+pub fn probe_duration(path: &Path) -> Option<f64> {
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(extension);
+    }
+    let stream = MediaSourceStream::new(Box::new(File::open(path).ok()?), Default::default());
+    let probe = get_probe()
+        .format(&hint, stream, &Default::default(), &Default::default())
+        .ok()?;
+    let params = &probe.format.default_track()?.codec_params;
+    Some(params.n_frames? as f64 / params.sample_rate? as f64)
 }
 
 #[cfg(test)]
@@ -192,6 +222,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("goxlr-edit-{}.wav", std::process::id()));
         test_file(&path);
 
+        assert!((probe_duration(&path).unwrap() - 1.0).abs() < 0.001);
         let mut audio = DecodedAudio::decode(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
@@ -216,6 +247,14 @@ mod tests {
         let reader = hound::WavReader::new(Cursor::new(written.into_inner())).unwrap();
         assert_eq!(reader.spec().bits_per_sample, 16);
         assert_eq!(reader.len(), 3200 * 2);
+
+        // Normalizing brings the loudest sample to the requested level
+        audio.normalize(-6.0);
+        let peak = audio
+            .samples
+            .iter()
+            .fold(0.0_f32, |peak, s| peak.max(s.abs()));
+        assert!((peak - 10_f32.powf(-6.0 / 20.0)).abs() < 0.001);
 
         // Removing everything is refused
         assert!(audio.remove_ranges(&[(0.0, 10.0)]).is_err());

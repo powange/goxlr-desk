@@ -32,7 +32,7 @@ use tokio::sync::oneshot::Sender;
 use tokio::sync::{RwLock, oneshot};
 
 use crate::PatchEvent;
-use crate::files::{FilePaths, find_file_in_path};
+use crate::files::{FilePaths, find_file_in_path, import_sample_target};
 use goxlr_ipc::{
     DaemonCommand, DaemonRequest, DaemonResponse, DaemonStatus, GoXLRCommand, HttpSettings,
     Scribble, WebsocketRequest, WebsocketResponse,
@@ -47,6 +47,9 @@ const WEB_CONTENT: Dir = include_dir!("./daemon/web-content/");
 
 // Firmware files are a few megabytes, anything far beyond this isn't a firmware.
 const MAX_FIRMWARE_SIZE: usize = 64 * 1024 * 1024;
+
+// The largest audio file that can be imported as a sample.
+const MAX_SAMPLE_SIZE: usize = 512 * 1024 * 1024;
 
 /// Decides which requests may reach the HTTP server. Browsers let any web page send requests to
 /// localhost (WebSockets and form posts aren't blocked by CORS), so we check the Host and Origin
@@ -285,6 +288,7 @@ pub async fn spawn_http_server(
             .service(get_scribble)
             .service(get_path)
             .service(upload_firmware)
+            .service(import_samples)
             .default_service(web::to(default))
     })
     // Don't hold up the daemon's shutdown waiting for open connections (such as WebSockets).
@@ -671,6 +675,102 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     }
 
     HttpResponse::NotFound().finish()
+}
+
+/// Imports audio files (multipart, one or more files) into a samples folder, given relative to
+/// the samples directory with '?folder='. Names already used by a sample get a ' (2)' suffix.
+#[post("/files/samples-import")]
+async fn import_samples(
+    query: web::Query<HashMap<String, String>>,
+    mut payload: Multipart,
+    app_data: Data<RwLock<AppData>>,
+) -> HttpResponse {
+    let folder = query.get("folder").cloned().unwrap_or_default();
+    let (base, mut usb_tx) = {
+        let data = app_data.read().await;
+        (data.file_paths.samples.clone(), data.usb_tx.clone())
+    };
+
+    let mut imported = 0;
+    let mut errors = Vec::new();
+    while let Some(field) = payload.next().await {
+        let mut field = match field {
+            Ok(field) => field,
+            Err(e) => {
+                errors.push(format!("Error reading the upload: {e}"));
+                break;
+            }
+        };
+        let file_name = field
+            .content_disposition()
+            .and_then(|disposition| disposition.get_filename())
+            .unwrap_or_default()
+            .to_string();
+
+        let result = match import_sample_target(&base, &folder, &file_name) {
+            Ok(target) => write_imported_sample(&mut field, &target).await,
+            Err(e) => {
+                // Read the rest of this file, so the next one can be read.
+                while let Some(Ok(_)) = field.next().await {}
+                Err(e)
+            }
+        };
+        match result {
+            Ok(()) => imported += 1,
+            Err(e) => errors.push(format!("{file_name}: {e}")),
+        }
+    }
+
+    // Refresh the sample list.
+    if imported > 0 {
+        let _ = handle_packet(
+            DaemonRequest::Daemon(DaemonCommand::ApplySampleChange),
+            &mut usb_tx,
+        )
+        .await;
+    }
+
+    if errors.is_empty() {
+        HttpResponse::Ok().json(DaemonResponse::Ok)
+    } else {
+        HttpResponse::Ok().json(DaemonResponse::Error(errors.join("\n")))
+    }
+}
+
+/// Writes an uploaded file next to its target, then moves it into place.
+async fn write_imported_sample(field: &mut actix_multipart::Field, target: &PathBuf) -> Result<()> {
+    let Some(name) = target.file_name() else {
+        return Err(anyhow!("Invalid file name"));
+    };
+    let temp = target.with_file_name(format!(".{}.import", name.to_string_lossy()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+
+    let mut size = 0;
+    let written: Result<()> = async {
+        while let Some(chunk) = field.next().await {
+            let data = chunk.map_err(|e| anyhow!("Error reading the file: {e}"))?;
+            size += data.len();
+            if size > MAX_SAMPLE_SIZE {
+                return Err(anyhow!("The file is too large"));
+            }
+            file.write_all(&data)?;
+        }
+        file.sync_all()?;
+        if target.exists() {
+            return Err(anyhow!("{} already exists", name.to_string_lossy()));
+        }
+        fs::rename(&temp, target)?;
+        Ok(())
+    }
+    .await;
+
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 #[post("/firmware-upload/{serial}")]

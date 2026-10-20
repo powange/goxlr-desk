@@ -19,9 +19,11 @@ use anyhow::{Context, Result, anyhow, bail};
 // use futures::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 
+use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
 use glob::{Pattern, glob};
 use goxlr_audio::editor::DecodedAudio;
 use goxlr_ipc::PathTypes;
+use goxlr_ipc::SampleEdit;
 use goxlr_profile_loader::atomic::atomic_write;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -344,7 +346,10 @@ fn create_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Resu
 }
 
 /// Lists files with the given extensions below a path, keyed by their path relative to it.
-fn recursive_file_list(path: PathBuf, extensions: Vec<&str>) -> BTreeMap<String, String> {
+pub(crate) fn recursive_file_list(
+    path: PathBuf,
+    extensions: Vec<&str>,
+) -> BTreeMap<String, String> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
     // Escape the directory, so names like '[Bob]' aren't treated as patterns.
@@ -389,7 +394,7 @@ fn collect_folders(base: &Path, directory: &Path, folders: &mut Vec<String>) {
 
 /// Turns a path relative to the samples directory (from a client, '/' or '\\' separated) into
 /// a full path, refusing anything that could point outside of the samples directory.
-fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
+pub(crate) fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = base.to_path_buf();
     let mut parts = 0;
     for part in relative.split(['/', '\\']).filter(|part| !part.is_empty()) {
@@ -504,33 +509,22 @@ pub fn sample_names_at(base: &Path, relative: &str) -> Result<Vec<String>> {
     bail!("{} doesn't exist", relative)
 }
 
-/// Deletes a sample file, or a folder with everything in it. Returns the names of the sample
-/// files that were deleted.
-pub fn delete_sample_path(base: &Path, relative: &str) -> Result<Vec<String>> {
-    let names = sample_names_at(base, relative)?;
-    let path = sample_path(base, relative)?;
-    if path.is_dir() {
-        fs::remove_dir_all(&path).context(format!("Unable to delete {}", relative))?;
-    } else {
-        fs::remove_file(&path).context(format!("Unable to delete {}", relative))?;
-    }
-    Ok(names)
-}
-
-/// Removes parts of a sample (start, end in seconds) and saves the result as WAV, either over
-/// the original file or as a new file named `save_as` next to it. Replacing a file that isn't a
+/// Edits a sample (removes parts, normalizes) and saves the result as WAV, either over the
+/// original file or as a new file named `save_as` next to it. When replacing, the original is
+/// moved to the trash in `backups` first, so it can be restored. Replacing a file that isn't a
 /// WAV gives it a .wav name, which is returned so profiles can follow it.
 pub fn edit_sample_file(
     base: &Path,
+    backups: &Path,
     relative: &str,
-    remove: &[(f64, f64)],
+    edit: &SampleEdit,
     save_as: Option<&str>,
 ) -> Result<Option<RenamedSample>> {
     let source = sample_path(base, relative)?;
     if !source.is_file() || !is_sample_file(&source) {
         bail!("{} isn't a sample file", relative);
     }
-    if remove.is_empty() {
+    if edit.remove.is_empty() && !edit.normalize {
         bail!("There is nothing to change in {}", relative);
     }
 
@@ -574,16 +568,117 @@ pub fn edit_sample_file(
 
     let mut audio =
         DecodedAudio::decode(&source).context(format!("Unable to read {}", relative))?;
-    audio.remove_ranges(remove)?;
-    atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)))
-        .context(format!("Unable to save {}", new_name))?;
+    audio.remove_ranges(&edit.remove)?;
+    if edit.normalize {
+        audio.normalize(-1.0);
+    }
 
-    // Replacing an MP3 / OGG / FLAC wrote a new .wav file, remove the original.
-    if save_as.is_none() && target != source {
-        fs::remove_file(&source).context(format!("Unable to remove {}", relative))?;
+    // Keep the original in the trash when replacing it, the edit can then be undone.
+    let replacing = save_as.is_none();
+    if replacing {
+        trash_sample_path(base, backups, relative)?;
+    }
+
+    let written = atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)));
+    if let Err(e) = written {
+        if replacing {
+            restore_latest_trash_of(base, backups, relative);
+        }
+        return Err(e).context(format!("Unable to save {}", new_name));
+    }
+
+    // Replacing an MP3 / OGG / FLAC wrote a new .wav file, so the sample has a new name.
+    if replacing && target != source {
         return Ok(Some(RenamedSample { old_name, new_name }));
     }
     Ok(None)
+}
+
+/// Puts back the most recently trashed item that came from `relative` (used when an edit
+/// couldn't be saved after its original was moved to the trash).
+fn restore_latest_trash_of(base: &Path, backups: &Path, relative: &str) {
+    let relative = relative.replace('\\', "/");
+    let latest = list_trash(backups)
+        .into_iter()
+        .find(|item| item.path == relative.trim_matches('/'));
+    if let Some(item) = latest
+        && let Err(e) = restore_trash_item(base, backups, &item.id)
+    {
+        warn!("Unable to restore {} from the trash: {}", relative, e);
+    }
+}
+
+/// A file name that isn't used by any sample yet: the name itself, or 'name (2).ext',
+/// 'name (3).ext'... Profiles reference samples by name, so names must be unique.
+pub fn free_sample_name(base: &Path, name: &str) -> String {
+    let used: std::collections::HashSet<String> =
+        recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
+            .into_values()
+            .collect();
+    if !used.contains(name) {
+        return name.to_string();
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    (2..)
+        .map(|count| format!("{stem} ({count}){extension}"))
+        .find(|candidate| !used.contains(candidate))
+        .expect("an unused name")
+}
+
+/// Copies a sample next to itself under a free name, returns the new file's relative path.
+pub fn duplicate_sample(base: &Path, relative: &str) -> Result<String> {
+    let source = sample_path(base, relative)?;
+    if !source.is_file() || !is_sample_file(&source) {
+        bail!("{} isn't a sample file", relative);
+    }
+    let Some(name) = source.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        bail!("Invalid file name");
+    };
+    let new_name = free_sample_name(base, &name);
+    fs::copy(&source, source.with_file_name(&new_name))
+        .context(format!("Unable to copy {}", relative))?;
+
+    let mut parts: Vec<&str> = relative
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    parts.pop();
+    parts.push(&new_name);
+    Ok(parts.join("/"))
+}
+
+/// Where an imported sample file goes: `folder` (relative to the samples directory, empty for
+/// the top), under a free name. Only audio files are accepted.
+pub fn import_sample_target(base: &Path, folder: &str, file_name: &str) -> Result<PathBuf> {
+    // Only keep the file name the client sent, never a path.
+    let name = Path::new(file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let invalid = name.is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_control() || (cfg!(windows) && c == ':'));
+    if invalid || !is_sample_file(Path::new(&name)) {
+        bail!(
+            "{} isn't a supported audio file ({})",
+            file_name,
+            SAMPLE_EXTENSIONS.join(", ")
+        );
+    }
+
+    let directory = if folder.trim_matches(['/', '\\']).is_empty() {
+        base.to_path_buf()
+    } else {
+        sample_path(base, folder)?
+    };
+    if !directory.is_dir() {
+        bail!("The folder {} doesn't exist", folder);
+    }
+    Ok(directory.join(free_sample_name(base, &name)))
 }
 
 pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
@@ -802,8 +897,9 @@ mod sample_management_tests {
 #[cfg(test)]
 mod sample_edit_tests {
     use super::*;
+    use crate::sample_trash::list_trash;
 
-    // One second of silence-ish stereo audio at 8kHz
+    // One second of stereo audio at 8kHz
     fn write_wav(path: &Path) {
         let audio = DecodedAudio {
             sample_rate: 8000,
@@ -814,9 +910,18 @@ mod sample_edit_tests {
         atomic_write(path, |file| audio.write_wav(BufWriter::new(file))).unwrap();
     }
 
+    fn cut(remove: &[(f64, f64)]) -> SampleEdit {
+        SampleEdit {
+            remove: remove.to_vec(),
+            normalize: false,
+        }
+    }
+
     #[test]
-    fn delete_and_edit() {
-        let base = std::env::temp_dir().join(format!("goxlr-test-edit-{}", std::process::id()));
+    fn edit_duplicate_and_import() {
+        let root = std::env::temp_dir().join(format!("goxlr-test-edit-{}", std::process::id()));
+        let base = root.join("samples");
+        let backups = root.join("backups");
         fs::create_dir_all(base.join("Jingles/Old")).unwrap();
         write_wav(&base.join("intro.wav"));
         write_wav(&base.join("Jingles/a.wav"));
@@ -828,50 +933,56 @@ mod sample_edit_tests {
         assert_eq!(names, vec!["a.wav".to_string(), "b.wav".to_string()]);
 
         // Edit into a copy: keeps the original, refuses a name already in use
-        assert!(edit_sample_file(&base, "intro.wav", &[(0.5, 1.0)], Some("a")).is_err());
+        let edit = cut(&[(0.5, 1.0)]);
+        assert!(edit_sample_file(&base, &backups, "intro.wav", &edit, Some("a")).is_err());
         let copy =
-            edit_sample_file(&base, "intro.wav", &[(0.5, 1.0)], Some("intro short")).unwrap();
+            edit_sample_file(&base, &backups, "intro.wav", &edit, Some("intro short")).unwrap();
         assert!(copy.is_none());
         let short = DecodedAudio::decode(&base.join("intro short.wav")).unwrap();
         assert!((short.duration() - 0.5).abs() < 0.01);
-        assert!(
-            (DecodedAudio::decode(&base.join("intro.wav"))
-                .unwrap()
-                .duration()
-                - 1.0)
-                .abs()
-                < 0.01
-        );
+        assert!(list_trash(&backups).is_empty());
 
-        // Edit in place
+        // Edit in place: the original goes to the trash
+        let edit = cut(&[(0.0, 0.25)]);
         assert!(
-            edit_sample_file(&base, "intro.wav", &[(0.0, 0.25)], None)
+            edit_sample_file(&base, &backups, "intro.wav", &edit, None)
                 .unwrap()
                 .is_none()
         );
+        let edited = DecodedAudio::decode(&base.join("intro.wav")).unwrap();
+        assert!((edited.duration() - 0.75).abs() < 0.01);
+        let trash = list_trash(&backups);
+        assert_eq!((trash.len(), trash[0].path.as_str()), (1, "intro.wav"));
+        assert!(edit_sample_file(&base, &backups, "intro.wav", &cut(&[]), None).is_err());
+
+        // Normalizing alone is a change
+        let normalize = SampleEdit {
+            remove: vec![],
+            normalize: true,
+        };
         assert!(
-            (DecodedAudio::decode(&base.join("intro.wav"))
-                .unwrap()
-                .duration()
-                - 0.75)
-                .abs()
-                < 0.01
+            edit_sample_file(&base, &backups, "Jingles/a.wav", &normalize, Some("a loud")).is_ok()
         );
-        assert!(edit_sample_file(&base, "intro.wav", &[], None).is_err());
 
-        // Delete a file, then a folder with its content
+        // Duplicates and imports get free names
         assert_eq!(
-            delete_sample_path(&base, "intro.wav").unwrap(),
-            vec!["intro.wav".to_string()]
+            duplicate_sample(&base, "Jingles/a.wav").unwrap(),
+            "Jingles/a (2).wav"
         );
-        assert!(!base.join("intro.wav").exists());
-        assert_eq!(delete_sample_path(&base, "Jingles").unwrap().len(), 2);
-        assert!(!base.join("Jingles").exists());
-        assert!(delete_sample_path(&base, "Jingles").is_err());
-        assert!(delete_sample_path(&base, "..").is_err());
-        assert!(base.join("intro short.wav").exists());
+        assert_eq!(
+            duplicate_sample(&base, "Jingles/a.wav").unwrap(),
+            "Jingles/a (3).wav"
+        );
+        assert!(base.join("Jingles/a (3).wav").is_file());
+        let target = import_sample_target(&base, "Jingles/Old", "b.wav").unwrap();
+        assert_eq!(target, base.join("Jingles/Old/b (2).wav"));
+        let target = import_sample_target(&base, "", "C:\\fakepath\\new.mp3").unwrap();
+        assert!(target.ends_with("new.mp3") || target.ends_with("C:\\fakepath\\new.mp3"));
+        assert!(import_sample_target(&base, "", "virus.exe").is_err());
+        assert!(import_sample_target(&base, "Missing", "new.wav").is_err());
+        assert!(import_sample_target(&base, "../..", "new.wav").is_err());
 
-        fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 

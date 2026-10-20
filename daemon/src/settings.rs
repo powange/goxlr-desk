@@ -718,14 +718,6 @@ impl SettingsHandle {
         entry.and_modify(|v| *v = value).or_insert(value);
     }
 
-    /// A sample file was deleted, forget its gain.
-    pub async fn remove_sample_gain(&self, name: &str) {
-        let mut settings = self.settings.write().await;
-        if let Some(gains) = settings.sample_gain.as_mut() {
-            gains.remove(name);
-        }
-    }
-
     /// A sample file was renamed, keep its gain under the new name.
     pub async fn rename_sample_gain(&self, old: &str, new: &str) {
         let mut settings = self.settings.write().await;

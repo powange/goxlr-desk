@@ -148,14 +148,29 @@ pub enum DaemonCommand {
     CreateSampleFolder(String),
     // Moves or renames a sample file or folder: (from, to)
     MoveSamplePath(String, String),
-    // Deletes a sample file, or a folder and everything in it
+    // Moves a sample file, or a folder and everything in it, to the sample trash
     DeleteSamplePath(String),
-    // Removes parts of a sample, as (start, end) times in seconds, then saves it as WAV, either
-    // replacing the file, or as a new file with the given name in the same folder: (path, parts
-    // to remove, new name)
-    EditSampleFile(String, Vec<(f64, f64)>, Option<String>),
+    // Puts an item from the sample trash back where it was (trash item id)
+    RestoreSampleTrash(String),
+    // Deletes an item from the sample trash for good, or everything when None
+    EmptySampleTrash(Option<String>),
+    // Copies a sample next to itself, with a free name such as 'name (2).wav'
+    DuplicateSample(String),
+    // Edits a sample and saves it as WAV, either replacing the file (the original goes to the
+    // trash), or as a new file with the given name in the same folder: (path, edit, new name)
+    EditSampleFile(String, SampleEdit, Option<String>),
 
     HandleMacOSAggregates(bool),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleEdit {
+    // Parts to remove, as (start, end) times in seconds
+    #[serde(default)]
+    pub remove: Vec<(f64, f64)>,
+    // Raise or lower the volume so the loudest peak is at -1dB
+    #[serde(default)]
+    pub normalize: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
