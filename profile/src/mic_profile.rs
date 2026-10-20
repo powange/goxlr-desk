@@ -109,7 +109,7 @@ impl MicProfileSettings {
                 // Event::Start/End only occurs for the top level micProfileTree, which has no
                 // attributes, so we don't need to worry about it :)
                 Ok(Event::Start(e)) => {
-                    if String::from_utf8_lossy(e.local_name().as_ref()) == "MicProfileTree" {
+                    if e.local_name().into_inner() == "MicProfileTree" {
                         valid_profile = true;
                     }
                 }
@@ -275,5 +275,25 @@ impl MicProfileSettings {
     }
     pub fn set_comp_select(&mut self, comp_select: u8) {
         self.comp_select = comp_select;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_mic_profile_round_trip() {
+        let default = include_bytes!("../../daemon/profiles/DEFAULT.goxlrMicProfile");
+        let profile = MicProfileSettings::load(&default[..]).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "goxlr-test-mic-{}.goxlrMicProfile",
+            std::process::id()
+        ));
+        profile.save(&path).unwrap();
+        let reloaded = MicProfileSettings::load(std::fs::File::open(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(reloaded.is_ok());
     }
 }

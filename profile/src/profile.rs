@@ -962,13 +962,18 @@ impl ProfileSettings {
 pub(crate) fn wrap_start_event(event: &BytesStart) -> Result<(String, Vec<Attribute>)> {
     let mut attributes = Vec::new();
 
-    let name = String::from_utf8_lossy(event.local_name().as_ref()).parse()?;
+    let name = event.local_name().into_inner().to_string();
     for attribute in event.attributes() {
         match attribute {
             Ok(a) => {
+                // unescape_value() is deprecated in favour of normalized_value(), which also
+                // rewrites whitespace in values. Keep the previous behaviour so profiles load and
+                // save exactly as before.
+                #[allow(deprecated)]
+                let value = a.unescape_value()?.to_string();
                 attributes.push(Attribute {
-                    name: String::from_utf8_lossy(a.key.local_name().as_ref()).parse()?,
-                    value: String::from(a.unescape_value()?.as_ref()),
+                    name: a.key.local_name().into_inner().to_string(),
+                    value,
                 });
             }
             Err(e) => {
@@ -988,6 +993,19 @@ mod tests {
     #[test]
     fn loads_test_profile() {
         assert!(ProfileSettings::load(TEST_PROFILE.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn default_profile_round_trip() {
+        let default = include_bytes!("../../daemon/profiles/Default.goxlr");
+        let mut profile = Profile::load(std::io::Cursor::new(&default[..])).unwrap();
+
+        let path =
+            std::env::temp_dir().join(format!("goxlr-test-profile-{}.goxlr", std::process::id()));
+        profile.save(&path).unwrap();
+        let reloaded = Profile::load(File::open(&path).unwrap());
+        fs::remove_file(&path).unwrap();
+        assert!(reloaded.is_ok());
     }
 
     #[test]
