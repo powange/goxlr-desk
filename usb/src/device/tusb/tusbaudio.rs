@@ -640,6 +640,7 @@ impl TUSBAudio<'_> {
             bail!("Handler Thread already running...");
         }
         debug!("Spawning Win32 PnP Handler Thread");
+        let started = std::time::Instant::now();
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
 
@@ -702,9 +703,12 @@ impl TUSBAudio<'_> {
 
         // Wait for the first scan to complete, but never forever..
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(_) => debug!("Win32 PnP Handler Started"),
+            Ok(_) => info!("Win32 PnP Handler Started in {:?}", started.elapsed()),
             Err(RecvTimeoutError::Timeout) => {
-                warn!("Win32 PnP Handler has not completed its first scan yet, continuing..");
+                warn!(
+                    "Win32 PnP Handler has not completed its first scan after {:?}, continuing..",
+                    started.elapsed()
+                );
             }
             Err(RecvTimeoutError::Disconnected) => {
                 *self.pnp_thread_running.lock().unwrap() = false;

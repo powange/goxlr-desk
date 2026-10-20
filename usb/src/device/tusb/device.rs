@@ -115,7 +115,8 @@ impl AttachGoXLR for TUSBAudioGoXLR {
         Self: Sized,
     {
         if !skip_pause {
-            // Before we do anything, wait 1second in case the GoXLR is still calibrating..
+            // Before we do anything, wait 2 seconds in case the GoXLR is still calibrating. The
+            // daemon runs this on a blocking thread, so it doesn't hold up anything else.
             sleep(Duration::from_millis(2000));
         }
 

@@ -64,6 +64,12 @@ pub async fn spawn_event_handler(
                     }
                 }
             },
+            // The shutdown request was queued, but the device worker stopped (or crashed) before
+            // handling it, so it will never confirm the devices are stopped.
+            () = device_state_tx.closed(), if triggered_device_stop => {
+                finish_without_devices(&state);
+                break;
+            },
             Some(event) = rx.recv() => {
                 match event {
                     EventTriggers::TTSMessage(message) => {
