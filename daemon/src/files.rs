@@ -373,6 +373,21 @@ pub fn create_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Builds the path of a named file (profile, preset..) in a directory. Names come from clients,
+/// so refuse any that could point outside of that directory.
+pub fn named_file_path(directory: &Path, name: &str, extension: &str) -> Result<PathBuf> {
+    let invalid = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\' || (cfg!(windows) && c == ':'));
+    if invalid {
+        bail!("Invalid name: {:?}", name);
+    }
+    Ok(directory.join(format!("{name}.{extension}")))
+}
+
 pub fn can_create_new_file(path: PathBuf) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.exists()
@@ -452,4 +467,26 @@ pub fn extract_defaults(file_type: PathTypes, path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_file_paths() {
+        let dir = Path::new("/profiles");
+        assert_eq!(
+            named_file_path(dir, "My Profile", "goxlr").unwrap(),
+            dir.join("My Profile.goxlr")
+        );
+        assert!(named_file_path(dir, "v1.2 (stream)", "preset").is_ok());
+
+        assert!(named_file_path(dir, "", "goxlr").is_err());
+        assert!(named_file_path(dir, "..", "goxlr").is_err());
+        assert!(named_file_path(dir, "../../x", "goxlr").is_err());
+        assert!(named_file_path(dir, "..\\..\\x", "goxlr").is_err());
+        assert!(named_file_path(dir, "/etc/passwd", "goxlr").is_err());
+        assert!(named_file_path(dir, "bad\nname", "goxlr").is_err());
+    }
 }

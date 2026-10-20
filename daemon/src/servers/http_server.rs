@@ -34,8 +34,8 @@ use tokio::sync::{RwLock, oneshot};
 use crate::PatchEvent;
 use crate::files::{FilePaths, find_file_in_path};
 use goxlr_ipc::{
-    DaemonRequest, DaemonResponse, DaemonStatus, HttpSettings, Scribble, WebsocketRequest,
-    WebsocketResponse,
+    DaemonCommand, DaemonRequest, DaemonResponse, DaemonStatus, HttpSettings, Scribble,
+    WebsocketRequest, WebsocketResponse,
 };
 use goxlr_scribbles::get_scribble_png;
 use goxlr_types::FaderName;
@@ -118,6 +118,27 @@ fn is_loopback_name(name: &str) -> bool {
 
 fn is_loopback_origin(origin: &str) -> bool {
     strip_scheme(origin).is_some_and(|authority| is_loopback_name(strip_port(authority)))
+}
+
+/// Whether the request comes from this machine (as opposed to another machine on the network,
+/// which is only possible when network access is enabled).
+fn is_local_peer(req: &HttpRequest) -> bool {
+    req.peer_addr()
+        .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+}
+
+/// Requests that run a program or flash a file from this machine's disk are refused when they
+/// come from another machine, the HTTP API has no authentication.
+fn local_only_reason(request: &DaemonRequest) -> Option<&'static str> {
+    match request {
+        DaemonRequest::Daemon(DaemonCommand::SetActivatorPath(_)) => {
+            Some("The activator can only be changed from this computer")
+        }
+        DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
+            Some("A firmware file on disk can only be flashed from this computer")
+        }
+        _ => None,
+    }
 }
 
 async fn check_request_source(
@@ -224,6 +245,17 @@ pub async fn spawn_http_server(
         settings.bind_address.as_str(),
         settings.port,
     );
+    let loopback = settings
+        .bind_address
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+        || settings.bind_address.eq_ignore_ascii_case("localhost");
+    if !loopback {
+        warn!(
+            "The configuration interface is reachable from other machines and has no password, \
+            only enable network access on networks you trust."
+        );
+    }
 
     // Let upstream know we're running...
     let _ = handle_tx.send(Ok(Some(server.handle())));
@@ -248,6 +280,7 @@ async fn websocket(
     body: web::Payload,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, msg_stream) = actix_ws::handle(&req, body)?;
+    let local_peer = is_local_peer(&req);
 
     let data = app_data.read().await;
     let mut usb_tx = data.usb_tx.clone();
@@ -283,7 +316,12 @@ async fn websocket(
                             match serde_json::from_slice::<WebsocketRequest>(msg.as_ref()) {
                                 Ok(request) => {
                                     let request_id = request.id;
-                                    let result = handle_packet(request.data, &mut usb_tx).await;
+                                    let result = match local_only_reason(&request.data) {
+                                        Some(reason) if !local_peer => {
+                                            Ok(DaemonResponse::Error(reason.to_string()))
+                                        }
+                                        _ => handle_packet(request.data, &mut usb_tx).await,
+                                    };
                                     let response = match result {
                                         Ok(resp) => {
                                             match resp {
@@ -426,7 +464,14 @@ async fn send_response(res: WsResponse, session: &mut Session) -> Result<(), Opt
 async fn execute_command(
     request: web::Json<DaemonRequest>,
     app_data: Data<RwLock<AppData>>,
+    req: HttpRequest,
 ) -> HttpResponse {
+    if !is_local_peer(&req)
+        && let Some(reason) = local_only_reason(&request.0)
+    {
+        return HttpResponse::Ok().json(DaemonResponse::Error(reason.to_string()));
+    }
+
     let mut data = app_data.write().await;
 
     // Errors propagate weirdly in the javascript world, so send all as OK, and handle there.

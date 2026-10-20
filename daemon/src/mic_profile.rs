@@ -1,4 +1,4 @@
-use crate::files::can_create_new_file;
+use crate::files::{can_create_new_file, named_file_path};
 use crate::profile::ProfileAdapter;
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
@@ -34,7 +34,7 @@ pub struct MicProfileAdapter {
 
 impl MicProfileAdapter {
     pub fn from_named(name: String, directory: &Path) -> Result<Self> {
-        let path = directory.join(format!("{name}.goxlrMicProfile"));
+        let path = named_file_path(directory, &name, "goxlrMicProfile")?;
         if path.is_file() {
             let file = File::open(path).context("Couldn't open mic profile for reading")?;
 
@@ -68,18 +68,20 @@ impl MicProfileAdapter {
     }
 
     pub fn can_create_new_file(name: String, directory: &Path) -> Result<()> {
-        let path = directory.join(format!("{name}.goxlrMicProfile"));
+        let path = named_file_path(directory, &name, "goxlrMicProfile")?;
         can_create_new_file(path)
     }
 
     pub fn save_as(&mut self, name: String, directory: &Path, overwrite: bool) -> Result<()> {
+        // Check the name before adopting it, so a refused name doesn't rename this profile.
+        named_file_path(directory, &name, "goxlrMicProfile")?;
         self.name = name;
         self.save(directory, overwrite)
     }
 
     pub fn save(&mut self, directory: &Path, overwrite: bool) -> Result<()> {
         let name = &self.name;
-        let path = directory.join(format!("{name}.goxlrMicProfile"));
+        let path = named_file_path(directory, name, "goxlrMicProfile")?;
         if !overwrite && path.is_file() {
             return Err(anyhow!("Profile exists, will not overwrite"));
         }
@@ -89,7 +91,7 @@ impl MicProfileAdapter {
     }
 
     pub fn delete_profile(&mut self, name: String, directory: &Path) -> Result<()> {
-        let path = directory.join(format!("{name}.goxlrMicProfile"));
+        let path = named_file_path(directory, &name, "goxlrMicProfile")?;
         if path.is_file() {
             remove_file(path)?;
         }
