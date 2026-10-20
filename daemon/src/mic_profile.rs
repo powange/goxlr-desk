@@ -415,7 +415,7 @@ impl MicProfileAdapter {
 
                 if value > max || value < min {
                     bail!(
-                        "4KHz Frequency should be between 1KHz ({}) and 8KHz ({}) Frequency",
+                        "4KHz Frequency should be between 2KHz ({}) and 8KHz ({}) Frequency",
                         min,
                         max
                     );
@@ -516,7 +516,7 @@ impl MicProfileAdapter {
     ) -> Result<MicrophoneParamKey> {
         match freq {
             MiniEqFrequencies::Equalizer90Hz => {
-                let max = self.profile.equalizer_mini().eq_1k_freq();
+                let max = self.profile.equalizer_mini().eq_250h_freq();
                 if value > max {
                     bail!("90Hz Frequency should be below 250Hz ({}) Frequency", max);
                 }
@@ -580,7 +580,7 @@ impl MicProfileAdapter {
                 Ok(MicrophoneParamKey::Equalizer3KHzFrequency)
             }
             MiniEqFrequencies::Equalizer8KHz => {
-                let min = self.profile.equalizer_mini().eq_250h_freq();
+                let min = self.profile.equalizer_mini().eq_3k_freq();
                 if value < min {
                     bail!("8K Frequency should be above 3KHz ({}) Frequency", min,);
                 }

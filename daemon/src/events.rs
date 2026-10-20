@@ -58,7 +58,10 @@ pub async fn spawn_event_handler(
                 // Ctrl+C is a generic capture, although we should also check for SIGTERM under Linux..
                 if !triggered_device_stop {
                     triggered_device_stop = true;
-                    let _ = device_state_tx.send(DeviceStateChange::Shutdown(false)).await;
+                    if device_state_tx.send(DeviceStateChange::Shutdown(false)).await.is_err() {
+                        finish_without_devices(&state);
+                        break;
+                    }
                 }
             },
             Some(event) = rx.recv() => {
@@ -70,7 +73,10 @@ pub async fn spawn_event_handler(
                         if !triggered_device_stop {
                             debug!("Shutdown Phase 1 Triggered..");
                             triggered_device_stop = true;
-                            let _ = device_state_tx.send(DeviceStateChange::Shutdown(avoid_write)).await;
+                            if device_state_tx.send(DeviceStateChange::Shutdown(avoid_write)).await.is_err() {
+                                finish_without_devices(&state);
+                                break;
+                            }
                         } else {
                             debug!("Shutdown Phase 1 already in Progress");
                         }
@@ -150,6 +156,8 @@ pub async fn spawn_event_handler(
                                                 warn!("Error Opening URL: {:?}", error);
                                             }
                                         }
+                                    } else if let Err(error) = open::that(url) {
+                                        warn!("Error Opening URL: {:?}", error);
                                     }
                                 },
                                 None => {
@@ -166,11 +174,13 @@ pub async fn spawn_event_handler(
                             match activate {
                                 Some(exec) => {
                                     let exec = exec.replace("%URL%", &url);
-                                    if let Ok(params) = shell_words::split(&exec) {
+                                    // An empty command has nothing to run, use the default browser.
+                                    let params = shell_words::split(&exec).ok().filter(|p| !p.is_empty());
+                                    if let Some((command, args)) = params.as_ref().and_then(|p| p.split_first()) {
                                         debug!("Attempting to Execute: {:?}", params);
-                                        let result = Command::new(&params[0])
+                                        let result = Command::new(command)
                                             .current_dir(tmp_dir)
-                                            .args(&params[1..])
+                                            .args(args)
                                             .stdout(Stdio::null())
                                             .stderr(Stdio::null())
                                             .spawn();
@@ -199,6 +209,14 @@ pub async fn spawn_event_handler(
             },
         }
     }
+}
+
+/// The device worker isn't running (it has stopped or crashed), so it will never confirm that the
+/// devices are stopped. Go straight to the final shutdown phase rather than waiting forever.
+fn finish_without_devices(state: &DaemonState) {
+    warn!("Device worker isn't running, completing shutdown without it..");
+    state.shutdown.trigger();
+    state.shutdown_blocking.store(true, Ordering::Relaxed);
 }
 
 fn get_util_url(state: &DaemonState) -> String {

@@ -154,21 +154,9 @@ pub async fn spawn_usb_handler(
                             state.status.progress = 0;
                             change_found = true;
                         } else {
-                            // We don't have a state for this device, set one.
-                            let status = FirmwareStatus {
-                                state: status,
-                                progress: 0,
-                                error: None
-                            };
-
-                            // Only create this if the serial is present..
-                            if devices.contains_key(&serial) {
-                                // Get the current status..
-                                let state = devices_firmware.get_mut(&serial).unwrap();
-                                state.status = status;
-
-                                change_found = true;
-                            }
+                            // The update state was cleared while the update was still running,
+                            // there's nothing left to attach this state to.
+                            warn!("Ignoring firmware state {:?} for {}, update state was cleared", status, serial);
                         }
                     }
                     FirmwareRequest::SetStateProgress(serial, progress) => {
@@ -277,7 +265,7 @@ pub async fn spawn_usb_handler(
                     let updated = device.update_state().await;
 
                     if let Ok(result) = updated {
-                        change_found = result;
+                        change_found |= result;
                     }
 
                     if let Err(error) = updated {
@@ -389,16 +377,20 @@ pub async fn spawn_usb_handler(
                             }
                             DaemonCommand::RecoverDefaults(path_type) => {
                                 let path = match path_type {
-                                    PathTypes::Profiles => settings.get_profile_directory().await,
-                                    PathTypes::Presets => settings.get_presets_directory().await,
-                                    PathTypes::Icons => settings.get_icons_directory().await,
-                                    PathTypes::MicProfiles => settings.get_mic_profile_directory().await,
-                                    _ => {
-                                        let _ = sender.send(Err(anyhow!("Invalid Path type Sent")));
-                                        return;
-                                    }
+                                    PathTypes::Profiles => Some(settings.get_profile_directory().await),
+                                    PathTypes::Presets => Some(settings.get_presets_directory().await),
+                                    PathTypes::Icons => Some(settings.get_icons_directory().await),
+                                    PathTypes::MicProfiles => Some(settings.get_mic_profile_directory().await),
+                                    _ => None,
                                 };
-                                let _ = sender.send(extract_defaults(path_type, &path));
+
+                                // An unsupported type is an error for this request only, the
+                                // worker must keep running for every other request.
+                                let result = match path {
+                                    Some(path) => extract_defaults(path_type, &path),
+                                    None => Err(anyhow!("Invalid Path type Sent")),
+                                };
+                                let _ = sender.send(result);
                             }
                             DaemonCommand::SetAutoStartEnabled(enabled) => {
                                 let _ = sender.send(set_autostart(enabled));
