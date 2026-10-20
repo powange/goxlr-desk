@@ -12,6 +12,8 @@ jobs:
   build_windows:
     name: "Create Windows Build"
     strategy:
+      # Build each architecture to the end, a failure on one shouldn't cancel the other.
+      fail-fast: false
       matrix:
         include:
           - targets: x86_64-pc-windows-msvc
