@@ -4,7 +4,7 @@
 name: Test Build (temporary)
 on:
   push:
-    branches: [ fix/critical-bugs ]
+    branches: [ fix/critical-bugs, feature/sample-file-management ]
 
 permissions:
   contents: read
