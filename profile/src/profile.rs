@@ -876,6 +876,13 @@ impl ProfileSettings {
         &mut self.sampler_map[button]
     }
 
+    /// Whether any sampler button plays one of these sample files.
+    pub fn uses_sample_file(&self, names: &std::collections::HashSet<String>) -> bool {
+        self.sampler_map
+            .values()
+            .any(|button| button.uses_track_file(names))
+    }
+
     /// Points every sampler track using the sample file `old` at `new` instead (a sample file
     /// was renamed). Returns how many tracks were changed.
     pub fn rename_sample_file(&mut self, old: &str, new: &str) -> usize {

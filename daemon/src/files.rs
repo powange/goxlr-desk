@@ -20,9 +20,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 
 use glob::{Pattern, glob};
+use goxlr_audio::editor::DecodedAudio;
 use goxlr_ipc::PathTypes;
+use goxlr_profile_loader::atomic::atomic_write;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::io::BufWriter;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -485,6 +488,104 @@ pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<Rena
     Ok(renamed)
 }
 
+/// The names of the sample files at a path: the file itself, or every sample inside a folder.
+pub fn sample_names_at(base: &Path, relative: &str) -> Result<Vec<String>> {
+    let path = sample_path(base, relative)?;
+    if path.is_dir() {
+        return Ok(recursive_file_list(path, SAMPLE_EXTENSIONS.to_vec())
+            .into_values()
+            .collect());
+    }
+    if path.is_file()
+        && let Some(name) = path.file_name()
+    {
+        return Ok(vec![name.to_string_lossy().to_string()]);
+    }
+    bail!("{} doesn't exist", relative)
+}
+
+/// Deletes a sample file, or a folder with everything in it. Returns the names of the sample
+/// files that were deleted.
+pub fn delete_sample_path(base: &Path, relative: &str) -> Result<Vec<String>> {
+    let names = sample_names_at(base, relative)?;
+    let path = sample_path(base, relative)?;
+    if path.is_dir() {
+        fs::remove_dir_all(&path).context(format!("Unable to delete {}", relative))?;
+    } else {
+        fs::remove_file(&path).context(format!("Unable to delete {}", relative))?;
+    }
+    Ok(names)
+}
+
+/// Removes parts of a sample (start, end in seconds) and saves the result as WAV, either over
+/// the original file or as a new file named `save_as` next to it. Replacing a file that isn't a
+/// WAV gives it a .wav name, which is returned so profiles can follow it.
+pub fn edit_sample_file(
+    base: &Path,
+    relative: &str,
+    remove: &[(f64, f64)],
+    save_as: Option<&str>,
+) -> Result<Option<RenamedSample>> {
+    let source = sample_path(base, relative)?;
+    if !source.is_file() || !is_sample_file(&source) {
+        bail!("{} isn't a sample file", relative);
+    }
+    if remove.is_empty() {
+        bail!("There is nothing to change in {}", relative);
+    }
+
+    let target = match save_as {
+        Some(name) => {
+            let name = name.trim();
+            let invalid = name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.chars().any(|c| {
+                    c.is_control() || c == '/' || c == '\\' || (cfg!(windows) && c == ':')
+                });
+            if invalid {
+                bail!("Invalid name: {:?}", name);
+            }
+            let file_name = if name.to_ascii_lowercase().ends_with(".wav") {
+                name.to_string()
+            } else {
+                format!("{name}.wav")
+            };
+            source.with_file_name(file_name)
+        }
+        None => source.with_extension("wav"),
+    };
+
+    let name_of = |path: &Path| path.file_name().map(|n| n.to_string_lossy().to_string());
+    let (Some(old_name), Some(new_name)) = (name_of(&source), name_of(&target)) else {
+        bail!("Invalid file name");
+    };
+    if target != source {
+        if target.exists() {
+            bail!("{} already exists", new_name);
+        }
+        let in_use = recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
+            .values()
+            .any(|name| name == &new_name);
+        if in_use {
+            bail!("A sample named {} already exists", new_name);
+        }
+    }
+
+    let mut audio =
+        DecodedAudio::decode(&source).context(format!("Unable to read {}", relative))?;
+    audio.remove_ranges(remove)?;
+    atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)))
+        .context(format!("Unable to save {}", new_name))?;
+
+    // Replacing an MP3 / OGG / FLAC wrote a new .wav file, remove the original.
+    if save_as.is_none() && target != source {
+        fs::remove_file(&source).context(format!("Unable to remove {}", relative))?;
+        return Ok(Some(RenamedSample { old_name, new_name }));
+    }
+    Ok(None)
+}
+
 pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
     // The file name comes from profiles or clients, it must stay inside the directory.
     let escapes = file
@@ -693,6 +794,82 @@ mod sample_management_tests {
             folders,
             vec!["Stingers".to_string(), format!("Stingers{separator}Old")]
         );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sample_edit_tests {
+    use super::*;
+
+    // One second of silence-ish stereo audio at 8kHz
+    fn write_wav(path: &Path) {
+        let audio = DecodedAudio {
+            sample_rate: 8000,
+            channels: 2,
+            samples: (0..16000).map(|i| (i % 50) as f32 / 100.0).collect(),
+            bits_per_sample: Some(16),
+        };
+        atomic_write(path, |file| audio.write_wav(BufWriter::new(file))).unwrap();
+    }
+
+    #[test]
+    fn delete_and_edit() {
+        let base = std::env::temp_dir().join(format!("goxlr-test-edit-{}", std::process::id()));
+        fs::create_dir_all(base.join("Jingles/Old")).unwrap();
+        write_wav(&base.join("intro.wav"));
+        write_wav(&base.join("Jingles/a.wav"));
+        write_wav(&base.join("Jingles/Old/b.wav"));
+
+        // Usage lookups know what a folder contains
+        let mut names = sample_names_at(&base, "Jingles").unwrap();
+        names.sort();
+        assert_eq!(names, vec!["a.wav".to_string(), "b.wav".to_string()]);
+
+        // Edit into a copy: keeps the original, refuses a name already in use
+        assert!(edit_sample_file(&base, "intro.wav", &[(0.5, 1.0)], Some("a")).is_err());
+        let copy =
+            edit_sample_file(&base, "intro.wav", &[(0.5, 1.0)], Some("intro short")).unwrap();
+        assert!(copy.is_none());
+        let short = DecodedAudio::decode(&base.join("intro short.wav")).unwrap();
+        assert!((short.duration() - 0.5).abs() < 0.01);
+        assert!(
+            (DecodedAudio::decode(&base.join("intro.wav"))
+                .unwrap()
+                .duration()
+                - 1.0)
+                .abs()
+                < 0.01
+        );
+
+        // Edit in place
+        assert!(
+            edit_sample_file(&base, "intro.wav", &[(0.0, 0.25)], None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            (DecodedAudio::decode(&base.join("intro.wav"))
+                .unwrap()
+                .duration()
+                - 0.75)
+                .abs()
+                < 0.01
+        );
+        assert!(edit_sample_file(&base, "intro.wav", &[], None).is_err());
+
+        // Delete a file, then a folder with its content
+        assert_eq!(
+            delete_sample_path(&base, "intro.wav").unwrap(),
+            vec!["intro.wav".to_string()]
+        );
+        assert!(!base.join("intro.wav").exists());
+        assert_eq!(delete_sample_path(&base, "Jingles").unwrap().len(), 2);
+        assert!(!base.join("Jingles").exists());
+        assert!(delete_sample_path(&base, "Jingles").is_err());
+        assert!(delete_sample_path(&base, "..").is_err());
+        assert!(base.join("intro short.wav").exists());
 
         fs::remove_dir_all(&base).unwrap();
     }

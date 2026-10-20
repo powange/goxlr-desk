@@ -1,12 +1,15 @@
 use crate::device::Device;
 use crate::events::EventTriggers;
-use crate::files::{create_sample_folder, extract_defaults, move_sample_path};
+use crate::files::{
+    RenamedSample, create_sample_folder, delete_sample_path, edit_sample_file, extract_defaults,
+    move_sample_path, sample_names_at,
+};
 use crate::firmware::firmware_update::{
     FirmwareMessages, FirmwareRequest, FirmwareUpdateDevice, FirmwareUpdateSettings,
     do_firmware_update, start_firmware_update,
 };
 use crate::platform::{get_ui_app_path, has_autostart, set_autostart};
-use crate::profile::rename_sample_in_saved_profiles;
+use crate::profile::{rename_sample_in_saved_profiles, saved_profiles_using_samples};
 use crate::{
     FIRMWARE_PATHS, FileManager, PatchEvent, SYSTEM_LOCALE, SettingsHandle, Shutdown, VERSION,
 };
@@ -15,7 +18,7 @@ use enum_map::EnumMap;
 use goxlr_ipc::{
     Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
     FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale, PathTypes,
-    Paths, SampleFile, UpdateState, UsbProductInformation,
+    Paths, SampleFile, SampleUsage, UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::{FullGoXLRDevice, GoXLRDevice};
@@ -24,7 +27,7 @@ use goxlr_usb::{PID_GOXLR_FULL, PID_GOXLR_MINI};
 use json_patch::diff;
 use log::{debug, error, info, warn};
 use reqwest::{ClientBuilder, StatusCode};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -66,6 +69,7 @@ pub enum DeviceCommand {
     RunDaemonCommand(DaemonCommand, oneshot::Sender<Result<()>>),
     RunDeviceCommand(String, GoXLRCommand, oneshot::Sender<Result<()>>),
     GetDeviceMicLevel(String, oneshot::Sender<Result<f64>>),
+    GetSampleUsage(String, oneshot::Sender<Result<SampleUsage>>),
     RunFirmwareUpdate(String, Option<PathBuf>, bool, oneshot::Sender<Result<()>>),
     ContinueFirmwareUpdate(String, oneshot::Sender<Result<()>>),
     ClearFirmwareState(String, oneshot::Sender<Result<()>>),
@@ -520,21 +524,51 @@ pub async fn spawn_usb_handler(
                                 let base = settings.get_samples_directory().await;
                                 let result = match move_sample_path(&base, &from, &to) {
                                     Ok(Some(renamed)) => {
-                                        // Profiles reference samples by file name, update them all:
-                                        // the ones loaded on devices, and the ones saved on disk.
-                                        let (old, new) = (&renamed.old_name, &renamed.new_name);
-                                        for device in devices.values_mut() {
-                                            device.rename_sample_file(old, new);
-                                        }
-                                        let profiles = settings.get_profile_directory().await;
-                                        let changed = rename_sample_in_saved_profiles(&profiles, old, new);
-                                        info!("Renamed sample {} to {}, updated profiles: {:?}", old, new, changed);
-
-                                        settings.rename_sample_gain(old, new).await;
-                                        settings.save().await;
+                                        apply_sample_rename(&renamed, &mut devices, &settings).await;
                                         Ok(())
                                     }
                                     Ok(None) => Ok(()),
+                                    Err(e) => Err(e),
+                                };
+                                if result.is_ok() {
+                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
+                                    change_found = true;
+                                }
+                                let _ = sender.send(result);
+                            }
+                            DaemonCommand::DeleteSamplePath(path) => {
+                                let base = settings.get_samples_directory().await;
+                                let result = match delete_sample_path(&base, &path) {
+                                    Ok(deleted) => {
+                                        // Forget the gain of samples that no longer exist anywhere.
+                                        let remaining = file_manager.get_samples();
+                                        for name in deleted {
+                                            if !remaining.values().any(|existing| existing == &name) {
+                                                settings.remove_sample_gain(&name).await;
+                                            }
+                                        }
+                                        settings.save().await;
+                                        info!("Deleted sample path {}", path);
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                if result.is_ok() {
+                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
+                                    change_found = true;
+                                }
+                                let _ = sender.send(result);
+                            }
+                            DaemonCommand::EditSampleFile(path, remove, save_as) => {
+                                let base = settings.get_samples_directory().await;
+                                let result = match edit_sample_file(&base, &path, &remove, save_as.as_deref()) {
+                                    Ok(renamed) => {
+                                        if let Some(renamed) = renamed {
+                                            apply_sample_rename(&renamed, &mut devices, &settings).await;
+                                        }
+                                        info!("Edited sample {} ({} part(s) removed)", path, remove.len());
+                                        Ok(())
+                                    }
                                     Err(e) => Err(e),
                                 };
                                 if result.is_ok() {
@@ -591,6 +625,26 @@ pub async fn spawn_usb_handler(
                         }
                     },
 
+                    DeviceCommand::GetSampleUsage(path, sender) => {
+                        let base = settings.get_samples_directory().await;
+                        let profile_directory = settings.get_profile_directory().await;
+                        let result = sample_names_at(&base, &path).map(|names| {
+                            let names: HashSet<String> = names.into_iter().collect();
+                            let mut profiles: BTreeSet<String> =
+                                saved_profiles_using_samples(&profile_directory, &names).into_iter().collect();
+                            // The loaded profiles may have changes that aren't saved yet.
+                            for device in devices.values() {
+                                if device.profile().uses_sample_file(&names) {
+                                    profiles.insert(device.profile().name().to_string());
+                                }
+                            }
+                            SampleUsage {
+                                files: names.len(),
+                                profiles: profiles.into_iter().collect(),
+                            }
+                        });
+                        let _ = sender.send(result);
+                    }
                     DeviceCommand::GetDeviceMicLevel(serial, sender) => {
                         if let Some(device) = devices.get_mut(&serial) {
                             let _ = sender.send(device.get_mic_level().await);
@@ -822,6 +876,28 @@ fn get_app_path(app_check: &mut Option<String>) -> bool {
         app_check.take();
         changed
     }
+}
+
+/// A sample file was renamed. Profiles reference samples by file name, so update them all: the
+/// ones loaded on devices and the ones saved on disk, and keep the sample's gain.
+async fn apply_sample_rename(
+    renamed: &RenamedSample,
+    devices: &mut HashMap<String, Device<'_>>,
+    settings: &SettingsHandle,
+) {
+    let (old, new) = (&renamed.old_name, &renamed.new_name);
+    for device in devices.values_mut() {
+        device.rename_sample_file(old, new);
+    }
+    let profiles = settings.get_profile_directory().await;
+    let changed = rename_sample_in_saved_profiles(&profiles, old, new);
+    info!(
+        "Renamed sample {} to {}, updated profiles: {:?}",
+        old, new, changed
+    );
+
+    settings.rename_sample_gain(old, new).await;
+    settings.save().await;
 }
 
 async fn get_sample_files(

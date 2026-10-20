@@ -392,41 +392,14 @@ async fn websocket(
                                         None => handle_packet(request.data, &mut usb_tx).await,
                                     };
                                     let response = match result {
-                                        Ok(resp) => {
-                                            match resp {
-                                                DaemonResponse::Ok => {
-                                                    WsResponse(WebsocketResponse {
-                                                        id: request_id,
-                                                        data: DaemonResponse::Ok,
-                                                    })
-                                                }
-                                                DaemonResponse::Error(error) => {
-                                                    WsResponse(WebsocketResponse {
-                                                        id: request_id,
-                                                        data: DaemonResponse::Error(error),
-                                                    })
-                                                }
-                                                DaemonResponse::Status(status) => {
-                                                    WsResponse(WebsocketResponse {
-                                                        id: request_id,
-                                                        data: DaemonResponse::Status(status),
-                                                    })
-                                                }
-                                                DaemonResponse::MicLevel(level) => {
-                                                    WsResponse(WebsocketResponse {
-                                                        id: request_id,
-                                                        data: DaemonResponse::MicLevel(level),
-                                                    })
-                                                }
-                                                _ => {
-                                                    // This should never fucking happen
-                                                    break Some(CloseReason {
-                                                        code: CloseCode::Abnormal,
-                                                        description: Some("Unexpected Message Type".to_string()),
-                                                    });
-                                                }
-                                            }
-                                        },
+                                        Ok(DaemonResponse::Patch(_)) => {
+                                            // Patches are only ever broadcast, never a reply.
+                                            break Some(CloseReason {
+                                                code: CloseCode::Abnormal,
+                                                description: Some("Unexpected Message Type".to_string()),
+                                            });
+                                        }
+                                        Ok(data) => WsResponse(WebsocketResponse { id: request_id, data }),
                                         Err(error) => {
                                             WsResponse(WebsocketResponse {
                                                 id: request_id,

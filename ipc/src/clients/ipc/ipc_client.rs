@@ -49,6 +49,9 @@ impl Client for IPCClient {
             DaemonResponse::Patch(_patch) => {
                 Err(anyhow!("Received Patch as response, shouldn't happen!"))
             }
+            DaemonResponse::SampleUsage(_usage) => Err(anyhow!(
+                "Received Sample Usage as response, shouldn't happen!"
+            )),
         }
     }
 

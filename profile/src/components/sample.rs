@@ -263,6 +263,16 @@ impl SampleBase {
         &mut self.sample_stack[bank]
     }
 
+    /// Whether any track, in any bank, plays one of these sample files.
+    pub fn uses_track_file(&self, names: &std::collections::HashSet<String>) -> bool {
+        self.sample_stack.values().any(|stack| {
+            stack
+                .get_tracks()
+                .iter()
+                .any(|track| names.contains(&track.track))
+        })
+    }
+
     /// Points every track using the sample file `old` at `new` instead, in all banks. Returns
     /// how many tracks were changed.
     pub fn rename_track_file(&mut self, old: &str, new: &str) -> usize {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::fs::{File, remove_file};
 use std::io::{Cursor, Read, Seek};
@@ -52,6 +52,29 @@ use crate::device::CurrentState;
 use crate::files::{can_create_new_file, named_file_path};
 
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
+
+/// The names of the profiles saved in `directory` that play one of these sample files.
+pub fn saved_profiles_using_samples(directory: &Path, names: &HashSet<String>) -> Vec<String> {
+    let mut using = Vec::new();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return using;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("goxlr") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        match ProfileAdapter::from_named(name.to_string(), directory) {
+            Ok(profile) if profile.uses_sample_file(names) => using.push(name.to_string()),
+            Ok(_) => {}
+            Err(e) => warn!("Unable to check profile {} for samples: {}", name, e),
+        }
+    }
+    using
+}
 
 /// A sample file was renamed: updates every profile saved in `directory` that uses it, and
 /// returns the names of the profiles that changed.
@@ -154,6 +177,11 @@ impl ProfileAdapter {
             remove_file(path)?;
         }
         Ok(())
+    }
+
+    /// Whether any sampler button plays one of these sample files.
+    pub fn uses_sample_file(&self, names: &HashSet<String>) -> bool {
+        self.profile.settings().uses_sample_file(names)
     }
 
     /// Points sampler tracks using the sample file `old` at `new` (the file was renamed).

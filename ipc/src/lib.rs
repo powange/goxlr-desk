@@ -29,6 +29,10 @@ pub enum DaemonRequest {
     RunFirmwareUpdate(String, Option<PathBuf>, bool),
     ContinueFirmwareUpdate(String),
     ClearFirmwareState(String),
+
+    // Which profiles use the sample file(s) at this path (a file, or a folder's content),
+    // relative to the samples directory. Answered with SampleUsage.
+    GetSampleUsage(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +43,15 @@ pub enum DaemonResponse {
     MicLevel(f64),
     Status(DaemonStatus),
     Patch(Patch),
+    SampleUsage(SampleUsage),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleUsage {
+    // How many sample files are at the path (1 for a file, the content of a folder)
+    pub files: usize,
+    // The profiles using any of them
+    pub profiles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +148,12 @@ pub enum DaemonCommand {
     CreateSampleFolder(String),
     // Moves or renames a sample file or folder: (from, to)
     MoveSamplePath(String, String),
+    // Deletes a sample file, or a folder and everything in it
+    DeleteSamplePath(String),
+    // Removes parts of a sample, as (start, end) times in seconds, then saves it as WAV, either
+    // replacing the file, or as a new file with the given name in the same folder: (path, parts
+    // to remove, new name)
+    EditSampleFile(String, Vec<(f64, f64)>, Option<String>),
 
     HandleMacOSAggregates(bool),
 }
