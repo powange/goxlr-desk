@@ -1,11 +1,12 @@
 use crate::device::Device;
 use crate::events::EventTriggers;
-use crate::files::extract_defaults;
+use crate::files::{create_sample_folder, extract_defaults, move_sample_path};
 use crate::firmware::firmware_update::{
     FirmwareMessages, FirmwareRequest, FirmwareUpdateDevice, FirmwareUpdateSettings,
     do_firmware_update, start_firmware_update,
 };
 use crate::platform::{get_ui_app_path, has_autostart, set_autostart};
+use crate::profile::rename_sample_in_saved_profiles;
 use crate::{
     FIRMWARE_PATHS, FileManager, PatchEvent, SYSTEM_LOCALE, SettingsHandle, Shutdown, VERSION,
 };
@@ -506,6 +507,42 @@ pub async fn spawn_usb_handler(
                                 settings.set_sample_gain_percent(sample, gain).await;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::CreateSampleFolder(path) => {
+                                let base = settings.get_samples_directory().await;
+                                let result = create_sample_folder(&base, &path);
+                                if result.is_ok() {
+                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
+                                    change_found = true;
+                                }
+                                let _ = sender.send(result);
+                            }
+                            DaemonCommand::MoveSamplePath(from, to) => {
+                                let base = settings.get_samples_directory().await;
+                                let result = match move_sample_path(&base, &from, &to) {
+                                    Ok(Some(renamed)) => {
+                                        // Profiles reference samples by file name, update them all:
+                                        // the ones loaded on devices, and the ones saved on disk.
+                                        let (old, new) = (&renamed.old_name, &renamed.new_name);
+                                        for device in devices.values_mut() {
+                                            device.rename_sample_file(old, new);
+                                        }
+                                        let profiles = settings.get_profile_directory().await;
+                                        let changed = rename_sample_in_saved_profiles(&profiles, old, new);
+                                        info!("Renamed sample {} to {}, updated profiles: {:?}", old, new, changed);
+
+                                        settings.rename_sample_gain(old, new).await;
+                                        settings.save().await;
+                                        Ok(())
+                                    }
+                                    Ok(None) => Ok(()),
+                                    Err(e) => Err(e),
+                                };
+                                if result.is_ok() {
+                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
+                                    change_found = true;
+                                }
+                                let _ = sender.send(result);
+                            }
                             DaemonCommand::ApplySampleChange => {
                                 // Change is committed, save it..
                                 settings.save().await;
@@ -820,6 +857,7 @@ async fn get_files(file_manager: &mut FileManager, settings: &SettingsHandle) ->
         mic_profiles: file_manager.get_mic_profiles(),
         presets: file_manager.get_presets(),
         samples: get_sample_files(file_manager, settings).await,
+        sample_folders: file_manager.get_sample_folders(),
         icons: file_manager.get_icons(),
     }
 }
@@ -854,6 +892,12 @@ async fn update_files(
             files.samples
         } else {
             get_sample_files(file_manager, settings).await
+        },
+
+        sample_folders: if file_type != PathTypes::Samples {
+            files.sample_folders
+        } else {
+            file_manager.get_sample_folders()
         },
 
         icons: if file_type != PathTypes::Icons {

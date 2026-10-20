@@ -876,6 +876,15 @@ impl ProfileSettings {
         &mut self.sampler_map[button]
     }
 
+    /// Points every sampler track using the sample file `old` at `new` instead (a sample file
+    /// was renamed). Returns how many tracks were changed.
+    pub fn rename_sample_file(&mut self, old: &str, new: &str) -> usize {
+        self.sampler_map
+            .values_mut()
+            .map(|button| button.rename_track_file(old, new))
+            .sum()
+    }
+
     pub fn pitch_encoder(&self) -> &PitchEncoderBase {
         &self.pitch_encoder
     }
@@ -1020,6 +1029,31 @@ mod tests {
         assert_eq!(
             settings.submix_tree.monitor_tree().monitored_output(),
             OutputChannels::LineOut
+        );
+    }
+
+    #[test]
+    fn renames_sample_tracks() {
+        let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let track = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(crate::components::sample::SampleBank::A)
+            .get_tracks()
+            .first()
+            .map(|track| track.track.clone());
+
+        // The test profile has a sample on the first button of bank A.
+        let old = track.expect("test profile should have a sample on TopLeft / A");
+        let changed = settings.rename_sample_file(&old, "renamed.wav");
+        assert!(changed >= 1);
+        assert_eq!(settings.rename_sample_file(&old, "other.wav"), 0);
+        assert_eq!(
+            settings
+                .sample_button(SampleButtons::TopLeft)
+                .get_stack(crate::components::sample::SampleBank::A)
+                .get_tracks()[0]
+                .track,
+            "renamed.wav"
         );
     }
 

@@ -52,6 +52,39 @@ use crate::device::CurrentState;
 use crate::files::{can_create_new_file, named_file_path};
 
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
+
+/// A sample file was renamed: updates every profile saved in `directory` that uses it, and
+/// returns the names of the profiles that changed.
+pub fn rename_sample_in_saved_profiles(directory: &Path, old: &str, new: &str) -> Vec<String> {
+    let mut changed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return changed;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("goxlr") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        match ProfileAdapter::from_named(name.to_string(), directory) {
+            Ok(mut profile) => {
+                if profile.rename_sample_file(old, new) {
+                    match profile.save(directory, true) {
+                        Ok(()) => changed.push(name.to_string()),
+                        Err(e) => warn!(
+                            "Unable to save profile {} after renaming {}: {}",
+                            name, old, e
+                        ),
+                    }
+                }
+            }
+            Err(e) => warn!("Unable to check profile {} for sample {}: {}", name, old, e),
+        }
+    }
+    changed
+}
 const DEFAULT_PROFILE: &[u8] = include_bytes!("../profiles/Default.goxlr");
 
 #[derive(Debug)]
@@ -121,6 +154,12 @@ impl ProfileAdapter {
             remove_file(path)?;
         }
         Ok(())
+    }
+
+    /// Points sampler tracks using the sample file `old` at `new` (the file was renamed).
+    /// Returns whether anything changed.
+    pub fn rename_sample_file(&mut self, old: &str, new: &str) -> bool {
+        self.profile.settings_mut().rename_sample_file(old, new) > 0
     }
 
     pub fn name(&self) -> &str {
@@ -3355,4 +3394,37 @@ pub fn usb_to_standard_button(source: Buttons) -> Button {
 
 pub fn version_newer_or_equal_to(version: &VersionNumber, comparison: VersionNumber) -> bool {
     version >= &comparison
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renames_samples_in_saved_profiles() {
+        let dir = std::env::temp_dir().join(format!("goxlr-test-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A saved profile with a sample on a button
+        let mut profile = ProfileAdapter::default();
+        profile.add_sample_file(
+            goxlr_types::SampleBank::A,
+            goxlr_types::SampleButtons::TopLeft,
+            "intro.wav".to_string(),
+        );
+        profile.save_as("Stream".to_string(), &dir, false).unwrap();
+        ProfileAdapter::default()
+            .save_as("Other".to_string(), &dir, false)
+            .unwrap();
+
+        let changed = rename_sample_in_saved_profiles(&dir, "intro.wav", "start.wav");
+        assert_eq!(changed, vec!["Stream".to_string()]);
+
+        // Reloaded from disk, the button now uses the new name
+        let mut reloaded = ProfileAdapter::from_named("Stream".to_string(), &dir).unwrap();
+        assert!(reloaded.rename_sample_file("start.wav", "check.wav"));
+        assert!(!reloaded.rename_sample_file("intro.wav", "check.wav"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

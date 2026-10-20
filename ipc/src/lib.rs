@@ -131,6 +131,11 @@ pub enum DaemonCommand {
     SetSampleGainPct(String, u8),
     ApplySampleChange,
 
+    // Sample file management, paths are relative to the samples directory ('/' separated).
+    CreateSampleFolder(String),
+    // Moves or renames a sample file or folder: (from, to)
+    MoveSamplePath(String, String),
+
     HandleMacOSAggregates(bool),
 }
 

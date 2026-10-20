@@ -717,6 +717,16 @@ impl SettingsHandle {
         let entry = settings.sample_gain.as_mut().unwrap().entry(name);
         entry.and_modify(|v| *v = value).or_insert(value);
     }
+
+    /// A sample file was renamed, keep its gain under the new name.
+    pub async fn rename_sample_gain(&self, old: &str, new: &str) {
+        let mut settings = self.settings.write().await;
+        if let Some(gains) = settings.sample_gain.as_mut()
+            && let Some(gain) = gains.remove(old)
+        {
+            gains.insert(new.to_string(), gain);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

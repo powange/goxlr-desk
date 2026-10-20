@@ -435,6 +435,9 @@ pub struct Files {
     pub mic_profiles: Vec<String>,
     pub presets: Vec<String>,
     pub samples: BTreeMap<String, SampleFile>,
+    // Every folder below the samples directory, so empty ones can be shown too.
+    #[serde(default)]
+    pub sample_folders: Vec<String>,
     pub icons: Vec<String>,
 }
 

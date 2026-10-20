@@ -136,9 +136,18 @@ impl FileManager {
 
     pub fn get_samples(&mut self) -> BTreeMap<String, String> {
         let base_path = self.paths.samples.clone();
-        let extensions = ["wav", "mp3", "ogg", "flac"].to_vec();
+        let extensions = SAMPLE_EXTENSIONS.to_vec();
 
         self.get_recursive_file_list(base_path, extensions)
+    }
+
+    /// Every folder below the samples directory (relative paths), empty ones included.
+    pub fn get_sample_folders(&mut self) -> Vec<String> {
+        let base = self.paths.samples.clone();
+        let mut folders = Vec::new();
+        collect_folders(&base, &base, &mut folders);
+        folders.sort();
+        folders
     }
 
     pub fn get_icons(&mut self) -> Vec<String> {
@@ -358,6 +367,124 @@ fn recursive_file_list(path: PathBuf, extensions: Vec<&str>) -> BTreeMap<String,
     map
 }
 
+pub const SAMPLE_EXTENSIONS: [&str; 4] = ["wav", "mp3", "ogg", "flac"];
+
+fn collect_folders(base: &Path, directory: &Path, folders: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(relative) = path.strip_prefix(base) {
+                folders.push(relative.to_string_lossy().to_string());
+            }
+            collect_folders(base, &path, folders);
+        }
+    }
+}
+
+/// Turns a path relative to the samples directory (from a client, '/' or '\\' separated) into
+/// a full path, refusing anything that could point outside of the samples directory.
+fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
+    let mut path = base.to_path_buf();
+    let mut parts = 0;
+    for part in relative.split(['/', '\\']).filter(|part| !part.is_empty()) {
+        let invalid = part == "."
+            || part == ".."
+            || part
+                .chars()
+                .any(|c| c.is_control() || (cfg!(windows) && c == ':'));
+        if invalid {
+            bail!("Invalid path: {:?}", relative);
+        }
+        path.push(part);
+        parts += 1;
+    }
+    if parts == 0 {
+        bail!("Invalid path: {:?}", relative);
+    }
+    Ok(path)
+}
+
+fn is_sample_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            SAMPLE_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+        })
+}
+
+/// Creates a folder in the samples directory, its parent folder must already exist.
+pub fn create_sample_folder(base: &Path, relative: &str) -> Result<()> {
+    let path = sample_path(base, relative)?;
+    if path.exists() {
+        bail!("{} already exists", relative);
+    }
+    if !path.parent().is_some_and(|parent| parent.is_dir()) {
+        bail!("The parent folder of {} doesn't exist", relative);
+    }
+    fs::create_dir(&path).context(format!("Unable to create {}", relative))?;
+    Ok(())
+}
+
+/// A sample file that changed name, profiles referencing it need updating.
+pub struct RenamedSample {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// Moves or renames a sample file or folder inside the samples directory. Profiles only store
+/// a sample's file name (it's then searched for in every folder), so a file keeps an audio
+/// extension, and a new file name must not already be used by another sample.
+pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<RenamedSample>> {
+    let source = sample_path(base, from)?;
+    let target = sample_path(base, to)?;
+
+    if !source.exists() {
+        bail!("{} doesn't exist", from);
+    }
+    if target.exists() {
+        bail!("{} already exists", to);
+    }
+    if !target.parent().is_some_and(|parent| parent.is_dir()) {
+        bail!("The destination folder of {} doesn't exist", to);
+    }
+
+    let mut renamed = None;
+    if source.is_dir() {
+        if target.starts_with(&source) {
+            bail!("A folder can't be moved inside itself");
+        }
+    } else {
+        if !is_sample_file(&target) {
+            bail!(
+                "{} must keep an audio extension ({})",
+                to,
+                SAMPLE_EXTENSIONS.join(", ")
+            );
+        }
+        let old_name = source.file_name().map(|n| n.to_string_lossy().to_string());
+        let new_name = target.file_name().map(|n| n.to_string_lossy().to_string());
+        if let (Some(old_name), Some(new_name)) = (old_name, new_name)
+            && old_name != new_name
+        {
+            let in_use = recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
+                .values()
+                .any(|name| name == &new_name);
+            if in_use {
+                bail!("A sample named {} already exists", new_name);
+            }
+            renamed = Some(RenamedSample { old_name, new_name });
+        }
+    }
+
+    fs::rename(&source, &target).context(format!("Unable to move {} to {}", from, to))?;
+    Ok(renamed)
+}
+
 pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
     // The file name comes from profiles or clients, it must stay inside the directory.
     let escapes = file
@@ -507,6 +634,67 @@ mod tests {
         assert!(named_file_path(dir, "..\\..\\x", "goxlr").is_err());
         assert!(named_file_path(dir, "/etc/passwd", "goxlr").is_err());
         assert!(named_file_path(dir, "bad\nname", "goxlr").is_err());
+    }
+}
+
+#[cfg(test)]
+mod sample_management_tests {
+    use super::*;
+
+    #[test]
+    fn create_rename_and_move() {
+        let base = std::env::temp_dir().join(format!("goxlr-test-manage-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("intro.wav"), b"").unwrap();
+        fs::write(base.join("outro.mp3"), b"").unwrap();
+
+        // Folders, nested and empty
+        create_sample_folder(&base, "Jingles").unwrap();
+        create_sample_folder(&base, "Jingles/Old").unwrap();
+        assert!(create_sample_folder(&base, "Jingles").is_err());
+        assert!(create_sample_folder(&base, "Missing/Child").is_err());
+        assert!(create_sample_folder(&base, "../escape").is_err());
+        assert!(create_sample_folder(&base, "").is_err());
+
+        // Moving a file keeps its name, nothing to update in profiles
+        let moved = move_sample_path(&base, "intro.wav", "Jingles/intro.wav").unwrap();
+        assert!(moved.is_none());
+        assert!(base.join("Jingles/intro.wav").is_file());
+
+        // Renaming a file reports the old and new names
+        let renamed = move_sample_path(&base, "Jingles/intro.wav", "Jingles/start.wav")
+            .unwrap()
+            .expect("file name changed");
+        assert_eq!(
+            (renamed.old_name.as_str(), renamed.new_name.as_str()),
+            ("intro.wav", "start.wav")
+        );
+
+        // Refused: name already used elsewhere, non audio extension, escaping, missing source
+        assert!(move_sample_path(&base, "Jingles/start.wav", "Jingles/outro.mp3").is_err());
+        assert!(move_sample_path(&base, "Jingles/start.wav", "Jingles/start.exe").is_err());
+        assert!(move_sample_path(&base, "Jingles/start.wav", "../start.wav").is_err());
+        assert!(move_sample_path(&base, "nothing.wav", "other.wav").is_err());
+
+        // Folders can be renamed, but not moved inside themselves
+        assert!(move_sample_path(&base, "Jingles", "Jingles/Old/Jingles").is_err());
+        assert!(
+            move_sample_path(&base, "Jingles", "Stingers")
+                .unwrap()
+                .is_none()
+        );
+        assert!(base.join("Stingers/start.wav").is_file());
+
+        let mut folders = Vec::new();
+        collect_folders(&base, &base, &mut folders);
+        folders.sort();
+        let separator = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            folders,
+            vec!["Stingers".to_string(), format!("Stingers{separator}Old")]
+        );
+
+        fs::remove_dir_all(&base).unwrap();
     }
 }
 

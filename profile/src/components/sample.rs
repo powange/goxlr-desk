@@ -262,6 +262,21 @@ impl SampleBase {
     pub fn get_stack_mut(&mut self, bank: SampleBank) -> &mut SampleStack {
         &mut self.sample_stack[bank]
     }
+
+    /// Points every track using the sample file `old` at `new` instead, in all banks. Returns
+    /// how many tracks were changed.
+    pub fn rename_track_file(&mut self, old: &str, new: &str) -> usize {
+        let mut changed = 0;
+        for stack in self.sample_stack.values_mut() {
+            for track in stack.get_tracks_mut() {
+                if track.track == old {
+                    track.track = new.to_string();
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
 }
 
 #[derive(Debug)]
