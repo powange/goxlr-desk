@@ -79,9 +79,16 @@ impl RequestPolicy {
             || self.host_names.contains(&name)
     }
 
-    /// An Origin is accepted if it matches the Host (the request comes from a page we served), or
-    /// if CORS is enabled and the page is served from this machine's loopback address.
+    /// An Origin is accepted if it matches the Host (the request comes from a page we served), if
+    /// it's a local file, or if CORS is enabled and the page is served from this machine's loopback
+    /// address.
     fn is_origin_allowed(&self, origin: &str, host: Option<&str>) -> bool {
+        // Local HTML apps, such as Stream Deck plugins, connect from a file:// page. No web site
+        // can send this origin ('null', which any site can produce with a sandboxed iframe, is
+        // still refused).
+        if origin.eq_ignore_ascii_case("file://") {
+            return true;
+        }
         let Some(authority) = strip_scheme(origin) else {
             return false;
         };
@@ -225,6 +232,8 @@ pub async fn spawn_http_server(
             .service(upload_firmware)
             .default_service(web::to(default))
     })
+    // Don't hold up the daemon's shutdown waiting for open connections (such as WebSockets).
+    .shutdown_timeout(2)
     .bind((settings.bind_address.clone(), settings.port));
 
     if let Err(e) = server {
@@ -301,7 +310,12 @@ async fn websocket(
                         break e;
                     }
                 }
-                Some(Ok(msg)) = msg_stream.next() => {
+                msg = msg_stream.next() => {
+                    // The client has gone (or the stream failed), stop handling this socket,
+                    // otherwise this task lives on waiting for patches.
+                    let Some(Ok(msg)) = msg else {
+                        break None;
+                    };
                     match msg {
                         AggregatedMessage::Ping(msg) => {
                             if let Err(e) = session.pong(&msg).await {
@@ -801,7 +815,10 @@ mod tests {
         assert!(!policy.is_origin_allowed("http://localhost.evil.com", host));
         assert!(!policy.is_origin_allowed("http://localhost:3000", host));
         assert!(!policy.is_origin_allowed("null", host));
-        assert!(!policy.is_origin_allowed("file://", host));
+
+        // Local HTML apps (Stream Deck plugins) connect from file:// pages.
+        assert!(policy.is_origin_allowed("file://", host));
+        assert!(!policy.is_origin_allowed("file://evil.com", host));
         assert!(!policy.is_origin_allowed("http://localhost:14564", None));
     }
 
