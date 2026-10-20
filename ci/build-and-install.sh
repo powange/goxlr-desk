@@ -1,11 +1,20 @@
 #!/bin/bash
 
-# This is a script which will build and install the relevant parts under linux, note that this should
-# probably be run under sudo..
+# This is a script which will build and install the relevant parts under linux. Run it as your
+# normal user: it calls sudo itself for the install steps, and running the whole script as root
+# would create the build directory as root.
+
+set -euo pipefail
+
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Please run this script as your normal user, not as root (it will use sudo when needed)." >&2
+    exit 1
+fi
 
 D="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
-cargo build --release
+# Same features as the packages built by ci/build-packages
+cargo build --release --all-features
 
 strip target/release/goxlr-client
 strip target/release/goxlr-daemon
@@ -25,7 +34,6 @@ sudo cp target/release/goxlr-daemon /usr/bin/
 sudo cp target/release/goxlr-client /usr/bin/
 sudo cp target/release/goxlr-defaults /usr/bin/
 sudo cp target/release/goxlr-launcher /usr/bin/
-sudo cp target/release/goxlr-firmware /usr/bin/
 
 sudo chmod 755 /usr/bin/goxlr-client /usr/bin/goxlr-daemon /usr/bin/goxlr-defaults /usr/bin/goxlr-launcher
 

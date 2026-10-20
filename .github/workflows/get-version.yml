@@ -6,6 +6,9 @@ on:
         description: "The GoXLR Utility Version Number"
         value: ${{ jobs.get_version.outputs.version }}
 
+permissions:
+  contents: read
+
 jobs:
   get_version:
     name: "Get Version"
@@ -14,13 +17,12 @@ jobs:
       version: ${{ steps.store_version.outputs.version }}
     steps:
       - name: "Check out Repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: "Install Rust"
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: "Update Cargo.lock"
-        run: cargo update
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: "Store Version"
         id: store_version

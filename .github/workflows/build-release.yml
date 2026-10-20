@@ -1,5 +1,9 @@
 name: Create Release Build
 on: [ workflow_dispatch, workflow_call ]
+
+# Builds only read the repository, artifacts are uploaded with the job token.
+permissions:
+  contents: read
 jobs:
   get_version:
     name: "Version"
@@ -33,22 +37,26 @@ jobs:
 
       # Firstly Checkout our Repository..
       - name: "Check out GoXLR Utility"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: goxlr-utility
 
       # Now Checkout the App Wrappers repository..
       - name: "Check out GoXLR Utility UI"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: goxlr-on-linux/goxlr-utility-ui-wrapper-app
+          # Pinned so a release always builds the same UI, update this to ship a newer UI.
+          ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
       - name: "Install Rust"
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: "Loading Cache"
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         continue-on-error: false
         with:
           path: |
@@ -69,7 +77,7 @@ jobs:
 
       # Prepare NSIS
       - name: Install NSIS
-        uses: repolevedavaj/install-nsis@v1.0.3
+        uses: repolevedavaj/install-nsis@265e893c16602d8ccfb0a9ca44173b084078917c # v1.0.3
         with:
           nsis-version: '3.11'
 
@@ -77,34 +85,34 @@ jobs:
         run: mkdir -p ${{ github.workspace }}/NSIS_Plugins/x86-unicode/
 
       - name: "Downloading Tauri Utility Plugin"
-        uses: suisei-cn/actions-download-file@v1.6.0
+        uses: suisei-cn/actions-download-file@818d6b7dc8fe73f2f924b6241f2b1134ca1377d9 # v1.6.0
         with:
           url: https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.1.1/nsis_tauri_utils.dll
           target: ${{ github.workspace }}/NSIS_Plugins/x86-unicode/
 
       - name: "Downloading WebView2 Bootstrapper"
-        uses: suisei-cn/actions-download-file@v1.6.0
+        uses: suisei-cn/actions-download-file@818d6b7dc8fe73f2f924b6241f2b1134ca1377d9 # v1.6.0
         with:
           url: https://go.microsoft.com/fwlink/p/?LinkId=2124703
           filename: MicrosoftEdgeWebview2Setup.exe
           target: goxlr-utility/ci/nsis/
 
       - name: "Downloading VC Runtime"
-        uses: suisei-cn/actions-download-file@v1.6.0
+        uses: suisei-cn/actions-download-file@818d6b7dc8fe73f2f924b6241f2b1134ca1377d9 # v1.6.0
         with:
           url: ${{ matrix.visual_c }}
           filename: vc_redist.exe
           target: goxlr-utility/ci/nsis/
 
       - name: "Build NSIS Packages"
-        uses: joncloud/makensis-action@publish
+        uses: joncloud/makensis-action@1446fc4d066482f715a57952550f559a3ab72b8a # publish branch
         with:
           additional-plugin-paths: ${{ github.workspace }}/NSIS_Plugins
           script-file: goxlr-utility/ci/nsis/goxlr-utility.nsi
           arguments: "/DPRODUCT_VERSION=${{ needs.get_version.outputs.version }}${{ env.SUFFIX }}"
 
       - name: "Upload Installer"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ./goxlr-utility/ci/Output/*.exe
@@ -115,10 +123,12 @@ jobs:
     needs: [ get_version ]
     steps:
       - name: "Check out Repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: "Install Rust"
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: "Install Required Libraries"
         run: |
@@ -126,7 +136,7 @@ jobs:
           sudo apt-get install libpulse0 libdbus-1-dev pkg-config libspeechd-dev
 
       - name: "Loading Cache"
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         continue-on-error: false
         with:
           path: |
@@ -146,13 +156,13 @@ jobs:
         shell: bash
 
       - name: "Upload DEB Artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: debian-artifact
           path: ./target/debian/*.deb
 
       - name: "Upload RPM Artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rpm-artifact
           path: ./target/generate-rpm/*.rpm
@@ -166,22 +176,26 @@ jobs:
     needs: [ get_version ]
     steps:
       - name: "Checkout Repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: goxlr-utility
 
       # Now Checkout the App Wrappers repository..
       - name: "Check out GoXLR Utility UI"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: goxlr-on-linux/goxlr-utility-ui-wrapper-app
+          # Pinned so a release always builds the same UI, update this to ship a newer UI.
+          ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
       - name: "Install Rust"
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: "Loading Cache"
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         continue-on-error: false
         with:
           path: |
@@ -201,7 +215,7 @@ jobs:
         shell: bash
 
       - name: "Upload MacOS zip Artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-artifact-${{ matrix.targets }}
           path: ./macos_binaries_*.tgz
@@ -213,15 +227,15 @@ jobs:
 
     steps:
       - name: "Checkout Repository"
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: "Download x86_64 Artifact"
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: "macos-artifact-x86_64-apple-darwin"
 
       - name: "Download aarch64 Artifact"
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: "macos-artifact-aarch64-apple-darwin"
 
@@ -235,17 +249,17 @@ jobs:
         shell: bash
 
       - name: "Upload MacOS final Artifact"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-artifact
           path: ./goxlr-utility-macos-*.pkg
 
       - name: "Remove x64 artifact"
-        uses: geekyeggo/delete-artifact@v5.1.0
+        uses: geekyeggo/delete-artifact@f275313e70c08f6120db482d7a6b98377786765b # v5.1.0
         with:
           name: macos-artifact-x86_64-apple-darwin
 
       - name: "Remove aarch artifact"
-        uses: geekyeggo/delete-artifact@v5.1.0
+        uses: geekyeggo/delete-artifact@f275313e70c08f6120db482d7a6b98377786765b # v5.1.0
         with:
           name: macos-artifact-aarch64-apple-darwin

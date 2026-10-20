@@ -2098,6 +2098,7 @@ dependencies = [
  "json-patch",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio-serde",
  "tokio-util",
 ]
@@ -6420,7 +6421,7 @@ dependencies = [
 [[package]]
 name = "xpc-connection-sys"
 version = "0.1.1"
-source = "git+https://github.com/dfrankland/xpc-connection-rs.git#cd4fb3d05edb4292ccb9566ae27cdeb874222d2a"
+source = "git+https://github.com/dfrankland/xpc-connection-rs.git?rev=cd4fb3d05edb4292ccb9566ae27cdeb874222d2a#cd4fb3d05edb4292ccb9566ae27cdeb874222d2a"
 dependencies = [
  "bindgen 0.58.1",
 ]
