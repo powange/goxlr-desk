@@ -34,8 +34,8 @@ use tokio::sync::{RwLock, oneshot};
 use crate::PatchEvent;
 use crate::files::{FilePaths, find_file_in_path};
 use goxlr_ipc::{
-    DaemonCommand, DaemonRequest, DaemonResponse, DaemonStatus, HttpSettings, Scribble,
-    WebsocketRequest, WebsocketResponse,
+    DaemonCommand, DaemonRequest, DaemonResponse, DaemonStatus, GoXLRCommand, HttpSettings,
+    Scribble, WebsocketRequest, WebsocketResponse,
 };
 use goxlr_scribbles::get_scribble_png;
 use goxlr_types::FaderName;
@@ -127,24 +127,72 @@ fn is_loopback_origin(origin: &str) -> bool {
     strip_scheme(origin).is_some_and(|authority| is_loopback_name(strip_port(authority)))
 }
 
-/// Whether the request comes from this machine (as opposed to another machine on the network,
-/// which is only possible when network access is enabled).
-fn is_local_peer(req: &HttpRequest) -> bool {
-    req.peer_addr()
-        .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+/// A 'null' origin: sent by some local apps, but also by sandboxed pages of any web site.
+fn is_opaque_origin(origin: &str) -> bool {
+    origin.eq_ignore_ascii_case("null")
 }
 
-/// Requests that run a program or flash a file from this machine's disk are refused when they
-/// come from another machine, the HTTP API has no authentication.
-fn local_only_reason(request: &DaemonRequest) -> Option<&'static str> {
-    match request {
-        DaemonRequest::Daemon(DaemonCommand::SetActivatorPath(_)) => {
-            Some("The activator can only be changed from this computer")
+/// Where a request comes from, which decides what it's allowed to do.
+#[derive(Clone, Copy)]
+struct RequestSource {
+    // From this machine, rather than another machine on the network.
+    local_peer: bool,
+    // With a 'null' origin, which a web page can also send.
+    opaque_origin: bool,
+}
+
+impl RequestSource {
+    fn of(req: &HttpRequest) -> Self {
+        Self {
+            local_peer: req
+                .peer_addr()
+                .is_some_and(|addr| addr.ip().to_canonical().is_loopback()),
+            opaque_origin: req
+                .headers()
+                .get(header::ORIGIN)
+                .and_then(|o| o.to_str().ok())
+                .is_some_and(is_opaque_origin),
         }
-        DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
-            Some("A firmware file on disk can only be flashed from this computer")
+    }
+
+    /// Why this request is refused from this source, if it is. The HTTP API has no
+    /// authentication, so:
+    /// - from another machine, nothing that runs a program or flashes a file from this disk,
+    /// - with a 'null' origin (which any web page can send), only reading the status and
+    ///   controlling the mixer, the same things the Stream Deck plugin does.
+    fn refused_reason(&self, request: &DaemonRequest) -> Option<&'static str> {
+        if self.opaque_origin {
+            let allowed = match request {
+                DaemonRequest::Ping | DaemonRequest::GetStatus | DaemonRequest::GetMicLevel(_) => {
+                    true
+                }
+                DaemonRequest::Command(_, command) => !matches!(
+                    command,
+                    GoXLRCommand::DeleteProfile(_)
+                        | GoXLRCommand::DeleteMicProfile(_)
+                        | GoXLRCommand::SetShutdownCommands(_)
+                        | GoXLRCommand::SetSleepCommands(_)
+                        | GoXLRCommand::SetWakeCommands(_)
+                ),
+                _ => false,
+            };
+            if !allowed {
+                return Some("This request isn't allowed from a page without an origin");
+            }
         }
-        _ => None,
+
+        if !self.local_peer {
+            match request {
+                DaemonRequest::Daemon(DaemonCommand::SetActivatorPath(_)) => {
+                    return Some("The activator can only be changed from this computer");
+                }
+                DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
+                    return Some("A firmware file on disk can only be flashed from this computer");
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }
 
@@ -161,10 +209,17 @@ async fn check_request_source(
 
         // Requests without these headers don't come from a browser, so they can't be forged
         // by a web page, and are let through.
+        // Some local apps (the Stream Deck plugin) send a 'null' origin, which any web page can
+        // also produce (with a sandboxed iframe). Those get limited access, only on the APIs the
+        // plugin uses, see restricted_reason().
+        let opaque = origin.is_some_and(is_opaque_origin)
+            && matches!(req.path(), "/api/websocket" | "/api/command");
+
         let allowed = match req.app_data::<Data<RequestPolicy>>() {
             Some(policy) => {
                 host.is_none_or(|host| policy.is_host_allowed(host))
-                    && origin.is_none_or(|origin| policy.is_origin_allowed(origin, host))
+                    && (opaque
+                        || origin.is_none_or(|origin| policy.is_origin_allowed(origin, host)))
             }
             None => false,
         };
@@ -289,7 +344,7 @@ async fn websocket(
     body: web::Payload,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, msg_stream) = actix_ws::handle(&req, body)?;
-    let local_peer = is_local_peer(&req);
+    let source = RequestSource::of(&req);
 
     let data = app_data.read().await;
     let mut usb_tx = data.usb_tx.clone();
@@ -330,11 +385,11 @@ async fn websocket(
                             match serde_json::from_slice::<WebsocketRequest>(msg.as_ref()) {
                                 Ok(request) => {
                                     let request_id = request.id;
-                                    let result = match local_only_reason(&request.data) {
-                                        Some(reason) if !local_peer => {
+                                    let result = match source.refused_reason(&request.data) {
+                                        Some(reason) => {
                                             Ok(DaemonResponse::Error(reason.to_string()))
                                         }
-                                        _ => handle_packet(request.data, &mut usb_tx).await,
+                                        None => handle_packet(request.data, &mut usb_tx).await,
                                     };
                                     let response = match result {
                                         Ok(resp) => {
@@ -480,9 +535,7 @@ async fn execute_command(
     app_data: Data<RwLock<AppData>>,
     req: HttpRequest,
 ) -> HttpResponse {
-    if !is_local_peer(&req)
-        && let Some(reason) = local_only_reason(&request.0)
-    {
+    if let Some(reason) = RequestSource::of(&req).refused_reason(&request.0) {
         return HttpResponse::Ok().json(DaemonResponse::Error(reason.to_string()));
     }
 
@@ -820,6 +873,76 @@ mod tests {
         assert!(policy.is_origin_allowed("file://", host));
         assert!(!policy.is_origin_allowed("file://evil.com", host));
         assert!(!policy.is_origin_allowed("http://localhost:14564", None));
+    }
+
+    #[test]
+    fn opaque_origin_is_restricted() {
+        let opaque = RequestSource {
+            local_peer: true,
+            opaque_origin: true,
+        };
+        let serial = "S1".to_string();
+
+        // What the Stream Deck plugin does
+        assert!(opaque.refused_reason(&DaemonRequest::GetStatus).is_none());
+        let volume = GoXLRCommand::SetVolume(goxlr_types::ChannelName::Mic, 100);
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial.clone(), volume))
+                .is_none()
+        );
+        let profile = GoXLRCommand::LoadProfile("Default".into(), true);
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial.clone(), profile))
+                .is_none()
+        );
+
+        // What a web page must not be able to do
+        let activator = DaemonCommand::SetActivatorPath(Some("/bin/sh".into()));
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Daemon(activator))
+                .is_some()
+        );
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Daemon(DaemonCommand::StopDaemon))
+                .is_some()
+        );
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::RunFirmwareUpdate(
+                    serial.clone(),
+                    None,
+                    false
+                ))
+                .is_some()
+        );
+        let delete = GoXLRCommand::DeleteProfile("Default".into());
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial.clone(), delete))
+                .is_some()
+        );
+        let shutdown = GoXLRCommand::SetShutdownCommands(vec![]);
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial, shutdown))
+                .is_some()
+        );
+
+        // A normal local page keeps full access
+        let local = RequestSource {
+            local_peer: true,
+            opaque_origin: false,
+        };
+        let activator = DaemonCommand::SetActivatorPath(Some("/bin/sh".into()));
+        assert!(
+            local
+                .refused_reason(&DaemonRequest::Daemon(activator))
+                .is_none()
+        );
     }
 
     #[test]
