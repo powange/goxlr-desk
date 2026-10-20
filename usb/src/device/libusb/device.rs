@@ -417,7 +417,17 @@ impl ExecutableGoXLR for GoXLRUSB {
                 };
             }
 
-            debug_assert!(response.len() == response_length as usize);
+            // The header says how long the body is, never hand back a short or padded body.
+            let response_length = response_length as usize;
+            if response.len() < response_length {
+                self.pause_polling.store(false, Ordering::Relaxed);
+                bail!(
+                    "Response too short, expected {} bytes, received {}",
+                    response_length,
+                    response.len()
+                );
+            }
+            response.truncate(response_length);
             break;
         }
 

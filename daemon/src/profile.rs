@@ -995,9 +995,9 @@ impl ProfileAdapter {
         let mute_config = self.get_mute_button(fader);
         let colour_map = mute_config.colour_map();
 
-        // We should be safe to straight unwrap these, state and blink are always present.
-        let muted_to_x = colour_map.state().as_ref().unwrap() == &ColourState::On;
-        let muted_to_all = colour_map.blink().as_ref().unwrap() == &ColourState::On;
+        // A profile missing these attributes (edited by hand, or by another tool) isn't muted.
+        let muted_to_x = matches!(colour_map.state(), Some(ColourState::On));
+        let muted_to_all = matches!(colour_map.blink(), Some(ColourState::On));
         let mute_function = *mute_config.mute_function();
 
         (muted_to_x, muted_to_all, mute_function)

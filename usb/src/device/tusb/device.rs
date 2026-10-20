@@ -322,7 +322,7 @@ impl ExecutableGoXLR for TUSBAudioGoXLR {
             bail!("Invalid Response");
         }
 
-        let response = response_header.split_off(16);
+        let mut response = response_header.split_off(16);
         let response_length = LittleEndian::read_u16(&response_header[4..6]);
         let response_command_index = LittleEndian::read_u16(&response_header[6..8]);
 
@@ -349,7 +349,16 @@ impl ExecutableGoXLR for TUSBAudioGoXLR {
             };
         }
 
-        debug_assert!(response.len() == response_length as usize);
+        // The header says how long the body is, never hand back a short or padded body.
+        let response_length = response_length as usize;
+        if response.len() < response_length {
+            bail!(
+                "Response too short, expected {} bytes, received {}",
+                response_length,
+                response.len()
+            );
+        }
+        response.truncate(response_length);
         Ok(response)
     }
 

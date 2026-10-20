@@ -10,10 +10,11 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 use ritelinked::LinkedHashMap;
 use strum::{Display, EnumIter, EnumProperty, EnumString};
 
-use crate::SampleButtons;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::components::sample::PlayOrder::{Random, Sequential};
 use crate::profile::Attribute;
+use crate::{SampleButtons, enum_from_index};
+use log::warn;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -101,11 +102,17 @@ impl SampleBase {
 
         // Pull out any 'extra' attributes which may be useful..
         if let Some(value) = map.get("playbackMode") {
-            sample_stack.playback_mode = Some(PlaybackMode::from_usize(value.parse::<usize>()?));
+            sample_stack.playback_mode = enum_from_index(value.parse::<usize>()?);
+            if sample_stack.playback_mode.is_none() {
+                warn!("Ignoring unknown sample playbackMode: {}", value);
+            }
         }
 
         if let Some(value) = map.get("playOrder") {
-            sample_stack.play_order = Some(PlayOrder::from_usize(value.parse::<usize>()?));
+            sample_stack.play_order = enum_from_index(value.parse::<usize>()?);
+            if sample_stack.play_order.is_none() {
+                warn!("Ignoring unknown sample playOrder: {}", value);
+            }
         }
 
         // Ok, somewhere in here we should have a key that tells us how many tracks are configured..

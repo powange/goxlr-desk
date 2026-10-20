@@ -978,3 +978,27 @@ pub(crate) fn wrap_start_event(event: &BytesStart) -> Result<(String, Vec<Attrib
     }
     Ok((name, attributes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_PROFILE: &str = include_str!("../test-data/profile.xml");
+
+    #[test]
+    fn loads_test_profile() {
+        assert!(ProfileSettings::load(TEST_PROFILE.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn out_of_range_enum_indexes_do_not_panic() {
+        let profile = TEST_PROFILE
+            .replacen("playbackMode=\"1\"", "playbackMode=\"9\"", 1)
+            .replacen(
+                "coughButtonMuteSourceSelection=\"0\"",
+                "coughButtonMuteSourceSelection=\"7\"",
+                1,
+            );
+        assert!(ProfileSettings::load(profile.as_bytes()).is_ok());
+    }
+}

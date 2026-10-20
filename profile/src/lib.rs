@@ -7,6 +7,12 @@ pub mod mic_profile;
 pub mod microphone;
 pub mod profile;
 
+/// Converts an index read from a profile into an enum value, profiles can be edited by hand or
+/// by other tools, so an out of range index returns None rather than panicking.
+pub(crate) fn enum_from_index<T: Enum>(index: usize) -> Option<T> {
+    (index < T::LENGTH).then(|| T::from_usize(index))
+}
+
 #[derive(Debug, Display, Enum, EnumIter, EnumProperty, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum SampleButtons {
     #[strum(props(contextTitle = "sampleTopLeft"))]

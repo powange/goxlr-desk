@@ -616,9 +616,18 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     if let Some(path) = file {
         debug!("Found at {:?}", path);
         let mime_type = MimeGuess::from_path(path.clone()).first_or_octet_stream();
-        let mut builder = HttpResponse::Ok();
-        builder.insert_header(ContentType(mime_type));
-        return builder.body(fs::read(path).unwrap());
+        return match fs::read(&path) {
+            Ok(contents) => {
+                let mut builder = HttpResponse::Ok();
+                builder.insert_header(ContentType(mime_type));
+                builder.body(contents)
+            }
+            // The file may have been removed, or be unreadable, since it was found.
+            Err(error) => {
+                warn!("Unable to read sample {:?}: {}", path, error);
+                HttpResponse::NotFound().finish()
+            }
+        };
     }
 
     HttpResponse::NotFound().finish()

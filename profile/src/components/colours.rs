@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::warn;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -123,15 +124,14 @@ impl ColourMap {
                 default
             });
 
-            // TODO: Tidy this monster up..
-            if let Some(index) = attribute
-                .name
-                .chars()
-                .last()
-                .map(|s| usize::from_str(&s.to_string()))
-                .transpose()?
+            // The attribute ends with the colour's index (eg. 'colour0'), which must exist.
+            let suffix = &attribute.name[attr_key.len()..];
+            match usize::from_str(suffix)
+                .ok()
+                .and_then(|i| color_list.get_mut(i))
             {
-                color_list[index] = Some(Colour::new(&attribute.value)?);
+                Some(slot) => *slot = Some(Colour::new(&attribute.value)?),
+                None => warn!("Ignoring unknown colour attribute: {}", attribute.name),
             }
 
             return Ok(true);
@@ -219,7 +219,7 @@ impl ColourMap {
 
     pub fn colour_or_default(&self, index: u8) -> &Colour {
         if let Some(colour_list) = &self.colour_list
-            && let Some(colour) = &colour_list[index as usize]
+            && let Some(Some(colour)) = colour_list.get(index as usize)
         {
             return colour;
         }
@@ -310,14 +310,15 @@ impl ColourMap {
     }
 
     pub fn set_colour(&mut self, index: usize, input: Colour) {
-        if let Some(colour) = &mut self.colour_list {
-            colour[index] = Some(input);
-        } else {
-            // Apparently the colour list isn't defined, it should be, but whatever..
+        // Apparently the colour list may not be defined, it should be, but whatever..
+        let colours = self.colour_list.get_or_insert_with(|| {
             let mut default = Vec::new();
             default.resize_with(3, || None);
-            default[index] = Some(input);
-            self.colour_list = Some(default);
+            default
+        });
+        match colours.get_mut(index) {
+            Some(colour) => *colour = Some(input),
+            None => warn!("Ignoring colour for unknown index {}", index),
         }
     }
     pub fn set_off_style(&mut self, off_style: ColourOffStyle) {
@@ -385,7 +386,8 @@ impl Colour {
             return Ok(DEFAULT_COLOUR);
         };
 
-        if argb.len() != 8 {
+        // Slicing below works on bytes, so only accept plain ASCII hex input.
+        if argb.len() != 8 || !argb.is_ascii() {
             return Err(ParseError::InvalidARGBLength(argb.to_string()));
         }
         Ok(Self {
@@ -397,7 +399,7 @@ impl Colour {
     }
 
     pub fn fromrgb(rgb: &str) -> Result<Self, ParseError> {
-        if rgb.len() != 6 {
+        if rgb.len() != 6 || !rgb.is_ascii() {
             return Err(ParseError::InvalidRGBLength(rgb.to_string()));
         }
 
@@ -431,5 +433,57 @@ impl Colour {
 
     pub fn to_reverse_bytes(&self) -> [u8; 4] {
         [self.blue, self.green, self.red, self.alpha]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attribute(name: &str, value: &str) -> Attribute {
+        Attribute {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn colour_indexes_are_bounded() {
+        let mut map = ColourMap::new("fader".to_string());
+        assert!(
+            map.read_colours(&attribute("fadercolour0", "FF112233"))
+                .unwrap()
+        );
+        assert!(
+            map.read_colours(&attribute("fadercolour2", "FF445566"))
+                .unwrap()
+        );
+
+        // Out of range indexes are ignored instead of panicking, or overwriting index 0.
+        assert!(
+            map.read_colours(&attribute("fadercolour3", "FF000000"))
+                .unwrap()
+        );
+        assert!(
+            map.read_colours(&attribute("fadercolour10", "FF000000"))
+                .unwrap()
+        );
+        assert!(
+            map.read_colours(&attribute("fadercolourX", "FF000000"))
+                .unwrap()
+        );
+        assert_eq!(map.colour_or_default(0).to_argb(), "FF112233");
+        assert_eq!(map.colour_or_default(2).to_argb(), "FF445566");
+        assert_eq!(map.colour_or_default(9).to_argb(), DEFAULT_COLOUR.to_argb());
+
+        map.set_colour(7, Colour::new("FFFFFFFF").unwrap());
+    }
+
+    #[test]
+    fn colours_must_be_ascii() {
+        assert!(Colour::new("FF00FF00").is_ok());
+        assert!(Colour::new("aébbbbb").is_err());
+        assert!(Colour::new("zzzzzzzz").is_err());
+        assert!(Colour::fromrgb("éabcd").is_err());
     }
 }
