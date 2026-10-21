@@ -34,9 +34,15 @@ pub fn network_token() -> Option<String> {
     NETWORK_TOKEN.lock().ok()?.clone()
 }
 
-fn publish_token(token: &Option<String>) {
+/// The token other machines must present: none while network access is off, so turning it off
+/// cuts them at once (without waiting for a restart).
+fn publish_token(settings: &Settings) {
+    let token = match settings.allow_network_access {
+        Some(true) => settings.network_token.clone(),
+        _ => None,
+    };
     if let Ok(mut current) = NETWORK_TOKEN.lock() {
-        current.clone_from(token);
+        *current = token;
     }
 }
 
@@ -191,7 +197,7 @@ impl SettingsHandle {
         if settings.allow_network_access == Some(true) && settings.network_token.is_none() {
             settings.network_token = Some(new_token());
         }
-        publish_token(&settings.network_token);
+        publish_token(&settings);
 
         let handle = SettingsHandle {
             path,
@@ -333,7 +339,7 @@ impl SettingsHandle {
         if enabled && settings.network_token.is_none() {
             settings.network_token = Some(new_token());
         }
-        publish_token(&settings.network_token);
+        publish_token(&settings);
     }
 
     pub async fn get_network_token(&self) -> Option<String> {
@@ -345,7 +351,7 @@ impl SettingsHandle {
         let mut settings = self.settings.write().await;
         let token = new_token();
         settings.network_token = Some(token.clone());
-        publish_token(&settings.network_token);
+        publish_token(&settings);
         token
     }
 

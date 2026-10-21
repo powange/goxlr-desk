@@ -73,20 +73,16 @@ fn same_token(given: &str, token: &str) -> bool {
             == 0
 }
 
-/// The token a request presents: its cookie, a `token` query parameter, or a Bearer header.
-/// Returns it with whether it came from the query (the cookie is then set on the response).
+/// The token a request presents: a `token` query parameter (a link just opened), a Bearer
+/// header, or the cookie a link set earlier, in that order: an old cookie never hides the new
+/// link. Returns it with whether it came from the query (the cookie is then set on the response).
 fn presented_token(req: &ServiceRequest) -> Option<(String, bool)> {
-    let cookie = req
-        .headers()
-        .get_all(header::COOKIE)
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
-            let (name, value) = pair.trim().split_once('=')?;
-            (name == ACCESS_COOKIE).then(|| value.to_string())
-        });
-    if let Some(cookie) = cookie {
-        return Some((cookie, false));
+    if let Some(token) = req
+        .query_string()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+    {
+        return Some((token.to_string(), true));
     }
     if let Some(value) = req
         .headers()
@@ -96,10 +92,14 @@ fn presented_token(req: &ServiceRequest) -> Option<(String, bool)> {
     {
         return Some((token.trim().to_string(), false));
     }
-    req.query_string()
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("token="))
-        .map(|token| (token.to_string(), true))
+    req.headers()
+        .get_all(header::COOKIE)
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == ACCESS_COOKIE).then(|| (value.to_string(), false))
+        })
 }
 
 /// Commands a client without an origin (the Stream Deck plugin, but also any web page through
@@ -277,9 +277,11 @@ impl RequestSource {
                 DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
                     return Some("A firmware file on disk can only be flashed from this computer");
                 }
+                // Restarting is what applies a network access change: it's managed here too
                 DaemonRequest::GetNetworkAccess
                 | DaemonRequest::Daemon(DaemonCommand::RegenerateNetworkToken)
-                | DaemonRequest::Daemon(DaemonCommand::SetAllowNetworkAccess(_)) => {
+                | DaemonRequest::Daemon(DaemonCommand::SetAllowNetworkAccess(_))
+                | DaemonRequest::Daemon(DaemonCommand::RestartDaemon) => {
                     return Some("Network access can only be managed from this computer");
                 }
                 _ => {}
@@ -491,12 +493,26 @@ async fn websocket(
     let mut usb_tx = data.usb_tx.clone();
     let mut broadcast_rx = data.broadcast_tx.subscribe();
 
+    // Another machine came in with the token of the moment: when access is turned off or the
+    // token changes, its socket is closed (its next requests are refused anyway).
+    let remote_token = (!source.local_peer).then(crate::settings::network_token);
+    let mut access_check = tokio::time::interval(ACCESS_CHECK_INTERVAL);
+
     // Spawn the handler (this is now where we do stuff)
     actix_web::rt::spawn(async move {
         let mut msg_stream = msg_stream.aggregate_continuations();
 
         let close_reason = loop {
             tokio::select! {
+                _ = access_check.tick(), if remote_token.is_some() => {
+                    let current = crate::settings::network_token();
+                    if current.is_none() || current != *remote_token.as_ref().unwrap_or(&None) {
+                        break Some(CloseReason {
+                            code: CloseCode::Policy,
+                            description: Some(String::from("Network access was turned off or its link changed")),
+                        });
+                    }
+                }
                 received = broadcast_rx.recv() => {
                     let patch = match received {
                         Ok(patch) => patch,
@@ -854,6 +870,9 @@ async fn get_sample(
         }
     }
 }
+
+// How often a socket from another machine checks it's still allowed
+const ACCESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 // A backup or restore never takes this long: older temporary files were left behind
 const BACKUP_TEMP_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -1570,6 +1589,19 @@ mod tests {
                 .is_some()
         );
         assert!(remote.refused_reason(&DaemonRequest::GetStatus).is_none());
+    }
+
+    #[test]
+    fn a_new_link_wins_over_an_old_cookie() {
+        let req = actix_web::test::TestRequest::default()
+            .uri("/?token=new")
+            .insert_header((header::COOKIE, "goxlr_access=old"))
+            .to_srv_request();
+        assert_eq!(presented_token(&req), Some((String::from("new"), true)));
+        let req = actix_web::test::TestRequest::default()
+            .insert_header((header::COOKIE, "other=1; goxlr_access=old"))
+            .to_srv_request();
+        assert_eq!(presented_token(&req), Some((String::from("old"), false)));
     }
 
     #[test]
