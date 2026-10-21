@@ -1,10 +1,11 @@
 use crate::FIRMWARE_PATHS;
 use crate::firmware::firmware_file::check_firmware;
+use crate::firmware::hash_probe;
 use anyhow::{Result, bail};
 use futures_util::StreamExt;
 use goxlr_ipc::{FirmwareInfo, FirmwareSource, UpdateState};
 use goxlr_types::{DeviceType, VersionNumber};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use reqwest::ClientBuilder;
 use std::cmp::min;
 use std::fs;
@@ -104,7 +105,6 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
             return;
         }
     };
-    let firmware_len = firmware.len() as u32;
 
     info!("Entering DFU Mode");
     if let Err(e) = enter_dfu(&device.serial, sender.clone()).await {
@@ -121,14 +121,14 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
     }
 
     info!("Uploading Firmware..");
-    if let Err(e) = upload_firmware(&device.serial, sender.clone(), firmware).await {
+    if let Err(e) = upload_firmware(&device.serial, sender.clone(), &firmware).await {
         send_error(&device.serial, sender.clone(), e.to_string()).await;
         reboot_goxlr(&device.serial, sender).await;
         return;
     }
 
     info!("Validating Upload");
-    if let Err(e) = validate_upload(&device.serial, sender.clone(), firmware_len).await {
+    if let Err(e) = validate_upload(&device.serial, sender.clone(), &firmware).await {
         send_error(&device.serial, sender.clone(), e.to_string()).await;
         reboot_goxlr(&device.serial, sender).await;
         return;
@@ -374,7 +374,7 @@ async fn clear_nvr(serial: &str, sender: Sender) -> Result<()> {
     set_update_stage_percent(serial, sender.clone(), 100).await
 }
 
-async fn upload_firmware(serial: &str, sender: Sender, bytes: Vec<u8>) -> Result<()> {
+async fn upload_firmware(serial: &str, sender: Sender, bytes: &[u8]) -> Result<()> {
     set_update_state(serial, sender.clone(), UpdateState::UploadFirmware).await?;
 
     // Monitor the current percentage
@@ -412,8 +412,14 @@ async fn upload_firmware(serial: &str, sender: Sender, bytes: Vec<u8>) -> Result
     Ok(())
 }
 
-async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Result<()> {
+async fn validate_upload(serial: &str, sender: Sender, firmware: &[u8]) -> Result<()> {
     set_update_state(serial, sender.clone(), UpdateState::ValidateUpload).await?;
+    let firmware_size = firmware.len() as u32;
+
+    // Which way of computing the device's hash fits every chunk (only logged for now, see
+    // hash_probe): None until the first chunk.
+    let mut fitting: Option<Vec<&'static str>> = None;
+    let mut chunks = 0;
 
     let mut last_percent = 0;
 
@@ -441,10 +447,33 @@ async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Re
         if response.count == 0 {
             bail!("Error Validating Firmware, the device validated nothing");
         }
-        processed_bytes += response.count;
-        if processed_bytes > firmware_size {
+        if processed_bytes + response.count > firmware_size {
             bail!("Error Validating Firmware, Length Mismatch");
         }
+        let chunk =
+            &firmware[processed_bytes as usize..(processed_bytes + response.count) as usize];
+        let matches = hash_probe::matching(hash_in, chunk, response.hash);
+        chunks += 1;
+        if chunks <= 3 {
+            info!(
+                "Firmware validation chunk {}: {} bytes from {}, hash in {:08x}, device {:08x}, matching: {:?}",
+                chunks, response.count, processed_bytes, hash_in, response.hash, matches
+            );
+        } else {
+            debug!(
+                "Firmware validation chunk {}: {} bytes from {}, hash in {:08x}, device {:08x}, matching: {:?}",
+                chunks, response.count, processed_bytes, hash_in, response.hash, matches
+            );
+        }
+        fitting = Some(match fitting {
+            None => matches,
+            Some(previous) => previous
+                .into_iter()
+                .filter(|name| matches.contains(name))
+                .collect(),
+        });
+
+        processed_bytes += response.count;
 
         hash_in = response.hash;
         remaining_bytes -= response.count;
@@ -455,6 +484,13 @@ async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Re
             set_update_stage_percent(serial, sender.clone(), percent).await?;
         }
     }
+
+    info!(
+        "Firmware validation: {} chunks, final hash {:08x}, computed the same way on every chunk: {:?}",
+        chunks,
+        hash_in,
+        fitting.unwrap_or_default()
+    );
 
     Ok(())
 }
