@@ -756,6 +756,36 @@ impl SettingsHandle {
         commands.clone_into(&mut entry.wake_commands);
     }
 
+    /// A profile (or mic profile) was renamed: the shutdown, sleep and wake actions of every
+    /// device loading it now load it by its new name. Returns whether any changed.
+    pub async fn rename_profile_in_power_commands(&self, from: &str, to: &str, mic: bool) -> bool {
+        let mut settings = self.settings.write().await;
+        let mut changed = false;
+        for device in settings.devices.iter_mut().flat_map(|d| d.values_mut()) {
+            let lists = [
+                &mut device.shutdown_commands,
+                &mut device.sleep_commands,
+                &mut device.wake_commands,
+            ];
+            for command in lists.into_iter().flat_map(|list| list.iter_mut()) {
+                let name = match command {
+                    GoXLRCommand::LoadProfile(name, _) | GoXLRCommand::LoadProfileColours(name)
+                        if !mic =>
+                    {
+                        name
+                    }
+                    GoXLRCommand::LoadMicProfile(name, _) if mic => name,
+                    _ => continue,
+                };
+                if name == from {
+                    *name = to.to_string();
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     pub async fn set_device_sampler_pre_buffer(&self, device_serial: &str, duration: u16) {
         let mut settings = self.settings.write().await;
         let entry = settings
@@ -1132,6 +1162,42 @@ mod tests {
         assert!(Settings::read(&path).unwrap().is_none());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renamed_profiles_follow_in_power_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = SettingsHandle::load(dir.path().join("settings.json"))
+            .await
+            .unwrap();
+        handle
+            .set_device_sleep_commands(
+                "S1",
+                vec![
+                    GoXLRCommand::LoadProfile("Old".into(), false),
+                    GoXLRCommand::LoadMicProfile("Old".into(), false),
+                ],
+            )
+            .await;
+        handle
+            .set_device_wake_commands("S2", vec![GoXLRCommand::LoadProfileColours("Old".into())])
+            .await;
+
+        assert!(
+            handle
+                .rename_profile_in_power_commands("Old", "New", false)
+                .await
+        );
+        let sleep = format!("{:?}", handle.get_device_sleep_commands("S1").await);
+        // The mic profile of the same name isn't the one renamed
+        assert!(sleep.contains("LoadProfile(\"New\"") && sleep.contains("LoadMicProfile(\"Old\""));
+        let wake = format!("{:?}", handle.get_device_wake_commands("S2").await);
+        assert!(wake.contains("\"New\""));
+        assert!(
+            !handle
+                .rename_profile_in_power_commands("Gone", "X", false)
+                .await
+        );
     }
 
     #[tokio::test]

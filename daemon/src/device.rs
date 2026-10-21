@@ -3247,11 +3247,18 @@ impl Device {
                 // The backup copy follows, it's only a convenience
                 let backups = self.settings.get_backup_directory().await;
                 let _ = rename_named_file(&backups, &from, &to, "goxlr");
+                let mut save = self
+                    .settings
+                    .rename_profile_in_power_commands(&from, &to, false)
+                    .await;
                 if self.profile.name() == from {
                     self.profile.set_name(to.clone());
                     self.settings
                         .set_device_profile_name(self.serial(), to.as_str())
                         .await;
+                    save = true;
+                }
+                if save {
                     self.settings.save().await;
                 }
             }
@@ -3342,11 +3349,18 @@ impl Device {
                 rename_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
                 let backups = self.settings.get_backup_directory().await;
                 let _ = rename_named_file(&backups, &from, &to, "goxlrMicProfile");
+                let mut save = self
+                    .settings
+                    .rename_profile_in_power_commands(&from, &to, true)
+                    .await;
                 if self.mic_profile.name() == from {
                     self.mic_profile.set_name(to.clone());
                     self.settings
                         .set_device_mic_profile_name(self.serial(), to.as_str())
                         .await;
+                    save = true;
+                }
+                if save {
                     self.settings.save().await;
                 }
             }
