@@ -855,15 +855,25 @@ async fn get_sample(
     }
 }
 
+// A backup or restore never takes this long: older temporary files were left behind
+const BACKUP_TEMP_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 static BACKUP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A temporary file for a backup being made or restored, in the backups folder. Files left by
-/// earlier ones (Windows can't remove a file still open) are removed first.
+/// earlier ones (Windows can't remove a file still open) are removed first, once they're old
+/// enough not to belong to a backup or restore still running.
 fn backup_temp_file(backups: &Path, kind: &str) -> PathBuf {
     if let Ok(entries) = fs::read_dir(backups) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".backup-") && name.ends_with(".zip") {
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > BACKUP_TEMP_LIFETIME);
+            if name.starts_with(".backup-") && name.ends_with(".zip") && stale {
                 let _ = fs::remove_file(entry.path());
             }
         }

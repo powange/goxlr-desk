@@ -36,7 +36,7 @@ pub struct DeviceActor {
 }
 
 impl DeviceActor {
-    pub fn spawn(device: Device, updates: mpsc::Sender<DeviceUpdate>) -> Self {
+    pub fn spawn(device: Device, updates: mpsc::UnboundedSender<DeviceUpdate>) -> Self {
         let (jobs, mut job_rx) = mpsc::unbounded_channel::<Job>();
         let (inputs, mut input_rx) = mpsc::channel::<()>(1);
         let (ticks, mut tick_rx) = mpsc::channel::<()>(1);
@@ -86,7 +86,7 @@ impl DeviceActor {
                     status: device.status().await,
                     reply,
                 };
-                if let Err(unsent) = updates.send(update).await {
+                if let Err(unsent) = updates.send(update) {
                     // The worker has stopped, answer anyway
                     if let Some(reply) = unsent.0.reply {
                         reply();

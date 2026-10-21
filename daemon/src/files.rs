@@ -231,6 +231,7 @@ impl FileManager {
 }
 
 // How long the file watcher waits for things to settle before reporting a change.
+const WATCHER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub async fn spawn_file_notification_service(
@@ -238,14 +239,24 @@ pub async fn spawn_file_notification_service(
     sender: Sender<PathTypes>,
     mut shutdown_signal: Shutdown,
 ) -> Result<()> {
-    let watcher = create_watcher();
-    if let Err(error) = watcher {
-        warn!("Error Creating the File Watcher, aborting: {:?}", error);
-        bail!("Error Creating the File Watcher: {:?}", error);
-    }
-
-    // Create the worker..
-    let (mut watcher, mut rx) = watcher.unwrap();
+    // Without a watcher the lists aren't refreshed by themselves, but the GoXLR keeps working:
+    // the daemon carries on and the watcher is tried again (the system may be out of inotify
+    // instances for a while).
+    let (mut watcher, mut rx) = loop {
+        match create_watcher() {
+            Ok(created) => break created,
+            Err(error) => {
+                warn!(
+                    "Unable to create the file watcher, retrying in a minute: {:?}",
+                    error
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(WATCHER_RETRY) => {}
+                    () = shutdown_signal.recv() => return Ok(()),
+                }
+            }
+        }
+    };
 
     // Add the Paths to the Watcher..
     if let Err(error) = watcher.watch(&paths.profiles, RecursiveMode::NonRecursive) {

@@ -110,16 +110,10 @@ pub fn get_ui_app_path() -> Option<PathBuf> {
     let mut path = None;
     let bin_name = get_ui_binary_name();
 
-    // There are three possible places to check for this, the CWD, the binary WD, and $PATH
-    let cwd = std::env::current_dir().unwrap().join(bin_name.clone());
-    if cwd.exists() {
-        path.replace(cwd);
-    }
-
-    // IntelliJ complains about duplicate code here, and while yes, it's technically duplicated
-    // from goxlr-launcher, the launcher and daemon don't have dependencies on each other.
-    if path.is_none()
-        && let Some(parent) = std::env::current_exe().unwrap().parent()
+    // Next to the daemon, then on $PATH. Not in the current directory: it can be any folder
+    // (or one that no longer exists), and the launcher doesn't look there either.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
     {
         let bin = parent.join(bin_name.clone());
         if bin.exists() {

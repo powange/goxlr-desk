@@ -166,7 +166,9 @@ pub async fn spawn_usb_handler(
     // Each device runs in its own task (see device_actor), and sends its status back here
     let mut devices: HashMap<String, DeviceActor> = HashMap::new();
     let mut mixers: HashMap<String, MixerStatus> = HashMap::new();
-    let (update_tx, mut update_rx) = mpsc::channel::<DeviceUpdate>(32);
+    // Unbounded: a device task must never wait for this loop, which may itself be waiting for
+    // that device (run()), or both would wait for ever. A status per job, consumed promptly.
+    let (update_tx, mut update_rx) = mpsc::unbounded_channel::<DeviceUpdate>();
     let mut devices_firmware: HashMap<String, FirmwareUpdateState> = HashMap::new();
     let mut ignore_list: HashMap<DeviceKey, (Instant, u32)> = HashMap::new();
 
@@ -216,6 +218,10 @@ pub async fn spawn_usb_handler(
                 match received {
                     FirmwareRequest::SetUpdateState(serial,status) => {
                         if let Some(state) = devices_firmware.get_mut(&serial) {
+                            // A file uploaded for this update isn't needed once it's flashed
+                            if status == UpdateState::Complete {
+                                remove_uploaded_firmware(&state.settings.file);
+                            }
                             state.status.state = status;
                             state.status.progress = 0;
                             change_found = true;
@@ -899,7 +905,9 @@ pub async fn spawn_usb_handler(
                             match device.status.state {
                                 UpdateState::Complete | UpdateState::Failed | UpdateState::Pause(_) => {
                                     // We're at a point where this update can be stopped, nuke it from the firmware list..
-                                    devices_firmware.remove(&serial);
+                                    if let Some(state) = devices_firmware.remove(&serial) {
+                                        remove_uploaded_firmware(&state.settings.file);
+                                    }
                                     change_found = true;
 
                                     let _ = sender.send(Ok(()));
@@ -1568,6 +1576,25 @@ async fn check_firmware_versions(x: FwSender, source: FirmwareSource) {
 
     debug!("Firmware Update Process Finished");
     let _ = x.send(map).await;
+}
+
+/// Removes a firmware file the interface uploaded (to the temporary folder, named by the HTTP
+/// server), once its update is done or cleared. A file picked on disk is never touched.
+fn remove_uploaded_firmware(file: &Option<PathBuf>) {
+    let Some(file) = file else {
+        return;
+    };
+    let uploaded = file.parent() == Some(std::env::temp_dir().as_path())
+        && file
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("goxlr-firmware-"));
+    if uploaded && let Err(e) = fs::remove_file(file) {
+        warn!(
+            "Unable to remove the uploaded firmware {}: {}",
+            file.display(),
+            e
+        );
+    }
 }
 
 #[cfg(test)]

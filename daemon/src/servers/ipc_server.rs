@@ -140,7 +140,17 @@ pub async fn spawn_ipc_server(
     debug!("Running IPC Server..");
     loop {
         tokio::select! {
-            Ok(connection) = listener.accept() => {
+            // An accept that fails (out of descriptors, a client gone mid-handshake) is logged
+            // and retried: matching Ok() here would stop accepting connections for good.
+            accepted = listener.accept() => {
+                let connection = match accepted {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        warn!("Unable to accept an IPC connection: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 if !same_user(&connection) {
                     warn!("Refused an IPC connection from another user");
                     continue;

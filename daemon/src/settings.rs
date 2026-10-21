@@ -185,37 +185,7 @@ impl SettingsHandle {
             settings.logs_directory = None;
         }
 
-        if settings.log_level.is_none() {
-            settings.log_level = Some(LogLevel::Debug);
-        }
-
-        if settings.open_ui_on_launch.is_none() {
-            settings.open_ui_on_launch = Some(false);
-        }
-
-        if settings.firmware_source.is_none() {
-            settings.firmware_source = Some(Default::default());
-        }
-
-        if settings.show_tray_icon.is_none() {
-            settings.show_tray_icon = Some(true);
-        }
-
-        if settings.tts_enabled.is_none() {
-            settings.tts_enabled = Some(false);
-        }
-
-        if settings.allow_network_access.is_none() {
-            settings.allow_network_access = Some(false);
-        }
-
-        if settings.macos_handle_aggregates.is_none() {
-            settings.macos_handle_aggregates = Some(true);
-        }
-
-        if settings.devices.is_none() {
-            settings.devices = Some(Default::default());
-        }
+        settings.fill_defaults();
 
         // Network access needs a token for other machines.
         if settings.allow_network_access == Some(true) && settings.network_token.is_none() {
@@ -290,8 +260,10 @@ impl SettingsHandle {
                     None => object.remove(*key),
                 };
             }
-            *settings = serde_json::from_value(incoming)
+            let mut restored: Settings = serde_json::from_value(incoming)
                 .context("The settings in the backup can't be read")?;
+            restored.fill_defaults();
+            *settings = restored;
         }
         self.save().await;
         Ok(())
@@ -913,6 +885,42 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The values every accessor expects to find: missing ones (an older file, a settings.json
+    /// from a backup) take their defaults.
+    fn fill_defaults(&mut self) {
+        if self.log_level.is_none() {
+            self.log_level = Some(LogLevel::Debug);
+        }
+
+        if self.open_ui_on_launch.is_none() {
+            self.open_ui_on_launch = Some(false);
+        }
+
+        if self.firmware_source.is_none() {
+            self.firmware_source = Some(Default::default());
+        }
+
+        if self.show_tray_icon.is_none() {
+            self.show_tray_icon = Some(true);
+        }
+
+        if self.tts_enabled.is_none() {
+            self.tts_enabled = Some(false);
+        }
+
+        if self.allow_network_access.is_none() {
+            self.allow_network_access = Some(false);
+        }
+
+        if self.macos_handle_aggregates.is_none() {
+            self.macos_handle_aggregates = Some(true);
+        }
+
+        if self.devices.is_none() {
+            self.devices = Some(Default::default());
+        }
+    }
+
     pub fn read(path: &Path) -> Result<Option<Settings>> {
         match File::open(path) {
             Ok(reader) => {
@@ -1148,5 +1156,13 @@ mod tests {
         assert_eq!(handle.get_network_token().await.as_deref(), Some("secret"));
         assert_eq!(handle.get_profile_directory().await, PathBuf::from("/here"));
         assert!(handle.restore_backup_json(b"[1, 2]").await.is_err());
+
+        // Missing or null values take their defaults, the accessors don't panic
+        handle
+            .restore_backup_json(br#"{"devices": null, "log_level": null}"#)
+            .await
+            .unwrap();
+        assert_eq!(handle.get_device_hold_time("S123").await, 500);
+        assert_eq!(handle.get_log_level().await, LogLevel::Debug);
     }
 }
