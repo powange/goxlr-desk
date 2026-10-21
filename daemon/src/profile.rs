@@ -194,6 +194,46 @@ impl ProfileAdapter {
         &self.name
     }
 
+    /// The sampler tracks playing one of these sample files, with where they sit.
+    pub fn sample_tracks_using(
+        &mut self,
+        names: &HashSet<String>,
+    ) -> Vec<(
+        goxlr_types::SampleBank,
+        goxlr_types::SampleButtons,
+        usize,
+        Track,
+    )> {
+        let mut found = vec![];
+        for bank in goxlr_types::SampleBank::iter() {
+            for button in goxlr_types::SampleButtons::iter() {
+                for (index, track) in self.get_sample_bank(bank, button).iter().enumerate() {
+                    if names.contains(&track.track) {
+                        found.push((bank, button, index, track.clone()));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Puts a track back on a button at its former position, unless the button already has it.
+    pub fn restore_sample_track(
+        &mut self,
+        bank: goxlr_types::SampleBank,
+        button: goxlr_types::SampleButtons,
+        index: usize,
+        track: Track,
+    ) -> bool {
+        let tracks = self.get_sample_bank(bank, button);
+        if tracks.iter().any(|existing| existing.track == track.track) {
+            return false;
+        }
+        let index = index.min(tracks.len());
+        tracks.insert(index, track);
+        true
+    }
+
     pub fn load_colour_profile(&mut self, new_profile: ProfileAdapter) {
         for colour in ColourTargets::iter() {
             let our_map = get_profile_colour_map_mut(self.profile.settings_mut(), colour);

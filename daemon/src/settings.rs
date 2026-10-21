@@ -795,7 +795,22 @@ impl Settings {
                     }
                 }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // A first start, or the file went missing (an antivirus, a cleaner..). Use the
+                // last known good copy if there is one, rather than starting from defaults.
+                let backup = Self::read_backup(path);
+                if backup.is_some() {
+                    let message = format!(
+                        "The settings at {} were missing, restored them from the backup copy.",
+                        path.to_string_lossy()
+                    );
+                    eprintln!("{message}");
+                    if let Ok(mut warning) = LOAD_WARNING.lock() {
+                        *warning = Some(message);
+                    }
+                }
+                Ok(backup)
+            }
             Err(error) => Err(error).context(format!(
                 "Could not open daemon settings file for reading at {}",
                 path.to_string_lossy()
@@ -916,6 +931,16 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .any(|entry| entry.file_name().to_string_lossy().contains(".failed-"));
         assert!(kept);
+
+        // A missing main file also falls back to the backup.
+        settings.write(&path).unwrap();
+        let _ = take_load_warning();
+        fs::remove_file(&path).unwrap();
+        let loaded = Settings::read(&path)
+            .unwrap()
+            .expect("backup should be loaded");
+        assert_eq!(loaded.tts_enabled, Some(true));
+        assert!(take_load_warning().is_some());
 
         // Without a usable backup, the defaults are used.
         fs::remove_file(with_suffix(&path, "bak")).unwrap();

@@ -448,6 +448,9 @@ pub struct RenamedSample {
 /// a sample's file name (it's then searched for in every folder), so a file keeps an audio
 /// extension, and a new file name must not already be used by another sample.
 pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<RenamedSample>> {
+    if crate::sample_trash::is_recorded_folder(from) {
+        bail!("The Recorded folder is where recordings go, it can't be moved or renamed");
+    }
     let source = sample_path(base, from)?;
     let target = sample_path(base, to)?;
 
@@ -576,7 +579,7 @@ pub fn edit_sample_file(
     // Keep the original in the trash when replacing it, the edit can then be undone.
     let replacing = save_as.is_none();
     if replacing {
-        trash_sample_path(base, backups, relative)?;
+        trash_sample_path(base, backups, relative, vec![])?;
     }
 
     let written = atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)));

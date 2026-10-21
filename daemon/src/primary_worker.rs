@@ -10,6 +10,9 @@ use crate::firmware::firmware_update::{
 };
 use crate::platform::{get_ui_app_path, has_autostart, set_autostart};
 use crate::profile::{rename_sample_in_saved_profiles, saved_profiles_using_samples};
+use crate::profile_trash::{
+    empty_profile_trash, list_profile_trash, purge_profile_trash, restore_profile,
+};
 use crate::sample_trash::{
     empty_trash, list_trash, purge_trash, restore_trash_item, trash_sample_path,
 };
@@ -22,7 +25,8 @@ use goxlr_audio::editor::probe_duration;
 use goxlr_ipc::{
     Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
     FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale, PathTypes,
-    Paths, SampleFile, SampleTrashItem, SampleUsage, UpdateState, UsbProductInformation,
+    Paths, ProfileTrashItem, SampleFile, SampleTrashItem, SampleUsage, UpdateState,
+    UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::{FullGoXLRDevice, GoXLRDevice};
@@ -544,8 +548,16 @@ pub async fn spawn_usb_handler(
                             DaemonCommand::DeleteSamplePath(path) => {
                                 let base = settings.get_samples_directory().await;
                                 let backups = settings.get_backup_directory().await;
+                                // The loaded profiles drop the tracks of a missing file, so note
+                                // them: they're put back if the file is restored.
+                                let names: HashSet<String> =
+                                    sample_names_at(&base, &path).unwrap_or_default().into_iter().collect();
+                                let tracks: Vec<_> = devices
+                                    .values_mut()
+                                    .flat_map(|device| device.trashed_tracks(&names))
+                                    .collect();
                                 // Kept in the trash (with its gain setting), so it can be restored.
-                                let result = trash_sample_path(&base, &backups, &path);
+                                let result = trash_sample_path(&base, &backups, &path, tracks);
                                 if result.is_ok() {
                                     info!("Moved sample path {} to the trash", path);
                                     files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
@@ -556,11 +568,37 @@ pub async fn spawn_usb_handler(
                             DaemonCommand::RestoreSampleTrash(id) => {
                                 let base = settings.get_samples_directory().await;
                                 let backups = settings.get_backup_directory().await;
-                                let result = restore_trash_item(&base, &backups, &id).map(|path| {
+                                let result = restore_trash_item(&base, &backups, &id);
+                                if let Ok((path, tracks)) = &result {
                                     info!("Restored sample path {} from the trash", path);
-                                });
-                                if result.is_ok() {
+                                    for device in devices.values_mut() {
+                                        if let Err(e) = device.restore_trashed_tracks(tracks).await {
+                                            warn!("Unable to put the restored sample back on the sampler: {}", e);
+                                        }
+                                    }
                                     files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
+                                    change_found = true;
+                                }
+                                let _ = sender.send(result.map(|_| ()));
+                            }
+                            DaemonCommand::RestoreProfileTrash(id) => {
+                                let profiles = settings.get_profile_directory().await;
+                                let mics = settings.get_mic_profile_directory().await;
+                                let backups = settings.get_backup_directory().await;
+                                let result = restore_profile(&profiles, &mics, &backups, &id);
+                                if let Ok((name, mic)) = &result {
+                                    info!("Restored the profile {} from the trash", name);
+                                    let kind = if *mic { PathTypes::MicProfiles } else { PathTypes::Profiles };
+                                    files = update_files(files, kind, &mut file_manager, &settings).await;
+                                    change_found = true;
+                                }
+                                let _ = sender.send(result.map(|_| ()));
+                            }
+                            DaemonCommand::EmptyProfileTrash(id) => {
+                                let backups = settings.get_backup_directory().await;
+                                let result = empty_profile_trash(&backups, id.as_deref());
+                                if result.is_ok() {
+                                    files.profile_trash = list_profile_trash(&backups);
                                     change_found = true;
                                 }
                                 let _ = sender.send(result);
@@ -976,8 +1014,15 @@ async fn get_files(file_manager: &mut FileManager, settings: &SettingsHandle) ->
         samples: get_sample_files(file_manager, settings).await,
         sample_folders: file_manager.get_sample_folders(),
         sample_trash: get_sample_trash(settings).await,
+        profile_trash: get_profile_trash(settings).await,
         icons: file_manager.get_icons(),
     }
+}
+
+async fn get_profile_trash(settings: &SettingsHandle) -> Vec<ProfileTrashItem> {
+    let backups = settings.get_backup_directory().await;
+    purge_profile_trash(&backups);
+    list_profile_trash(&backups)
 }
 
 async fn get_sample_trash(settings: &SettingsHandle) -> Vec<SampleTrashItem> {
@@ -1028,6 +1073,12 @@ async fn update_files(
             files.sample_trash
         } else {
             get_sample_trash(settings).await
+        },
+
+        profile_trash: if file_type != PathTypes::Profiles && file_type != PathTypes::MicProfiles {
+            files.profile_trash
+        } else {
+            get_profile_trash(settings).await
         },
 
         icons: if file_type != PathTypes::Icons {

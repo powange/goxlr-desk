@@ -154,6 +154,10 @@ pub enum DaemonCommand {
     RestoreSampleTrash(String),
     // Deletes an item from the sample trash for good, or everything when None
     EmptySampleTrash(Option<String>),
+    // Puts a deleted profile or mic profile back, by trash id
+    RestoreProfileTrash(String),
+    // Deletes a profile from the trash for good (or everything with None)
+    EmptyProfileTrash(Option<String>),
     // Copies a sample next to itself, with a free name such as 'name (2).wav'
     DuplicateSample(String),
     // Edits a sample and saves it as WAV, either replacing the file (the original goes to the

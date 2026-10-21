@@ -17,6 +17,7 @@ use goxlr_ipc::{
     SampleProcessState, Settings,
 };
 use goxlr_profile_loader::components::mute::MuteFunction;
+use goxlr_profile_loader::components::sample::Track;
 use goxlr_types::{
     Button, ChannelName, DeviceType, DisplayModeComponents, EffectBankPresets, EffectKey,
     EncoderName, FaderName, HardTuneSource, InputDevice as BasicInputDevice, MicrophoneParamKey,
@@ -42,6 +43,8 @@ use crate::mic_profile::{DEFAULT_MIC_PROFILE_NAME, MicProfileAdapter};
 use crate::profile::{
     DEFAULT_PROFILE_NAME, ProfileAdapter, usb_to_standard_button, version_newer_or_equal_to,
 };
+use crate::profile_trash::trash_profile;
+use crate::sample_trash::TrashedTrack;
 
 pub struct Device<'a> {
     goxlr: Box<dyn FullGoXLRDevice>,
@@ -1225,6 +1228,55 @@ impl<'a> Device<'a> {
         Ok(())
     }
 
+    /// The sampler tracks of the loaded profile that play one of these files, recorded so they
+    /// can be put back if the files come back from the trash.
+    pub fn trashed_tracks(&mut self, names: &HashSet<String>) -> Vec<TrashedTrack> {
+        let serial = self.serial().to_string();
+        let profile = self.profile.name().to_string();
+        self.profile
+            .sample_tracks_using(names)
+            .into_iter()
+            .map(|(bank, button, index, track)| TrashedTrack {
+                serial: serial.clone(),
+                profile: profile.clone(),
+                bank,
+                button,
+                index,
+                track: track.track,
+                start: track.start_position,
+                end: track.end_position,
+                gain: track.normalized_gain,
+            })
+            .collect()
+    }
+
+    /// Puts back the tracks recorded for this device, if the same profile is still loaded.
+    pub async fn restore_trashed_tracks(&mut self, tracks: &[TrashedTrack]) -> Result<()> {
+        let mut changed = false;
+        for trashed in tracks {
+            if trashed.serial != self.serial() || trashed.profile != self.profile.name() {
+                continue;
+            }
+            let track = Track::new(
+                trashed.track.clone(),
+                trashed.start,
+                trashed.end,
+                trashed.gain,
+            );
+            changed |= self.profile.restore_sample_track(
+                trashed.bank,
+                trashed.button,
+                trashed.index,
+                track,
+            );
+        }
+        if changed {
+            self.load_colour_map().await?;
+            self.update_button_states()?;
+        }
+        Ok(())
+    }
+
     pub async fn validate_sampler(&mut self) -> Result<()> {
         let sample_path = self.settings.get_samples_directory().await;
         for bank in SampleBank::iter() {
@@ -1508,6 +1560,10 @@ impl<'a> Device<'a> {
         // Create the full Path..
         let mut sample_path = self.settings.get_samples_directory().await;
         sample_path = sample_path.join("Recorded");
+        // It's created at startup, but recreate it if it went missing since.
+        if let Err(e) = std::fs::create_dir_all(&sample_path) {
+            warn!("Unable to create the recordings folder: {}", e);
+        }
         sample_path = sample_path.join(file_name);
 
         if let Some(audio_handler) = &mut self.audio_handler {
@@ -2759,7 +2815,8 @@ impl<'a> Device<'a> {
 
                 let profiles = self.settings.get_profile_directory().await;
                 let backups = self.settings.get_backup_directory().await;
-                self.profile.delete_profile(name.clone(), &profiles)?;
+                // Kept in the profile trash, so it can be restored.
+                trash_profile(&profiles, &backups, &name, false)?;
                 self.profile.delete_profile(name.clone(), &backups)?;
             }
             GoXLRCommand::ReloadSettings() => {
@@ -2866,8 +2923,9 @@ impl<'a> Device<'a> {
                 }
 
                 let profile_directory = self.settings.get_mic_profile_directory().await;
-                self.mic_profile
-                    .delete_profile(profile_name.clone(), &profile_directory)?;
+                let backups = self.settings.get_backup_directory().await;
+                // Kept in the profile trash, so it can be restored.
+                trash_profile(&profile_directory, &backups, &profile_name, true)?;
             }
 
             GoXLRCommand::SetMuteHoldDuration(duration) => {

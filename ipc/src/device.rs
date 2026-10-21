@@ -441,7 +441,20 @@ pub struct Files {
     // Deleted samples and folders, which can be restored.
     #[serde(default)]
     pub sample_trash: Vec<SampleTrashItem>,
+    // Deleted profiles and mic profiles, which can be restored.
+    #[serde(default)]
+    pub profile_trash: Vec<ProfileTrashItem>,
     pub icons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileTrashItem {
+    pub id: String,
+    pub name: String,
+    // A mic profile rather than a main profile
+    pub mic: bool,
+    // When it was deleted (seconds since the epoch)
+    pub deleted_at: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
