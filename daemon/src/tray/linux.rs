@@ -1,9 +1,12 @@
 use crate::ICON;
 use crate::events::EventTriggers;
 use crate::shutdown::Shutdown;
+use crate::tray::{tray_label, tray_state};
 use anyhow::Result;
+use goxlr_ipc::GoXLRCommand;
 use goxlr_ipc::PathTypes::{Icons, Logs, MicProfiles, Presets, Profiles, Samples};
-use ksni::menu::{StandardItem, SubMenu};
+use goxlr_types::MuteState;
+use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
 use ksni::{Category, MenuItem, Status, ToolTip, Tray, TrayMethods};
 use log::{debug, warn};
 use std::fs;
@@ -53,7 +56,20 @@ pub async fn handle_tray(mut stop: Shutdown, tx: mpsc::Sender<EventTriggers>) ->
         }
     };
 
-    stop.recv().await;
+    // The menu shows profiles and the mic state: rebuild it when they change.
+    let mut shown = tray_state();
+    loop {
+        tokio::select! {
+            _ = stop.recv() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                let current = tray_state();
+                if current != shown {
+                    shown = current;
+                    handle.update(|_| {}).await;
+                }
+            }
+        }
+    }
 
     debug!("Shutting Down Tray Handler..");
     let _ = handle.shutdown().await;
@@ -118,9 +134,44 @@ impl Tray for GoXLRTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
+        let state = tray_state();
+        let lang = state.language.as_str();
+        let path_item = |label: &str, path: goxlr_ipc::PathTypes| -> MenuItem<Self> {
             StandardItem {
-                label: String::from("Configure GoXLR"),
+                label: label.to_string(),
+                activate: Box::new(move |this: &mut GoXLRTray| {
+                    let _ = this.tx.try_send(EventTriggers::Open(path.clone()));
+                }),
+                ..Default::default()
+            }
+            .into()
+        };
+        let profile_items = |names: &[String], active: &Option<String>, mic: bool| {
+            names
+                .iter()
+                .map(|name| {
+                    let profile = name.clone();
+                    CheckmarkItem {
+                        label: name.replace('_', "__"),
+                        checked: active.as_ref() == Some(name),
+                        activate: Box::new(move |this: &mut GoXLRTray| {
+                            let command = if mic {
+                                GoXLRCommand::LoadMicProfile(profile.clone(), true)
+                            } else {
+                                GoXLRCommand::LoadProfile(profile.clone(), true)
+                            };
+                            let _ = this.tx.try_send(EventTriggers::TrayCommand(command));
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect::<Vec<MenuItem<Self>>>()
+        };
+
+        let mut menu: Vec<MenuItem<Self>> = vec![
+            StandardItem {
+                label: tray_label(lang, "configure").to_string(),
                 activate: Box::new(|this: &mut GoXLRTray| {
                     let _ = this.tx.try_send(EventTriggers::Activate);
                 }),
@@ -128,72 +179,74 @@ impl Tray for GoXLRTray {
             }
             .into(),
             MenuItem::Separator,
+        ];
+        if state.profile.is_some() {
+            menu.push(
+                SubMenu {
+                    label: tray_label(lang, "profiles").to_string(),
+                    submenu: profile_items(&state.profiles, &state.profile, false),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            menu.push(
+                SubMenu {
+                    label: tray_label(lang, "mic_profiles").to_string(),
+                    submenu: profile_items(&state.mic_profiles, &state.mic_profile, true),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if let Some(muted) = state.mic_muted {
+            menu.push(
+                StandardItem {
+                    label: tray_label(lang, if muted { "unmute" } else { "mute" }).to_string(),
+                    activate: Box::new(move |this: &mut GoXLRTray| {
+                        let state = if muted {
+                            MuteState::Unmuted
+                        } else {
+                            MuteState::MutedToX
+                        };
+                        let command = GoXLRCommand::SetCoughMuteState(state);
+                        let _ = this.tx.try_send(EventTriggers::TrayCommand(command));
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if state.profile.is_some() || state.mic_muted.is_some() {
+            menu.push(MenuItem::Separator);
+        }
+        menu.push(
             SubMenu {
-                label: String::from("Open Path"),
+                label: tray_label(lang, "open_path").to_string(),
                 submenu: vec![
-                    StandardItem {
-                        label: String::from("Profiles"),
-                        activate: Box::new(|this: &mut GoXLRTray| {
-                            let _ = this.tx.try_send(EventTriggers::Open(Profiles));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
-                    StandardItem {
-                        label: String::from("Mic Profiles"),
-                        activate: Box::new(|this: &mut GoXLRTray| {
-                            let _ = this.tx.try_send(EventTriggers::Open(MicProfiles));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
+                    path_item(tray_label(lang, "profiles"), Profiles),
+                    path_item(tray_label(lang, "mic_profiles"), MicProfiles),
                     MenuItem::Separator,
-                    StandardItem {
-                        label: String::from("Presets"),
-                        activate: Box::new(|this: &mut GoXLRTray| {
-                            let _ = this.tx.try_send(EventTriggers::Open(Presets));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
-                    StandardItem {
-                        label: String::from("Samples"),
-                        activate: Box::new(|this: &mut GoXLRTray| {
-                            let _ = this.tx.try_send(EventTriggers::Open(Samples));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
-                    StandardItem {
-                        label: String::from("Icons"),
-                        activate: Box::new(|this: &mut GoXLRTray| {
-                            let _ = this.tx.try_send(EventTriggers::Open(Icons));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
+                    path_item(tray_label(lang, "presets"), Presets),
+                    path_item(tray_label(lang, "samples"), Samples),
+                    path_item(tray_label(lang, "icons"), Icons),
                     MenuItem::Separator,
-                    StandardItem {
-                        label: String::from("Logs"),
-                        activate: Box::new(|this: &mut GoXLRTray| {
-                            let _ = this.tx.try_send(EventTriggers::Open(Logs));
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
+                    path_item(tray_label(lang, "logs"), Logs),
                 ],
                 ..Default::default()
             }
             .into(),
-            MenuItem::Separator,
+        );
+        menu.push(MenuItem::Separator);
+        menu.push(
             StandardItem {
-                label: String::from("Quit"),
+                label: tray_label(lang, "quit").to_string(),
                 activate: Box::new(|this: &mut GoXLRTray| {
                     let _ = this.tx.try_send(EventTriggers::Stop(false));
                 }),
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        menu
     }
 }

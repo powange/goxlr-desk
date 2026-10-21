@@ -90,6 +90,8 @@ pub enum DeviceStateChange {
     Shutdown(bool),
     Sleep(oneshot::Sender<()>),
     Wake(oneshot::Sender<()>),
+    // A command for the first device (from the tray menu)
+    Command(GoXLRCommand),
 }
 
 #[derive(Clone)]
@@ -405,6 +407,16 @@ pub async fn spawn_usb_handler(
                         }
                         let _ = sender.send(());
                     },
+                    DeviceStateChange::Command(command) => {
+                        let mut serials: Vec<String> = devices.keys().cloned().collect();
+                        serials.sort();
+                        if let Some(device) = serials.first().and_then(|s| devices.get_mut(s)) {
+                            if let Err(e) = device.perform_command(command).await {
+                                warn!("Unable to run the tray's command: {}", e);
+                            }
+                            change_found = true;
+                        }
+                    }
                     DeviceStateChange::Wake(sender) => {
                         debug!("Received Wake Notification");
                         for device in devices.values_mut() {
@@ -432,6 +444,11 @@ pub async fn spawn_usb_handler(
 
                     DeviceCommand::RunDaemonCommand(command, sender) => {
                         match command {
+                            DaemonCommand::RestartDaemon => {
+                                crate::RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let _ = global_tx.send(EventTriggers::Stop(false)).await;
+                                let _ = sender.send(Ok(()));
+                            }
                             DaemonCommand::StopDaemon => {
                                 // These should probably be moved upstream somewhere, they're not
                                 // device specific!
@@ -959,6 +976,7 @@ async fn get_daemon_status(
             .insert(serial.to_owned(), device.status().await.clone());
     }
 
+    crate::tray::update_tray_state(&status);
     status
 }
 

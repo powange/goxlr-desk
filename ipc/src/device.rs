@@ -75,6 +75,8 @@ pub struct MixerStatus {
     pub shutdown_commands: Vec<GoXLRCommand>,
     pub sleep_commands: Vec<GoXLRCommand>,
     pub wake_commands: Vec<GoXLRCommand>,
+    #[serde(default)]
+    pub scenes: std::collections::BTreeMap<String, Vec<GoXLRCommand>>,
     pub fader_status: EnumMap<FaderName, FaderStatus>,
     pub mic_status: MicSettings,
     pub levels: Levels,

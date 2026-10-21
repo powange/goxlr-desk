@@ -21,7 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use sysinfo::System;
@@ -31,7 +31,9 @@ use tokio::sync::oneshot::Sender;
 use tokio::sync::{RwLock, oneshot};
 
 use crate::PatchEvent;
-use crate::files::{FilePaths, find_file_in_path, import_sample_target};
+use crate::files::{
+    FilePaths, find_file_in_path, import_sample_target, named_file_path, new_named_file_path,
+};
 use goxlr_ipc::{
     DaemonCommand, DaemonRequest, DaemonResponse, DaemonStatus, GoXLRCommand, HttpSettings,
     Scribble, WebsocketRequest, WebsocketResponse,
@@ -51,6 +53,8 @@ const MAX_FIRMWARE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_SAMPLE_SIZE: usize = 512 * 1024 * 1024;
 // Limits for one import request, so a client can't fill the disk in one go.
 const MAX_IMPORT_FILES: usize = 200;
+// A profile is XML and four small screen images
+const MAX_PROFILE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_IMPORT_TOTAL: usize = 2 * 1024 * 1024 * 1024;
 
 // The cookie that holds the network access token, set when a link with ?token= is opened.
@@ -412,6 +416,10 @@ pub async fn spawn_http_server(
             .service(get_path)
             .service(upload_firmware)
             .service(import_samples)
+            .service(export_profile)
+            .service(export_backup)
+            .service(restore_backup)
+            .service(import_profiles)
             .default_service(web::to(default))
     })
     // Don't hold up the daemon's shutdown waiting for open connections (such as WebSockets).
@@ -803,6 +811,289 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
         }
         _ => HttpResponse::NotFound().finish(),
     }
+}
+
+static BACKUP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temporary file for a backup being made or restored, in the backups folder. Files left by
+/// earlier ones (Windows can't remove a file still open) are removed first.
+fn backup_temp_file(backups: &Path, kind: &str) -> PathBuf {
+    if let Ok(entries) = fs::read_dir(backups) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".backup-") && name.ends_with(".zip") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = fs::create_dir_all(backups);
+    backups.join(format!(
+        ".backup-{kind}-{}-{}.zip",
+        std::process::id(),
+        BACKUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+/// Downloads the whole configuration as a .zip ('?samples=1' adds the samples).
+#[get("/files/backup")]
+async fn export_backup(
+    query: web::Query<HashMap<String, String>>,
+    app_data: Data<RwLock<AppData>>,
+) -> HttpResponse {
+    let paths = app_data.read().await.file_paths.clone();
+    let samples = query.get("samples").is_some_and(|value| value == "1");
+    let temp = backup_temp_file(&paths.backups, "export");
+
+    let written = {
+        let temp = temp.clone();
+        web::block(move || -> Result<()> {
+            let file = std::fs::File::create(&temp)?;
+            crate::backup::write_backup(&paths, samples, std::io::BufWriter::new(file))
+        })
+        .await
+    };
+    if !matches!(written, Ok(Ok(()))) {
+        let _ = fs::remove_file(&temp);
+        return HttpResponse::InternalServerError().body("Unable to make the backup");
+    }
+
+    let Ok(file) = tokio::fs::File::open(&temp).await else {
+        return HttpResponse::InternalServerError().finish();
+    };
+    let size = file.metadata().await.map(|m| m.len()).unwrap_or_default();
+    // Already open, so it can go now on Linux and macOS (Windows: on the next backup).
+    let _ = fs::remove_file(&temp);
+
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    HttpResponse::Ok()
+        .insert_header(ContentType(mime_guess::mime::APPLICATION_OCTET_STREAM))
+        .insert_header((
+            header::CONTENT_DISPOSITION,
+            header::ContentDisposition::attachment(format!("goxlr-utility-backup-{date}.zip")),
+        ))
+        .body(actix_web::body::SizedStream::new(
+            size,
+            tokio_util::io::ReaderStream::new(file),
+        ))
+}
+
+/// Restores a backup made by /files/backup (one .zip in a multipart upload). Replaced files
+/// are kept in the backups folder.
+#[post("/files/backup-restore")]
+async fn restore_backup(mut payload: Multipart, app_data: Data<RwLock<AppData>>) -> HttpResponse {
+    let (paths, mut usb_tx) = {
+        let data = app_data.read().await;
+        (data.file_paths.clone(), data.usb_tx.clone())
+    };
+    let Some(Ok(mut field)) = payload.next().await else {
+        return HttpResponse::BadRequest().json(DaemonResponse::Error("No file sent".into()));
+    };
+
+    let temp = backup_temp_file(&paths.backups, "restore");
+    let received: Result<()> = async {
+        let mut file = tokio::fs::File::create(&temp).await?;
+        let mut size = 0;
+        while let Some(chunk) = field.next().await {
+            let data = chunk.map_err(|e| anyhow!("Error reading the file: {e}"))?;
+            size += data.len();
+            if size > MAX_IMPORT_TOTAL * 2 {
+                return Err(anyhow!("The file is too large"));
+            }
+            file.write_all(&data).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = received {
+        let _ = fs::remove_file(&temp);
+        return HttpResponse::Ok().json(DaemonResponse::Error(e.to_string()));
+    }
+
+    let restored = {
+        let temp = temp.clone();
+        web::block(move || -> Result<crate::backup::RestoreSummary> {
+            crate::backup::restore_backup(&paths, std::fs::File::open(&temp)?)
+        })
+        .await
+    };
+    let _ = fs::remove_file(&temp);
+
+    match restored {
+        Ok(Ok(summary)) => {
+            // Refresh the samples list (profiles are seen by the file watcher)
+            let _ = handle_packet(
+                DaemonRequest::Daemon(DaemonCommand::ApplySampleChange),
+                &mut usb_tx,
+            )
+            .await;
+            HttpResponse::Ok().json(summary)
+        }
+        Ok(Err(e)) => HttpResponse::Ok().json(DaemonResponse::Error(e.to_string())),
+        Err(e) => HttpResponse::Ok().json(DaemonResponse::Error(e.to_string())),
+    }
+}
+
+/// Profiles and mic profiles: their folder and file extension, chosen with '?kind=mic'.
+fn profile_kind(
+    query: &HashMap<String, String>,
+    paths: &FilePaths,
+) -> (PathBuf, &'static str, bool) {
+    if query.get("kind").is_some_and(|kind| kind == "mic") {
+        (paths.mic_profiles.clone(), "goxlrMicProfile", true)
+    } else {
+        (paths.profiles.clone(), "goxlr", false)
+    }
+}
+
+/// Downloads a profile or mic profile file (to share it, or keep a copy elsewhere).
+#[get("/files/profiles/{name}")]
+async fn export_profile(
+    name: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+    app_data: Data<RwLock<AppData>>,
+) -> HttpResponse {
+    let (directory, extension, _) = {
+        let data = app_data.read().await;
+        profile_kind(&query, &data.file_paths)
+    };
+    let name = name.into_inner();
+    let Ok(path) = named_file_path(&directory, &name, extension) else {
+        return HttpResponse::BadRequest().finish();
+    };
+    match web::block(move || fs::read(path)).await {
+        Ok(Ok(contents)) => HttpResponse::Ok()
+            .insert_header(ContentType::octet_stream())
+            .insert_header((
+                header::CONTENT_DISPOSITION,
+                header::ContentDisposition::attachment(format!("{name}.{extension}")),
+            ))
+            .body(contents),
+        _ => HttpResponse::NotFound().finish(),
+    }
+}
+
+/// Imports profile or mic profile files (multipart). Each one must load as a profile; a name
+/// already used gets a ' (2)' suffix.
+#[post("/files/profiles-import")]
+async fn import_profiles(
+    query: web::Query<HashMap<String, String>>,
+    mut payload: Multipart,
+    app_data: Data<RwLock<AppData>>,
+) -> HttpResponse {
+    let (directory, extension, mic) = {
+        let data = app_data.read().await;
+        profile_kind(&query, &data.file_paths)
+    };
+
+    let mut imported = Vec::new();
+    let mut errors = Vec::new();
+    while let Some(field) = payload.next().await {
+        if imported.len() + errors.len() >= MAX_IMPORT_FILES {
+            errors.push(format!(
+                "Only {MAX_IMPORT_FILES} files can be imported at once"
+            ));
+            break;
+        }
+        let mut field = match field {
+            Ok(field) => field,
+            Err(e) => {
+                errors.push(format!("Error reading the upload: {e}"));
+                break;
+            }
+        };
+        let file_name = field
+            .content_disposition()
+            .and_then(|disposition| disposition.get_filename())
+            .unwrap_or_default()
+            .to_string();
+
+        // Read it whole (it's small), then check it really is a profile before keeping it.
+        let mut contents = Vec::new();
+        let mut too_large = false;
+        while let Some(chunk) = field.next().await {
+            match chunk {
+                Ok(data) if contents.len() + data.len() <= MAX_PROFILE_SIZE => {
+                    contents.extend_from_slice(&data)
+                }
+                Ok(_) => too_large = true,
+                Err(e) => {
+                    errors.push(format!("{file_name}: {e}"));
+                    too_large = true;
+                    break;
+                }
+            }
+        }
+        if too_large {
+            errors.push(format!(
+                "{file_name}: the file is too large to be a profile"
+            ));
+            continue;
+        }
+
+        let directory = directory.clone();
+        let saved = web::block(move || {
+            save_imported_profile(&directory, &file_name, extension, mic, &contents)
+                .map_err(|e| format!("{file_name}: {e}"))
+        })
+        .await;
+        match saved {
+            Ok(Ok(name)) => imported.push(name),
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
+
+    if errors.is_empty() {
+        HttpResponse::Ok().json(DaemonResponse::Ok)
+    } else {
+        HttpResponse::Ok().json(DaemonResponse::Error(errors.join("\n")))
+    }
+}
+
+/// Checks an uploaded profile and writes it under a free name, returns that name.
+fn save_imported_profile(
+    directory: &Path,
+    file_name: &str,
+    extension: &str,
+    mic: bool,
+    contents: &[u8],
+) -> Result<String> {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let Some(stem) = base.strip_suffix(&format!(".{extension}")).or_else(|| {
+        let dot = base.rfind('.')?;
+        base[dot + 1..]
+            .eq_ignore_ascii_case(extension)
+            .then(|| &base[..dot])
+    }) else {
+        return Err(anyhow!("Not a .{} file", extension));
+    };
+
+    let reader = std::io::Cursor::new(contents);
+    let valid = if mic {
+        crate::mic_profile::MicProfileAdapter::from_reader(stem.to_string(), reader).is_ok()
+    } else {
+        crate::profile::ProfileAdapter::from_reader(stem.to_string(), reader).is_ok()
+    };
+    if !valid {
+        return Err(anyhow!("The file isn't a valid profile"));
+    }
+
+    // A free name, 'Name (2)' when it's taken
+    let mut name = stem.trim().to_string();
+    let mut count = 2;
+    while new_named_file_path(directory, &name, extension)?.exists() {
+        name = format!("{} ({count})", stem.trim());
+        count += 1;
+    }
+    let path = new_named_file_path(directory, &name, extension)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::io::Write::write_all(&mut file, contents)?;
+    file.sync_all()?;
+    Ok(name)
 }
 
 /// Imports audio files (multipart, one or more files) into a samples folder, given relative to

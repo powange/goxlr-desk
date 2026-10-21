@@ -8,7 +8,7 @@ use goxlr_types::VodMode;
 use goxlr_types::VodMode::Routable;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::{File, create_dir_all};
@@ -630,6 +630,44 @@ impl SettingsHandle {
         mic_profile_name.clone_into(&mut entry.mic_profile);
     }
 
+    pub async fn get_device_scenes(
+        &self,
+        device_serial: &str,
+    ) -> BTreeMap<String, Vec<GoXLRCommand>> {
+        let settings = self.settings.read().await;
+        settings
+            .devices
+            .as_ref()
+            .unwrap()
+            .get(device_serial)
+            .map(|d| d.scenes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Stores a scene, or removes it with None.
+    pub async fn set_device_scene(
+        &self,
+        device_serial: &str,
+        name: &str,
+        commands: Option<Vec<GoXLRCommand>>,
+    ) {
+        let mut settings = self.settings.write().await;
+        let entry = settings
+            .devices
+            .as_mut()
+            .unwrap()
+            .entry(device_serial.to_owned())
+            .or_insert_with(DeviceSettings::default);
+        match commands {
+            Some(commands) => {
+                entry.scenes.insert(name.to_owned(), commands);
+            }
+            None => {
+                entry.scenes.remove(name);
+            }
+        }
+    }
+
     pub async fn set_device_shutdown_commands(
         &self,
         device_serial: &str,
@@ -933,6 +971,9 @@ struct DeviceSettings {
     shutdown_commands: Vec<GoXLRCommand>,
     sleep_commands: Vec<GoXLRCommand>,
     wake_commands: Vec<GoXLRCommand>,
+
+    // Named scenes, run on request
+    scenes: BTreeMap<String, Vec<GoXLRCommand>>,
 }
 
 impl Default for DeviceSettings {
@@ -954,6 +995,7 @@ impl Default for DeviceSettings {
             shutdown_commands: vec![],
             sleep_commands: vec![],
             wake_commands: vec![],
+            scenes: BTreeMap::new(),
         }
     }
 }

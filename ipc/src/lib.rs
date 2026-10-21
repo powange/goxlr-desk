@@ -142,6 +142,8 @@ pub enum DaemonCommand {
     OpenUi,
     Activate,
     StopDaemon,
+    // Stops, then starts again with the same arguments (to apply network access, for example)
+    RestartDaemon,
     OpenPath(PathTypes),
     SetLogLevel(LogLevel),
     SetFirmwareSource(FirmwareSource),
@@ -197,6 +199,11 @@ pub enum GoXLRCommand {
     SetShutdownCommands(Vec<GoXLRCommand>),
     SetSleepCommands(Vec<GoXLRCommand>),
     SetWakeCommands(Vec<GoXLRCommand>),
+
+    // Scenes: named lists of commands, run in one go (volumes, mutes, routing, effects..)
+    SaveScene(String, Vec<GoXLRCommand>),
+    RunScene(String),
+    DeleteScene(String),
     SetSamplerPreBufferDuration(u16),
 
     SetFader(FaderName, ChannelName),
@@ -336,6 +343,9 @@ pub enum GoXLRCommand {
     PlaySampleByIndex(SampleBank, SampleButtons, usize),
     PlayNextSample(SampleBank, SampleButtons),
     StopSamplePlayback(SampleBank, SampleButtons),
+    // Records into an empty button of the active bank, as holding it on the device does
+    StartSampleRecording(SampleBank, SampleButtons),
+    StopSampleRecording(SampleBank, SampleButtons),
 
     // Scribbles
     SetScribbleIcon(FaderName, Option<String>),

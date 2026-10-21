@@ -25,15 +25,18 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
-    GetWindowLongPtrW, HICON, HMENU, MENUINFO, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, RegisterClassW, RegisterWindowMessageW,
-    SetMenuInfo, SetTimer, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CREATE, WM_NCDESTROY, WM_USER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
+    GetMessageW, GetWindowLongPtrW, HICON, HMENU, MENU_ITEM_FLAGS, MENUINFO, MF_CHECKED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, RegisterClassW,
+    RegisterWindowMessageW, SetMenuInfo, SetTimer, SetWindowLongPtrW, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CREATE, WM_NCDESTROY, WM_USER, WNDCLASSW,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
-use goxlr_ipc::PathTypes;
+use goxlr_ipc::{GoXLRCommand, PathTypes};
+use goxlr_types::MuteState;
+
+use crate::tray::{TrayState, tray_label, tray_state};
 
 use crate::events::EventTriggers::Open;
 use crate::events::{DaemonState, EventTriggers};
@@ -52,29 +55,96 @@ pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> Result<()> 
     create_window(state, tx)?;
     Ok(())
 }
+// Menu item ids: profiles and mic profiles are numbered from these, by their position
+const PROFILE_BASE: u32 = 100;
+const MIC_PROFILE_BASE: u32 = 1000;
+const MIC_MUTE_ID: u32 = 20;
+
+/// Appends a menu entry with a run time label (AppendMenuW needs a null terminated UTF-16 string
+/// that lives during the call).
+unsafe fn append(menu: HMENU, flags: MENU_ITEM_FLAGS, id: usize, label: &str) -> Result<()> {
+    let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+    unsafe { AppendMenuW(menu, flags, id, PCWSTR(wide.as_ptr()))? };
+    Ok(())
+}
+
+/// Builds the menu from the current state: profiles (the active one checked), mic mute, folders.
+unsafe fn build_menu(state: &TrayState) -> Result<HMENU> {
+    let lang = state.language.as_str();
+    unsafe {
+        let paths = CreatePopupMenu()?;
+        append(paths, MF_STRING, 10, tray_label(lang, "profiles"))?;
+        append(paths, MF_STRING, 11, tray_label(lang, "mic_profiles"))?;
+        AppendMenuW(paths, MF_SEPARATOR, 12, None)?;
+        append(paths, MF_STRING, 13, tray_label(lang, "presets"))?;
+        append(paths, MF_STRING, 14, tray_label(lang, "samples"))?;
+        append(paths, MF_STRING, 15, tray_label(lang, "icons"))?;
+        AppendMenuW(paths, MF_SEPARATOR, 16, None)?;
+        append(paths, MF_STRING, 17, tray_label(lang, "logs"))?;
+
+        let hmenu = CreatePopupMenu()?;
+        append(hmenu, MF_STRING, 0, tray_label(lang, "configure"))?;
+        AppendMenuW(hmenu, MF_SEPARATOR, 1, None)?;
+
+        if state.profile.is_some() {
+            let profiles = CreatePopupMenu()?;
+            for (index, name) in state.profiles.iter().enumerate() {
+                let flags = if state.profile.as_ref() == Some(name) {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                append(profiles, flags, PROFILE_BASE as usize + index, name)?;
+            }
+            append(
+                hmenu,
+                MF_POPUP,
+                profiles.0 as usize,
+                tray_label(lang, "profiles"),
+            )?;
+
+            let mic_profiles = CreatePopupMenu()?;
+            for (index, name) in state.mic_profiles.iter().enumerate() {
+                let flags = if state.mic_profile.as_ref() == Some(name) {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                append(mic_profiles, flags, MIC_PROFILE_BASE as usize + index, name)?;
+            }
+            append(
+                hmenu,
+                MF_POPUP,
+                mic_profiles.0 as usize,
+                tray_label(lang, "mic_profiles"),
+            )?;
+        }
+        if let Some(muted) = state.mic_muted {
+            let label = tray_label(lang, if muted { "unmute" } else { "mute" });
+            append(hmenu, MF_STRING, MIC_MUTE_ID as usize, label)?;
+        }
+        if state.profile.is_some() || state.mic_muted.is_some() {
+            AppendMenuW(hmenu, MF_SEPARATOR, 2, None)?;
+        }
+
+        append(
+            hmenu,
+            MF_POPUP,
+            paths.0 as usize,
+            tray_label(lang, "open_path"),
+        )?;
+        AppendMenuW(hmenu, MF_SEPARATOR, 3, None)?;
+        append(hmenu, MF_STRING, 4, tray_label(lang, "quit"))?;
+        Ok(hmenu)
+    }
+}
+
 fn create_window(state: DaemonState, tx: Sender<EventTriggers>) -> Result<()> {
     // To save some headaches, this is *ALL* unsafe!
     debug!("Creating Window for Tray");
     unsafe {
-        debug!("Creating SubMenu");
-        let sub = CreatePopupMenu()?;
-        AppendMenuW(sub, MF_STRING, 10, w!("Profiles"))?;
-        AppendMenuW(sub, MF_STRING, 11, w!("Mic Profiles"))?;
-        AppendMenuW(sub, MF_SEPARATOR, 12, None)?;
-        AppendMenuW(sub, MF_STRING, 13, w!("Presets"))?;
-        AppendMenuW(sub, MF_STRING, 14, w!("Samples"))?;
-        AppendMenuW(sub, MF_STRING, 15, w!("Icons"))?;
-        AppendMenuW(sub, MF_SEPARATOR, 16, None)?;
-        AppendMenuW(sub, MF_STRING, 17, w!("Logs"))?;
-
-        // Create the Main Menu..
         debug!("Creating Main Menu..");
-        let hmenu = CreatePopupMenu()?;
-        AppendMenuW(hmenu, MF_STRING, 0, w!("Configure GoXLR"))?;
-        AppendMenuW(hmenu, MF_SEPARATOR, 1, None)?;
-        AppendMenuW(hmenu, MF_POPUP, sub.0 as usize, w!("Open Path"))?;
-        AppendMenuW(hmenu, MF_SEPARATOR, 3, None)?;
-        AppendMenuW(hmenu, MF_STRING, 4, w!("Quit"))?;
+        let hmenu = build_menu(&tray_state())?;
 
         debug!("Generating Window Proc");
         let window_proc = GoXLRWindowProc::new(state.clone(), tx, hmenu);
@@ -205,6 +275,8 @@ struct GoXLRWindowProc {
     state: DaemonState,
     global_tx: Sender<EventTriggers>,
     menu: HMENU,
+    // What the menu was built from, to know what its numbered items are
+    menu_state: TrayState,
 
     shutdown_triggered: bool,
 }
@@ -215,6 +287,7 @@ impl GoXLRWindowProc {
             state,
             global_tx: tx,
             menu,
+            menu_state: tray_state(),
             shutdown_triggered: false,
         }
     }
@@ -262,6 +335,25 @@ impl GoXLRWindowProc {
                 if Shell_NotifyIconW(action, tray) == FALSE {
                     error!("Unable to Load Tray Icon");
                 }
+            }
+        }
+    }
+
+    /// Rebuilds the menu when the profiles or the mic state changed since it was made.
+    fn refresh_menu(&mut self) {
+        let state = tray_state();
+        if state == self.menu_state {
+            return;
+        }
+        unsafe {
+            match build_menu(&state) {
+                Ok(menu) => {
+                    let _ = DestroyMenu(self.menu);
+                    self.menu = menu;
+                    self.menu_state = state;
+                    self.create_menu();
+                }
+                Err(e) => warn!("Unable to rebuild the tray menu: {}", e),
             }
         }
     }
@@ -317,6 +409,36 @@ impl WindowProc for GoXLRWindowProc {
                     0 => self.global_tx.try_send(EventTriggers::Activate),
                     4 => self.global_tx.try_send(EventTriggers::Stop(false)),
 
+                    MIC_MUTE_ID => {
+                        let state = if self.menu_state.mic_muted == Some(true) {
+                            MuteState::Unmuted
+                        } else {
+                            MuteState::MutedToX
+                        };
+                        let command = GoXLRCommand::SetCoughMuteState(state);
+                        self.global_tx.try_send(EventTriggers::TrayCommand(command))
+                    }
+                    id if (PROFILE_BASE..MIC_PROFILE_BASE).contains(&id) => {
+                        let index = (id - PROFILE_BASE) as usize;
+                        match self.menu_state.profiles.get(index) {
+                            Some(name) => {
+                                let command = GoXLRCommand::LoadProfile(name.clone(), true);
+                                self.global_tx.try_send(EventTriggers::TrayCommand(command))
+                            }
+                            None => Ok(()),
+                        }
+                    }
+                    id if id >= MIC_PROFILE_BASE => {
+                        let index = (id - MIC_PROFILE_BASE) as usize;
+                        match self.menu_state.mic_profiles.get(index) {
+                            Some(name) => {
+                                let command = GoXLRCommand::LoadMicProfile(name.clone(), true);
+                                self.global_tx.try_send(EventTriggers::TrayCommand(command))
+                            }
+                            None => Ok(()),
+                        }
+                    }
+
                     // Open Paths Menu
                     10 => self.global_tx.try_send(Open(PathTypes::Profiles)),
                     11 => self.global_tx.try_send(Open(PathTypes::MicProfiles)),
@@ -346,6 +468,7 @@ impl WindowProc for GoXLRWindowProc {
                             return None;
                         }
                         if button == WM_RBUTTONUP {
+                            self.refresh_menu();
                             // The docs say if the window isn't foreground, the menu wont close!
                             if SetForegroundWindow(hwnd) == FALSE {
                                 warn!("Unable to Set window to Foreground");

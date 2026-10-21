@@ -310,6 +310,7 @@ impl<'a> Device<'a> {
             .await;
 
         let sleep_commands = self.settings.get_device_sleep_commands(self.serial()).await;
+        let scenes = self.settings.get_device_scenes(self.serial()).await;
 
         let wake_commands = self.settings.get_device_wake_commands(self.serial()).await;
 
@@ -355,6 +356,7 @@ impl<'a> Device<'a> {
             hardware: self.hardware.clone(),
             shutdown_commands,
             sleep_commands,
+            scenes,
             wake_commands,
             fader_status: fader_map,
             cough_button: self.profile.get_cough_status(),
@@ -471,6 +473,8 @@ impl<'a> Device<'a> {
                 | GoXLRCommand::DuplicateProfile(..)
                 | GoXLRCommand::RenameMicProfile(..)
                 | GoXLRCommand::DuplicateMicProfile(..)
+                | GoXLRCommand::SaveScene(..)
+                | GoXLRCommand::DeleteScene(_)
                 // settings.json variables
                 | GoXLRCommand::SetSamplerPreBufferDuration(_)
                 | GoXLRCommand::SetVCMuteAlsoMuteCM(_)
@@ -1504,28 +1508,7 @@ impl<'a> Device<'a> {
 
         let sample_bank = self.profile.get_active_sample_bank();
         if !self.profile.current_sample_bank_has_samples(button) {
-            if self
-                .audio_handler
-                .as_mut()
-                .unwrap()
-                .sample_recording(sample_bank, button)
-            {
-                let file_name = self
-                    .audio_handler
-                    .as_mut()
-                    .unwrap()
-                    .stop_record(sample_bank, button)?;
-
-                if let Some((file_name, gain)) = file_name {
-                    let track = self.profile.add_sample_file(sample_bank, button, file_name);
-                    track.normalized_gain = gain;
-                }
-            }
-            // In all cases, we should stop the colour flashing.
-            self.profile.set_sample_button_blink(button, false);
-            self.load_colour_map().await?;
-
-            return Ok(());
+            return self.finish_recording(button).await;
         }
 
         let mode = self.profile.get_sample_playback_mode(button);
@@ -1600,6 +1583,22 @@ impl<'a> Device<'a> {
             audio_handler.stop_playback(bank, button, false).await?;
         }
 
+        Ok(())
+    }
+
+    /// Stops a recording on a button of the active bank, and adds the recorded file to it.
+    async fn finish_recording(&mut self, button: SampleButtons) -> Result<()> {
+        let sample_bank = self.profile.get_active_sample_bank();
+        if let Some(audio) = self.audio_handler.as_mut()
+            && audio.sample_recording(sample_bank, button)
+            && let Some((file_name, gain)) = audio.stop_record(sample_bank, button)?
+        {
+            let track = self.profile.add_sample_file(sample_bank, button, file_name);
+            track.normalized_gain = gain;
+        }
+        // In all cases, we should stop the colour flashing.
+        self.profile.set_sample_button_blink(button, false);
+        self.load_colour_map().await?;
         Ok(())
     }
 
@@ -1981,6 +1980,41 @@ impl<'a> Device<'a> {
             GoXLRCommand::SetShutdownCommands(commands) => {
                 self.settings
                     .set_device_shutdown_commands(self.serial(), commands)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SaveScene(name, commands) => {
+                let name = name.trim().to_string();
+                if name.is_empty() || name.chars().count() > 64 {
+                    bail!("A scene needs a name of 1 to 64 characters");
+                }
+                if let Some(command) = commands.iter().find(|c| !scene_command_allowed(c)) {
+                    bail!("A scene can't contain {:?}", command);
+                }
+                self.settings
+                    .set_device_scene(self.serial(), &name, Some(commands))
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::RunScene(name) => {
+                let scenes = self.settings.get_device_scenes(self.serial()).await;
+                let Some(commands) = scenes.get(&name) else {
+                    bail!("There is no scene named {}", name);
+                };
+                for command in commands.clone() {
+                    // Stored scenes were checked when saved, but the settings file can be edited.
+                    if !scene_command_allowed(&command) {
+                        warn!("Skipping {:?} in scene {}", command, name);
+                        continue;
+                    }
+                    if let Err(e) = Box::pin(self.perform_command(command)).await {
+                        warn!("Scene {}: {}", name, e);
+                    }
+                }
+            }
+            GoXLRCommand::DeleteScene(name) => {
+                self.settings
+                    .set_device_scene(self.serial(), &name, None)
                     .await;
                 self.settings.save().await;
             }
@@ -2750,6 +2784,30 @@ impl<'a> Device<'a> {
                 let track = self.profile.get_track_by_bank_button(bank, button)?;
                 self.play_audio_file(bank, button, track, false).await?;
                 self.update_button_states()?;
+            }
+            GoXLRCommand::StartSampleRecording(bank, button) => {
+                if bank != self.profile.get_active_sample_bank() {
+                    bail!("Recording is only possible on the active bank");
+                }
+                let Some(audio) = &self.audio_handler else {
+                    bail!("The sampler isn't available");
+                };
+                if audio.is_sample_recording() {
+                    bail!("A sample is already being recorded");
+                }
+                if self.profile.current_sample_bank_has_samples(button) {
+                    bail!("Only an empty button can record");
+                }
+                let file_date = Local::now().format("%Y-%m-%dT%H%M%S").to_string();
+                self.record_audio_file(button, format!("Recording_{file_date}.wav"))
+                    .await?;
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::StopSampleRecording(bank, button) => {
+                if bank != self.profile.get_active_sample_bank() {
+                    bail!("Recording is only possible on the active bank");
+                }
+                self.finish_recording(button).await?;
             }
             GoXLRCommand::StopSamplePlayback(bank, button) => {
                 self.stop_sample_playback(bank, button).await?;
@@ -4396,4 +4454,31 @@ fn tts_target(target: MuteFunction) -> String {
         MuteFunction::ToStream2 => " to Stream Mix 2".to_string(),
         MuteFunction::ToStreams => " to Stream Mix 1 and 2".to_string(),
     }
+}
+
+/// Commands a scene may hold: what changes the device's state, not files, settings or other
+/// command lists (a scene can't run another one).
+fn scene_command_allowed(command: &GoXLRCommand) -> bool {
+    !matches!(
+        command,
+        GoXLRCommand::SaveScene(..)
+            | GoXLRCommand::RunScene(_)
+            | GoXLRCommand::DeleteScene(_)
+            | GoXLRCommand::SetShutdownCommands(_)
+            | GoXLRCommand::SetSleepCommands(_)
+            | GoXLRCommand::SetWakeCommands(_)
+            | GoXLRCommand::SaveActivePreset()
+            | GoXLRCommand::NewProfile(_)
+            | GoXLRCommand::SaveProfile()
+            | GoXLRCommand::SaveProfileAs(_)
+            | GoXLRCommand::DeleteProfile(_)
+            | GoXLRCommand::RenameProfile(..)
+            | GoXLRCommand::DuplicateProfile(..)
+            | GoXLRCommand::NewMicProfile(_)
+            | GoXLRCommand::SaveMicProfile()
+            | GoXLRCommand::SaveMicProfileAs(_)
+            | GoXLRCommand::DeleteMicProfile(_)
+            | GoXLRCommand::RenameMicProfile(..)
+            | GoXLRCommand::DuplicateMicProfile(..)
+    )
 }

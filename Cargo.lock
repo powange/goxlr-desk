@@ -2114,6 +2114,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tts",
  "which 8.0.6",
  "windows 0.62.2",
@@ -2123,6 +2124,7 @@ dependencies = [
  "winrt-toast-reborn",
  "xmltree",
  "zbus",
+ "zip",
 ]
 
 [[package]]
