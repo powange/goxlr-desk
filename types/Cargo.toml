@@ -12,8 +12,10 @@ repository.workspace = true
 
 [features]
 default = []
+schema = ["serde", "dep:schemars"]
 
 [dependencies]
+schemars = { workspace = true, optional = true }
 # Common Workspace
 strum = { workspace = true }
 serde = { workspace = true, optional = true }

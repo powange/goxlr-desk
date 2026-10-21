@@ -1,5 +1,5 @@
-//! A whole configuration as one .zip (profiles, mic profiles, presets, icons, and optionally the
-//! samples), to move to another computer or keep aside, and restoring from one.
+//! A whole configuration as one .zip (the settings, profiles, mic profiles, presets, icons, and
+//! optionally the samples), to move to another computer or keep aside, and restoring from one.
 
 use crate::files::FilePaths;
 use anyhow::{Context, Result, bail};
@@ -10,6 +10,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+// The settings, at the root of the archive (applied by the caller, the daemon owns that file)
+const SETTINGS_ENTRY: &str = "settings.json";
+const MAX_SETTINGS_SIZE: u64 = 4 * 1024 * 1024;
 
 // A restore never writes more than this, or more files than this.
 const MAX_RESTORE_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
@@ -30,8 +34,17 @@ fn sections(paths: &FilePaths, samples: bool) -> Vec<(&'static str, PathBuf)> {
 }
 
 /// Writes the archive. Audio is already compressed, so samples are stored as they are.
-pub fn write_backup<W: Write + Seek>(paths: &FilePaths, samples: bool, sink: W) -> Result<()> {
+pub fn write_backup<W: Write + Seek>(
+    paths: &FilePaths,
+    samples: bool,
+    settings: Option<&[u8]>,
+    sink: W,
+) -> Result<()> {
     let mut archive = ZipWriter::new(sink);
+    if let Some(settings) = settings {
+        archive.start_file(SETTINGS_ENTRY, SimpleFileOptions::default())?;
+        archive.write_all(settings)?;
+    }
     for (name, directory) in sections(paths, samples) {
         let method = if name == "samples" {
             CompressionMethod::Stored
@@ -84,12 +97,18 @@ pub struct RestoreSummary {
     pub added: usize,
     pub replaced: usize,
     pub unchanged: usize,
+    /// Whether the settings were restored too (set by the caller, which applies them)
+    pub settings: bool,
 }
 
 /// Restores an archive made by `write_backup`. A file that would be replaced is first copied
 /// to `backups/restore-<time>/`, so a restore can be undone by hand. Entries that don't belong
-/// to a known folder, or point outside of it, are refused.
-pub fn restore_backup<R: Read + Seek>(paths: &FilePaths, source: R) -> Result<RestoreSummary> {
+/// to a known folder, or point outside of it, are refused. The settings are handed back, not
+/// written: the daemon applies them to the settings it holds.
+pub fn restore_backup<R: Read + Seek>(
+    paths: &FilePaths,
+    source: R,
+) -> Result<(RestoreSummary, Option<Vec<u8>>)> {
     let mut archive = ZipArchive::new(source).context("The file isn't a .zip archive")?;
     if archive.len() > MAX_RESTORE_FILES {
         bail!("The archive has too many files");
@@ -103,10 +122,20 @@ pub fn restore_backup<R: Read + Seek>(paths: &FilePaths, source: R) -> Result<Re
 
     // Check everything first: an archive that isn't one of ours changes nothing.
     let mut plan = Vec::new();
+    let mut settings = None;
     let mut total = 0u64;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
+        let mut entry = archive.by_index(index)?;
         if entry.is_dir() {
+            continue;
+        }
+        if entry.name().is_ok_and(|name| name == SETTINGS_ENTRY) {
+            if entry.size() > MAX_SETTINGS_SIZE {
+                bail!("The settings in the archive are too large");
+            }
+            let mut contents = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut contents)?;
+            settings = Some(contents);
             continue;
         }
         let Some(name) = entry.enclosed_name() else {
@@ -178,7 +207,7 @@ pub fn restore_backup<R: Read + Seek>(paths: &FilePaths, source: R) -> Result<Re
     {
         warn!("Unable to remove {}: {}", set_aside.display(), e);
     }
-    Ok(summary)
+    Ok((summary, settings))
 }
 
 #[cfg(test)]
@@ -218,9 +247,9 @@ mod tests {
         fs::write(from.samples.join(".intro.wav.1-1.import"), b"temp").unwrap();
 
         let mut without_samples = Cursor::new(Vec::new());
-        write_backup(&from, false, &mut without_samples).unwrap();
+        write_backup(&from, false, None, &mut without_samples).unwrap();
         let mut zip = Cursor::new(Vec::new());
-        write_backup(&from, true, &mut zip).unwrap();
+        write_backup(&from, true, Some(b"{\"a\":1}"), &mut zip).unwrap();
         assert!(zip.get_ref().len() > without_samples.get_ref().len());
 
         // Into another configuration, where one profile already exists with other content
@@ -228,15 +257,19 @@ mod tests {
         let to = paths(target.path());
         fs::write(to.profiles.join("Stream.goxlr"), b"older").unwrap();
         zip.set_position(0);
-        let summary = restore_backup(&to, &mut zip).unwrap();
+        let (summary, settings) = restore_backup(&to, &mut zip).unwrap();
         assert_eq!(
             summary,
             RestoreSummary {
                 added: 2,
                 replaced: 1,
-                unchanged: 0
+                unchanged: 0,
+                settings: false,
             }
         );
+        // The settings are handed back, not written
+        assert_eq!(settings.as_deref(), Some(&b"{\"a\":1}"[..]));
+        assert!(!to.profiles.join("settings.json").exists());
         assert_eq!(
             fs::read(to.profiles.join("Stream.goxlr")).unwrap(),
             b"stream"
@@ -260,13 +293,14 @@ mod tests {
 
         // Restoring again changes nothing
         zip.set_position(0);
-        let again = restore_backup(&to, &mut zip).unwrap();
+        let (again, _) = restore_backup(&to, &mut zip).unwrap();
         assert_eq!(
             again,
             RestoreSummary {
                 added: 0,
                 replaced: 0,
-                unchanged: 3
+                unchanged: 3,
+                settings: false,
             }
         );
     }
@@ -279,7 +313,7 @@ mod tests {
         {
             let mut archive = ZipWriter::new(&mut zip);
             archive
-                .start_file("settings.json", SimpleFileOptions::default())
+                .start_file("other.json", SimpleFileOptions::default())
                 .unwrap();
             archive.write_all(b"{}").unwrap();
             archive.finish().unwrap();

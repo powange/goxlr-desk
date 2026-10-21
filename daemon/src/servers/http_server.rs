@@ -1,3 +1,4 @@
+use crate::settings::SettingsHandle;
 use actix_cors::Cors;
 use actix_multipart::Multipart;
 use actix_web::body::MessageBody;
@@ -22,6 +23,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use sysinfo::System;
@@ -365,6 +367,7 @@ struct AppData {
     usb_tx: DeviceSender,
     broadcast_tx: BroadcastSender<PatchEvent>,
     file_paths: FilePaths,
+    settings: SettingsHandle,
 
     scribble_state: EnumMap<FaderName, ScribbleState>,
 }
@@ -381,6 +384,7 @@ pub async fn spawn_http_server(
     broadcast_tx: tokio::sync::broadcast::Sender<PatchEvent>,
     settings: HttpSettings,
     file_paths: FilePaths,
+    daemon_settings: SettingsHandle,
 ) {
     // Imports interrupted by a crash leave hidden temporary files, remove them.
     crate::files::remove_stale_imports(&file_paths.samples);
@@ -390,6 +394,7 @@ pub async fn spawn_http_server(
         broadcast_tx: broadcast_tx.clone(),
         usb_tx: usb_tx.clone(),
         file_paths: file_paths.clone(),
+        settings: daemon_settings,
         scribble_state: EnumMap::default(),
     }));
     let policy = Data::new(RequestPolicy::new(
@@ -411,6 +416,7 @@ pub async fn spawn_http_server(
             .service(websocket)
             .service(execute_command)
             .service(get_devices)
+            .service(get_schema)
             .service(get_sample)
             .service(get_scribble)
             .service(get_path)
@@ -670,6 +676,13 @@ async fn execute_command(
     }
 }
 
+/// The JSON Schema of the requests /api/command accepts.
+#[get("/api/schema")]
+async fn get_schema() -> HttpResponse {
+    static SCHEMA: LazyLock<schemars::Schema> = LazyLock::new(goxlr_ipc::request_schema);
+    HttpResponse::Ok().json(&*SCHEMA)
+}
+
 #[get("/api/get-devices")]
 async fn get_devices(app_data: Data<RwLock<AppData>>) -> HttpResponse {
     if let Ok(response) = get_status(app_data).await {
@@ -860,15 +873,20 @@ async fn export_backup(
     query: web::Query<HashMap<String, String>>,
     app_data: Data<RwLock<AppData>>,
 ) -> HttpResponse {
-    let paths = app_data.read().await.file_paths.clone();
+    let (paths, settings) = {
+        let data = app_data.read().await;
+        (data.file_paths.clone(), data.settings.clone())
+    };
     let samples = query.get("samples").is_some_and(|value| value == "1");
     let temp = backup_temp_file(&paths.backups, "export");
+    let settings = settings.backup_json().await.ok();
 
     let written = {
         let temp = temp.clone();
         web::block(move || -> Result<()> {
             let file = std::fs::File::create(&temp)?;
-            crate::backup::write_backup(&paths, samples, std::io::BufWriter::new(file))
+            let sink = std::io::BufWriter::new(file);
+            crate::backup::write_backup(&paths, samples, settings.as_deref(), sink)
         })
         .await
     };
@@ -901,9 +919,13 @@ async fn export_backup(
 /// are kept in the backups folder.
 #[post("/files/backup-restore")]
 async fn restore_backup(mut payload: Multipart, app_data: Data<RwLock<AppData>>) -> HttpResponse {
-    let (paths, mut usb_tx) = {
+    let (paths, settings, mut usb_tx) = {
         let data = app_data.read().await;
-        (data.file_paths.clone(), data.usb_tx.clone())
+        (
+            data.file_paths.clone(),
+            data.settings.clone(),
+            data.usb_tx.clone(),
+        )
     };
     let Some(Ok(mut field)) = payload.next().await else {
         return HttpResponse::BadRequest().json(DaemonResponse::Error("No file sent".into()));
@@ -932,15 +954,27 @@ async fn restore_backup(mut payload: Multipart, app_data: Data<RwLock<AppData>>)
 
     let restored = {
         let temp = temp.clone();
-        web::block(move || -> Result<crate::backup::RestoreSummary> {
-            crate::backup::restore_backup(&paths, std::fs::File::open(&temp)?)
-        })
+        web::block(
+            move || -> Result<(crate::backup::RestoreSummary, Option<Vec<u8>>)> {
+                crate::backup::restore_backup(&paths, std::fs::File::open(&temp)?)
+            },
+        )
         .await
     };
     let _ = fs::remove_file(&temp);
 
     match restored {
-        Ok(Ok(summary)) => {
+        Ok(Ok((mut summary, settings_json))) => {
+            if let Some(json) = settings_json {
+                match settings.restore_backup_json(&json).await {
+                    Ok(()) => summary.settings = true,
+                    Err(e) => {
+                        return HttpResponse::Ok().json(DaemonResponse::Error(format!(
+                            "The files were restored, but not the settings: {e}"
+                        )));
+                    }
+                }
+            }
             // Refresh the samples list (profiles are seen by the file watcher)
             let _ = handle_packet(
                 DaemonRequest::Daemon(DaemonCommand::ApplySampleChange),

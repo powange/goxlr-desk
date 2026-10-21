@@ -35,7 +35,7 @@ use crate::SettingsHandle;
 use crate::audio::{AudioFile, AudioHandler};
 use crate::events::EventTriggers;
 use crate::events::EventTriggers::TTSMessage;
-use crate::files::{duplicate_named_file, find_file_in_path, rename_named_file};
+use crate::files::{duplicate_named_file, find_file_in_path, named_file_path, rename_named_file};
 use crate::firmware::firmware_update::{
     FirmwareMessages, HardwareProgressResponse, ProgressResponse, ValidateUploadChunkResponse,
 };
@@ -44,6 +44,7 @@ use crate::profile::{
     DEFAULT_PROFILE_NAME, ProfileAdapter, hard_muted, usb_to_standard_button,
     version_newer_or_equal_to,
 };
+use crate::profile_history::keep_history;
 use crate::profile_store::load_with_backup;
 use crate::profile_trash::trash_profile;
 use crate::sample_trash::TrashedTrack;
@@ -2840,6 +2841,9 @@ impl<'a> Device<'a> {
             }
             GoXLRCommand::SaveProfile() => {
                 let profile_directory = self.settings.get_profile_directory().await;
+                let backups = self.settings.get_backup_directory().await;
+                let file = named_file_path(&profile_directory, self.profile.name(), "goxlr")?;
+                keep_history(&file, &backups);
                 self.profile.save(&profile_directory, true)?;
             }
             GoXLRCommand::SaveProfileAs(profile_name) => {
@@ -2933,6 +2937,10 @@ impl<'a> Device<'a> {
             }
             GoXLRCommand::SaveMicProfile() => {
                 let mic_profile_directory = self.settings.get_mic_profile_directory().await;
+                let backups = self.settings.get_backup_directory().await;
+                let name = self.mic_profile.name();
+                let file = named_file_path(&mic_profile_directory, name, "goxlrMicProfile")?;
+                keep_history(&file, &backups);
                 self.mic_profile.save(&mic_profile_directory, true)?;
             }
             GoXLRCommand::SaveMicProfileAs(name) => {

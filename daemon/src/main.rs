@@ -50,6 +50,7 @@ mod mic_profile;
 mod platform;
 mod primary_worker;
 mod profile;
+mod profile_history;
 mod profile_store;
 mod profile_trash;
 mod sample_trash;
@@ -375,6 +376,7 @@ async fn run_utility() -> Result<()> {
             broadcast_tx.clone(),
             http_settings.clone(),
             file_paths.clone(),
+            settings.clone(),
         ));
         http_server = httpd_rx.await?;
         if let Err(e) = http_server {

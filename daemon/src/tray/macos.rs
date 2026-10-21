@@ -11,8 +11,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSCellImagePosition, NSEvent, NSEventModifierFlags, NSEventSubtype,
-    NSEventType, NSImage, NSMenu, NSMenuItem, NSRunningApplication, NSStatusBar, NSWorkspace,
+    NSApplicationDelegate, NSCellImagePosition, NSControlStateValueOn, NSEvent,
+    NSEventModifierFlags, NSEventSubtype, NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSRunningApplication, NSStatusBar, NSWorkspace,
 };
 use objc2_foundation::{
     NSAutoreleasePool, NSData, NSDistributedNotificationCenter, NSNotification, NSNotificationName,
@@ -27,7 +28,8 @@ use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 
-use goxlr_ipc::PathTypes;
+use goxlr_ipc::{GoXLRCommand, PathTypes};
+use goxlr_types::MuteState;
 
 use crate::ICON_MAC;
 use crate::events::EventTriggers::Open;
@@ -36,6 +38,7 @@ use crate::tray::macos::TrayOption::{
     Configure, OpenPathIcons, OpenPathLogs, OpenPathMicProfiles, OpenPathPresets, OpenPathProfiles,
     OpenPathSamples, Quit,
 };
+use crate::tray::{tray_label, tray_state};
 
 // MacOS is similar to Windows, except it expects the App loop to exist on the main thread..
 pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> anyhow::Result<()> {
@@ -136,6 +139,12 @@ enum TrayOption {
     Quit,
 }
 
+// Tags of the items built from the device's state (the TrayOption ones are their index). A
+// profile item's title is the profile's name.
+const TAG_PROFILE: isize = 1000;
+const TAG_MIC_PROFILE: isize = 1001;
+const TAG_MUTE: isize = 1002;
+
 struct App {}
 
 struct AppParams {
@@ -192,54 +201,13 @@ impl App {
             None
         };
 
-        // Ok, lets add some items to the tray :)
+        // The menu is filled from the current state each time it opens (see menuNeedsUpdate),
+        // so the profiles, the active one and the mute state are always up to date.
         if let Some(status) = status {
             debug!("Building Menu..");
-
             let menu = NSMenu::new(mtm);
-            let sub_title = NSString::from_str("Open Path");
-
-            // Create the Main Tray Labels..
-            let configure = App::get_label(mtm, "Configure GoXLR", Configure);
-            let quit = App::get_label(mtm, "Quit", Quit);
-
-            // Create SubMenu Items..
-            let profiles = App::get_label(mtm, "Profiles", OpenPathProfiles);
-            let mic_profiles = App::get_label(mtm, "Mic Profiles", OpenPathMicProfiles);
-            let presets = App::get_label(mtm, "Presets", OpenPathPresets);
-            let samples = App::get_label(mtm, "Samples", OpenPathSamples);
-            let icons = App::get_label(mtm, "Icons", OpenPathIcons);
-            let logs = App::get_label(mtm, "Logs", OpenPathLogs);
-
-            debug!("Generating Sub Menu...");
-            let sub_menu = {
-                let menu_item = NSMenuItem::new(mtm);
-                let menu = NSMenu::new(mtm);
-
-                menu.setTitle(&sub_title);
-                menu_item.setTitle(&sub_title);
-                menu_item.setSubmenu(Some(&menu));
-
-                menu.addItem(&profiles);
-                menu.addItem(&mic_profiles);
-                menu.addItem(&App::get_separator(mtm));
-                menu.addItem(&presets);
-                menu.addItem(&samples);
-                menu.addItem(&icons);
-                menu.addItem(&App::get_separator(mtm));
-                menu.addItem(&logs);
-
-                menu_item
-            };
-
-            // Create the Tray Labels
-            debug!("Generating Main Menu..");
-            menu.addItem(&configure);
-            menu.addItem(&App::get_separator(mtm));
-            menu.addItem(&sub_menu);
-            menu.addItem(&App::get_separator(mtm));
-            menu.addItem(&quit);
-
+            App::fill_menu(mtm, &menu);
+            menu.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             status.setMenu(Some(&*menu));
         }
 
@@ -316,7 +284,91 @@ impl App {
         app.run();
     }
 
+    fn fill_menu(mtm: MainThreadMarker, menu: &NSMenu) {
+        menu.removeAllItems();
+        let state = tray_state();
+        let lang = state.language.as_str();
+
+        menu.addItem(&App::get_label(
+            mtm,
+            tray_label(lang, "configure"),
+            Configure,
+        ));
+        menu.addItem(&App::get_separator(mtm));
+
+        if state.profile.is_some() {
+            let profiles = |names: &[String], active: &Option<String>, tag: isize| {
+                names
+                    .iter()
+                    .map(|name| {
+                        let item = App::get_item(mtm, name, tag);
+                        if active.as_ref() == Some(name) {
+                            item.setState(NSControlStateValueOn);
+                        }
+                        item
+                    })
+                    .collect::<Vec<_>>()
+            };
+            menu.addItem(&App::get_submenu(
+                mtm,
+                tray_label(lang, "profiles"),
+                profiles(&state.profiles, &state.profile, TAG_PROFILE),
+            ));
+            menu.addItem(&App::get_submenu(
+                mtm,
+                tray_label(lang, "mic_profiles"),
+                profiles(&state.mic_profiles, &state.mic_profile, TAG_MIC_PROFILE),
+            ));
+        }
+        if let Some(muted) = state.mic_muted {
+            let label = tray_label(lang, if muted { "unmute" } else { "mute" });
+            menu.addItem(&App::get_item(mtm, label, TAG_MUTE));
+        }
+        if state.profile.is_some() || state.mic_muted.is_some() {
+            menu.addItem(&App::get_separator(mtm));
+        }
+
+        let open_path = vec![
+            App::get_label(mtm, tray_label(lang, "profiles"), OpenPathProfiles),
+            App::get_label(mtm, tray_label(lang, "mic_profiles"), OpenPathMicProfiles),
+            App::get_separator(mtm),
+            App::get_label(mtm, tray_label(lang, "presets"), OpenPathPresets),
+            App::get_label(mtm, tray_label(lang, "samples"), OpenPathSamples),
+            App::get_label(mtm, tray_label(lang, "icons"), OpenPathIcons),
+            App::get_separator(mtm),
+            App::get_label(mtm, tray_label(lang, "logs"), OpenPathLogs),
+        ];
+        menu.addItem(&App::get_submenu(
+            mtm,
+            tray_label(lang, "open_path"),
+            open_path,
+        ));
+        menu.addItem(&App::get_separator(mtm));
+        menu.addItem(&App::get_label(mtm, tray_label(lang, "quit"), Quit));
+    }
+
+    fn get_submenu(
+        mtm: MainThreadMarker,
+        label: &str,
+        items: Vec<Retained<NSMenuItem>>,
+    ) -> Retained<NSMenuItem> {
+        let title = NSString::from_str(label);
+        let menu_item = NSMenuItem::new(mtm);
+        let menu = NSMenu::new(mtm);
+        menu.setTitle(&title);
+        menu_item.setTitle(&title);
+        menu_item.setSubmenu(Some(&menu));
+        for item in items {
+            menu.addItem(&item);
+        }
+        menu_item
+    }
+
     fn get_label(mtm: MainThreadMarker, label: &str, option: TrayOption) -> Retained<NSMenuItem> {
+        App::get_item(mtm, label, option as isize)
+    }
+
+    fn get_item(mtm: MainThreadMarker, label: &str, tag: isize) -> Retained<NSMenuItem> {
         unsafe {
             let title = NSString::from_str(label);
 
@@ -344,7 +396,7 @@ impl App {
             //    // WARNING: This causes memory leaks as boxed data is never freed
             //    // Only use when necessary for complex data that can't be encoded as an index
 
-            item.setTag(option as isize);
+            item.setTag(tag);
 
             item
         }
@@ -376,10 +428,39 @@ define_class! {
         //Showcase function for now
         #[unsafe(method(menu_item:))]
         unsafe fn menu_item(&self, item: &NSMenuItem) {
+            let command = match item.tag() {
+                TAG_PROFILE => Some(GoXLRCommand::LoadProfile(item.title().to_string(), true)),
+                TAG_MIC_PROFILE => {
+                    Some(GoXLRCommand::LoadMicProfile(item.title().to_string(), true))
+                }
+                TAG_MUTE => tray_state().mic_muted.map(|muted| {
+                    GoXLRCommand::SetCoughMuteState(if muted {
+                        MuteState::Unmuted
+                    } else {
+                        MuteState::MutedToX
+                    })
+                }),
+                _ => None,
+            };
+            if let Some(command) = command {
+                if self.ivars().global_tx.try_send(EventTriggers::TrayCommand(command)).is_err() {
+                    warn!("Failed to send Tray Command");
+                }
+                return;
+            }
+
             if let Some(option) = TrayOption::iter().nth(item.tag() as usize)
                 && self.ivars().sender.try_send(option).is_err() {
                     warn!("Failed to send Tray Signal");
                 }
+        }
+    }
+
+    unsafe impl NSMenuDelegate for UtilityDelegate {
+        // Called just before the menu opens: rebuilt from the current state
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            App::fill_menu(self.mtm(), menu);
         }
     }
 

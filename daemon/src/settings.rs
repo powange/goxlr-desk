@@ -62,6 +62,19 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Settings which stay with the computer when a backup is restored on it.
+const MACHINE_SETTINGS: &[&str] = &[
+    "network_token",
+    "allow_network_access",
+    "profile_directory",
+    "mic_profile_directory",
+    "samples_directory",
+    "presets_directory",
+    "icons_directory",
+    "logs_directory",
+    "backup_directory",
+];
+
 #[derive(Debug, Clone)]
 pub struct SettingsHandle {
     path: PathBuf,
@@ -246,6 +259,42 @@ impl SettingsHandle {
                 e
             );
         }
+    }
+
+    /// The settings for a backup: without what belongs to this computer (the folders) or is a
+    /// secret (the network token), see `restore_backup_json`.
+    pub async fn backup_json(&self) -> Result<Vec<u8>> {
+        let mut value = serde_json::to_value(&*self.settings.read().await)?;
+        if let Some(object) = value.as_object_mut() {
+            for key in MACHINE_SETTINGS {
+                object.remove(*key);
+            }
+        }
+        Ok(serde_json::to_vec_pretty(&value)?)
+    }
+
+    /// Applies settings from a backup, keeping this computer's folders, network token and
+    /// network access (a restore never opens the interface to the network by itself).
+    pub async fn restore_backup_json(&self, json: &[u8]) -> Result<()> {
+        let mut incoming: serde_json::Value =
+            serde_json::from_slice(json).context("The settings in the backup can't be read")?;
+        let Some(object) = incoming.as_object_mut() else {
+            anyhow::bail!("The settings in the backup can't be read");
+        };
+        {
+            let mut settings = self.settings.write().await;
+            let current = serde_json::to_value(&*settings)?;
+            for key in MACHINE_SETTINGS {
+                match current.get(*key) {
+                    Some(value) => object.insert(key.to_string(), value.clone()),
+                    None => object.remove(*key),
+                };
+            }
+            *settings = serde_json::from_value(incoming)
+                .context("The settings in the backup can't be read")?;
+        }
+        self.save().await;
+        Ok(())
     }
 
     fn get_default_path(&self, suffix: Paths) -> PathBuf {
@@ -1069,5 +1118,35 @@ mod tests {
         assert!(Settings::read(&path).unwrap().is_none());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn backups_keep_this_computers_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"selected_locale": "fr_FR", "network_token": "secret", "profile_directory": "/here"}"#,
+        )
+        .unwrap();
+        let handle = SettingsHandle::load(path).await.unwrap();
+
+        // What goes in a backup: no secret, no folders
+        let json = String::from_utf8(handle.backup_json().await.unwrap()).unwrap();
+        assert!(json.contains("fr_FR"));
+        assert!(!json.contains("secret") && !json.contains("/here"));
+
+        // What comes back from one: applied, except what belongs to this computer
+        let incoming = r#"{"selected_locale": "de_DE", "allow_network_access": true,
+            "network_token": "other", "profile_directory": "/there"}"#;
+        handle
+            .restore_backup_json(incoming.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(handle.get_selected_locale().await.as_deref(), Some("de_DE"));
+        assert!(!handle.get_allow_network_access().await);
+        assert_eq!(handle.get_network_token().await.as_deref(), Some("secret"));
+        assert_eq!(handle.get_profile_directory().await, PathBuf::from("/here"));
+        assert!(handle.restore_backup_json(b"[1, 2]").await.is_err());
     }
 }
