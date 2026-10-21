@@ -316,11 +316,11 @@ async fn run_utility() -> Result<()> {
     let file_paths = file_manager.paths().clone();
 
     let (file_tx, file_rx) = mpsc::channel(20);
-    let file_handle = tokio::spawn(spawn_file_notification_service(
-        file_paths.clone(),
-        file_tx,
+    let file_handle = supervise(
+        "file watcher",
         shutdown.clone(),
-    ));
+        spawn_file_notification_service(file_paths.clone(), file_tx, shutdown.clone()),
+    );
 
     // Spawn the IPC Socket..
     let ipc_socket = bind_socket().await;
@@ -332,29 +332,33 @@ async fn run_utility() -> Result<()> {
     let (ready_tx, ready_rx) = oneshot::channel();
 
     // Start the USB Device Handler
-    let usb_handle = tokio::spawn(spawn_usb_handler(
-        usb_rx,
-        file_rx,
-        device_state_rx,
-        broadcast_tx.clone(),
-        global_tx.clone(),
-        ready_tx,
+    let usb_handle = supervise(
+        "device worker",
         shutdown.clone(),
-        settings.clone(),
-        http_settings.clone(),
-        file_manager,
-    ));
+        spawn_usb_handler(
+            usb_rx,
+            file_rx,
+            device_state_rx,
+            broadcast_tx.clone(),
+            global_tx.clone(),
+            ready_tx,
+            shutdown.clone(),
+            settings.clone(),
+            http_settings.clone(),
+            file_manager,
+        ),
+    );
 
     // Wait until the handler is setup
     let _ = ready_rx.await;
 
     // Launch the IPC Server..
     let ipc_socket = ipc_socket?;
-    let communications_handle = tokio::spawn(spawn_ipc_server(
-        ipc_socket,
-        usb_tx.clone(),
+    let communications_handle = supervise(
+        "IPC server",
         shutdown.clone(),
-    ));
+        spawn_ipc_server(ipc_socket, usb_tx.clone(), shutdown.clone()),
+    );
 
     // Run the HTTP Server (if enabled)..
     let mut http_server: Result<Option<ServerHandle>> = Ok(None);
@@ -403,11 +407,11 @@ async fn run_utility() -> Result<()> {
     };
 
     // Spawn the general event handler..
-    let event_handle = tokio::spawn(spawn_event_handler(
-        state.clone(),
-        global_rx,
-        device_state_tx,
-    ));
+    let event_handle = supervise(
+        "event handler",
+        local_shutdown.clone(),
+        spawn_event_handler(state.clone(), global_rx, device_state_tx),
+    );
 
     // Spawn the Platform Runtime (if needed)
     let platform_handle = tokio::spawn(spawn_runtime(state.clone(), global_tx.clone()));
@@ -424,32 +428,64 @@ async fn run_utility() -> Result<()> {
     local_shutdown.recv().await;
     info!("Shutting down daemon");
 
-    if let Ok(Some(server)) = http_server {
-        // We only need to Join on the HTTP Server if it exists..
-        let _ = join!(
-            usb_handle,
-            communications_handle,
-            server.stop(false),
-            file_handle,
-            tts_handle,
-            event_handle,
-            platform_handle
-        );
-    } else {
-        let _ = join!(
-            usb_handle,
-            communications_handle,
-            file_handle,
-            tts_handle,
-            event_handle,
-            platform_handle
-        );
+    // Everything should stop within seconds; a task stuck on a device or a driver mustn't keep
+    // the process alive for ever.
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        if let Ok(Some(server)) = http_server {
+            // We only need to Join on the HTTP Server if it exists..
+            let _ = join!(
+                usb_handle,
+                communications_handle,
+                server.stop(false),
+                file_handle,
+                tts_handle,
+                event_handle,
+                platform_handle
+            );
+        } else {
+            let _ = join!(
+                usb_handle,
+                communications_handle,
+                file_handle,
+                tts_handle,
+                event_handle,
+                platform_handle
+            );
+        }
+    })
+    .await;
+    if stopped.is_err() {
+        warn!("Some tasks didn't stop in time, exiting anyway");
     }
 
     if RESTART_REQUESTED.load(Ordering::SeqCst) {
         restart();
     }
     Ok(())
+}
+
+/// Runs one of the daemon's main tasks. If it stops (or panics) while no shutdown was asked for,
+/// the daemon would be left half working without any sign: log it and shut down instead.
+fn supervise<F>(name: &'static str, mut shutdown: Shutdown, task: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future + Send + 'static,
+{
+    use futures_util::FutureExt;
+    tokio::spawn(async move {
+        let panicked = std::panic::AssertUnwindSafe(task)
+            .catch_unwind()
+            .await
+            .is_err();
+        // Tasks also end during a normal shutdown, give it a moment to be signalled.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if !shutdown.triggered() {
+            match panicked {
+                false => error!("The {} stopped unexpectedly, shutting down", name),
+                true => error!("The {} panicked, shutting down", name),
+            }
+            shutdown.trigger();
+        }
+    })
 }
 
 /// Set by RestartDaemon: once everything has stopped, a new daemon is started.

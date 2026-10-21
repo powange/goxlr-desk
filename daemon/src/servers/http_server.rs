@@ -660,10 +660,11 @@ async fn execute_command(
         return HttpResponse::Ok().json(DaemonResponse::Error(reason.to_string()));
     }
 
-    let mut data = app_data.write().await;
+    // The sender is cloned so a slow command doesn't hold the lock every request waits on.
+    let mut usb_tx = app_data.read().await.usb_tx.clone();
 
     // Errors propagate weirdly in the javascript world, so send all as OK, and handle there.
-    match handle_packet(request.0, &mut data.usb_tx).await {
+    match handle_packet(request.0, &mut usb_tx).await {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(error) => HttpResponse::Ok().json(DaemonResponse::Error(error.to_string())),
     }
@@ -717,55 +718,62 @@ async fn get_scribble(
     let final_height = 64;
 
     // Now we need to grab the DaemonResponse to get the layout of the scribble
-    let mut data = app_data.write().await;
+    let (mut usb_tx, icons) = {
+        let data = app_data.read().await;
+        (data.usb_tx.clone(), data.file_paths.icons.clone())
+    };
     let request = DaemonRequest::GetStatus;
 
     // Pull out the scribble configuration from the Daemon Status
-    let scribble = handle_packet(request, &mut data.usb_tx)
-        .await
-        .ok()
-        .and_then(|response| match response {
-            DaemonResponse::Status(status) => status
-                .mixers
-                .get(serial)
-                .and_then(|mixer| mixer.fader_status[fader].scribble.clone()),
-            _ => None,
-        });
+    let scribble =
+        handle_packet(request, &mut usb_tx)
+            .await
+            .ok()
+            .and_then(|response| match response {
+                DaemonResponse::Status(status) => status
+                    .mixers
+                    .get(serial)
+                    .and_then(|mixer| mixer.fader_status[fader].scribble.clone()),
+                _ => None,
+            });
 
     if scribble.is_none() {
         return HttpResponse::NotFound().finish();
     }
 
-    let state = &data.scribble_state[fader];
-    if state.scribble_config == scribble && state.png_data.is_some() {
+    let cached = {
+        let data = app_data.read().await;
+        let state = &data.scribble_state[fader];
+        (state.scribble_config == scribble)
+            .then(|| state.png_data.clone())
+            .flatten()
+    };
+    if let Some(png_data) = cached {
         // If we already have the PNG data, return it.
-        if let Some(png_data) = &data.scribble_state[fader].png_data {
-            debug!("Returning Cached Scribble Image for {} - {}", serial, fader);
-            let mime_type = ContentType(IMAGE_PNG);
-            let mut builder = HttpResponse::Ok();
-            builder.insert_header(mime_type);
-            return builder.body(png_data.clone());
-        }
+        debug!("Returning Cached Scribble Image for {} - {}", serial, fader);
+        let mime_type = ContentType(IMAGE_PNG);
+        let mut builder = HttpResponse::Ok();
+        builder.insert_header(mime_type);
+        return builder.body(png_data);
     } else if let Some(scribble) = scribble {
         debug!("Building Scribble Image for {} - {}", serial, fader);
-        let scribble_path = data.file_paths.icons.clone();
+        let icon_path = scribble.file_name.as_ref().map(|file| icons.join(file));
 
-        let mut icon_path = None;
-        if let Some(file) = &scribble.file_name {
-            icon_path = Some(scribble_path.join(file));
-        }
-
-        let png = get_scribble_png(
-            icon_path,
+        // Drawing reads the icon and encodes a PNG, off the web server's workers
+        let (bottom, left, inverted) = (
             scribble.bottom_text.clone(),
             scribble.left_text.clone(),
             scribble.inverted,
-            final_width,
-            final_height,
         );
+        let png = web::block(move || {
+            get_scribble_png(icon_path, bottom, left, inverted, final_width, final_height)
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))
+        .and_then(|result| result);
 
         if let Ok(png) = png {
-            data.scribble_state[fader] = ScribbleState {
+            app_data.write().await.scribble_state[fader] = ScribbleState {
                 scribble_config: Some(scribble.clone()),
                 png_data: Some(png.clone()),
             };
@@ -1365,10 +1373,10 @@ async fn default(req: HttpRequest) -> HttpResponse {
 }
 
 async fn get_status(app_data: Data<RwLock<AppData>>) -> Result<DaemonStatus> {
-    let mut data = app_data.write().await;
+    let mut usb_tx = app_data.read().await.usb_tx.clone();
     let request = DaemonRequest::GetStatus;
 
-    let result = handle_packet(request, &mut data.usb_tx).await?;
+    let result = handle_packet(request, &mut usb_tx).await?;
     match result {
         DaemonResponse::Status(status) => Ok(status),
         _ => Err(anyhow!("Unexpected Daemon Status Result: {:?}", result)),

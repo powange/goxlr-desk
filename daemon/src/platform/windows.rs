@@ -2,7 +2,7 @@ use crate::DaemonState;
 use crate::events::EventTriggers;
 use anyhow::{Result, bail};
 use lazy_static::lazy_static;
-use log::{debug, error};
+use log::{debug, error, info, warn};
 use mslnk::ShellLink;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -87,6 +87,9 @@ pub async fn spawn_platform_runtime(
     state: DaemonState,
     tx: mpsc::Sender<EventTriggers>,
 ) -> Result<()> {
+    // Move an old Startup shortcut to the logon task (it runs PowerShell, so not on this thread)
+    tokio::task::spawn_blocking(migrate_autostart);
+
     // Grab an async shutdown event..
     let mut shutdown = state.shutdown.clone();
     let mut duration = time::interval(Duration::from_millis(1000));
@@ -148,12 +151,112 @@ fn throw_notification() {
     let _ = manager.show(&toast);
 }
 
-pub fn has_autostart() -> bool {
-    if let Some(path) = &*STARTUP_PATH {
-        return path.join(AUTOSTART_FILENAME).exists();
-    }
+// Autostart is a scheduled task run at logon: Windows runs the Startup folder's shortcuts minutes
+// after logon (5 to 6 measured), a logon task starts right away. The shortcut is the fallback.
+const AUTOSTART_TASK: &str = "GoXLR Utility";
 
-    false
+// No console window flashes when PowerShell or schtasks run
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn hidden_command(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+fn has_autostart_task() -> bool {
+    hidden_command("schtasks")
+        .args(["/Query", "/TN", AUTOSTART_TASK])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Registers the logon task for this user: no time limit, normal priority, one instance.
+fn create_autostart_task() -> Result<()> {
+    let executable = env::current_exe()?;
+    let executable = dunce::simplified(&executable).to_path_buf();
+    let directory = executable
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let quote = |value: &std::path::Path| value.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $user = \"$env:USERDOMAIN\\$env:USERNAME\"; \
+         $action = New-ScheduledTaskAction -Execute '{exe}' -WorkingDirectory '{dir}'; \
+         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user; \
+         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited; \
+         $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 4 \
+           -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew; \
+         Register-ScheduledTask -TaskName '{task}' -Action $action -Trigger $trigger \
+           -Principal $principal -Settings $settings -Description 'Starts the GoXLR Utility at logon.' -Force | Out-Null",
+        exe = quote(&executable),
+        dir = quote(&directory),
+        task = AUTOSTART_TASK,
+    );
+    let output = hidden_command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "Unable to create the logon task: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn remove_autostart_task() {
+    if has_autostart_task() {
+        let _ = hidden_command("schtasks")
+            .args(["/Delete", "/TN", AUTOSTART_TASK, "/F"])
+            .output();
+    }
+}
+
+pub fn has_autostart() -> bool {
+    if let Some(path) = &*STARTUP_PATH
+        && path.join(AUTOSTART_FILENAME).exists()
+    {
+        return true;
+    }
+    has_autostart_task()
+}
+
+/// Turns autostart on: the logon task, or the Startup shortcut when the task can't be made.
+pub fn enable_autostart() -> Result<()> {
+    match create_autostart_task() {
+        Ok(()) => {
+            // Only one way to start, or the Utility would be started twice
+            remove_startup_link()
+        }
+        Err(e) => {
+            warn!("{}, using the Startup folder instead", e);
+            create_startup_link()
+        }
+    }
+}
+
+pub fn disable_autostart() -> Result<()> {
+    remove_autostart_task();
+    remove_startup_link()
+}
+
+/// Earlier versions used the Startup shortcut: move it to the logon task.
+pub fn migrate_autostart() {
+    let Some(path) = &*STARTUP_PATH else {
+        return;
+    };
+    if path.join(AUTOSTART_FILENAME).exists() && !has_autostart_task() {
+        match create_autostart_task() {
+            Ok(()) => {
+                info!("Autostart moved from the Startup folder to a logon task");
+                let _ = remove_startup_link();
+            }
+            Err(e) => warn!("Keeping the Startup shortcut: {}", e),
+        }
+    }
 }
 
 pub fn remove_startup_link() -> Result<()> {

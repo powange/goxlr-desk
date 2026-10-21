@@ -24,9 +24,9 @@ cfg_if! {
 
         pub fn set_autostart(enabled: bool) -> Result<()> {
             if enabled {
-                return windows::create_startup_link();
+                return windows::enable_autostart();
             }
-            windows::remove_startup_link()
+            windows::disable_autostart()
         }
 
         pub fn display_error(message: String) {

@@ -69,6 +69,17 @@ pub struct Device<'a> {
     // current ones at most once per CHANGES_CHECK_INTERVAL.
     saved: ProfileFingerprints,
     changes_checked: Instant,
+
+    // Settings read on hot paths (routing, faders, status), kept here and updated by their
+    // setters below, like hold_time.
+    cached: CachedSettings,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedSettings {
+    lock_faders: bool,
+    vod_mode: VodMode,
+    monitor_with_fx: bool,
 }
 
 const CHANGES_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -217,6 +228,11 @@ impl<'a> Device<'a> {
         }
 
         let hold_time = settings_handle.get_device_hold_time(&serial).await;
+        let cached = CachedSettings {
+            lock_faders: settings_handle.get_device_lock_faders(&serial).await,
+            vod_mode: settings_handle.get_device_vod_mode(&serial).await,
+            monitor_with_fx: settings_handle.get_enable_monitor_with_fx(&serial).await,
+        };
         let vc_mute_also_mute_cm = settings_handle
             .get_device_chat_mute_mutes_mic_to_chat(&serial)
             .await;
@@ -249,6 +265,7 @@ impl<'a> Device<'a> {
 
             saved: ProfileFingerprints::default(),
             changes_checked: Instant::now(),
+            cached,
         };
 
         device.apply_profile(None).await?;
@@ -319,18 +336,15 @@ impl<'a> Device<'a> {
             .get_device_sampler_pre_buffer(self.serial())
             .await;
 
-        let monitor_with_fx = self
-            .settings
-            .get_enable_monitor_with_fx(self.serial())
-            .await;
+        let monitor_with_fx = self.cached.monitor_with_fx;
 
         let sampler_reset_on_clear = self
             .settings
             .get_sampler_reset_on_clear(self.serial())
             .await;
 
-        let locked_faders = self.settings.get_device_lock_faders(self.serial()).await;
-        let vod_mode = self.settings.get_device_vod_mode(self.serial()).await;
+        let locked_faders = self.cached.lock_faders;
+        let vod_mode = self.cached.vod_mode;
 
         let sampler_fade_duration = self.settings.get_sampler_fade_duration(self.serial()).await;
 
@@ -509,56 +523,70 @@ impl<'a> Device<'a> {
         &self.mic_profile
     }
 
-    pub async fn update_state(&mut self) -> Result<bool> {
-        let mut state_updated = self.check_unsaved_changes();
+    /// Picks up finished gain calculations, progress and playback changes from the sampler.
+    async fn update_audio_state(&mut self) -> Result<bool> {
+        let mut state_updated = false;
         let mut refresh_colour_map = false;
+        let Some(audio_handler) = &mut self.audio_handler else {
+            return Ok(false);
+        };
 
-        // Update any audio related states..
-        if let Some(audio_handler) = &mut self.audio_handler {
-            // Check the status of any processing audio files..
-            if audio_handler.is_calculating() && audio_handler.is_calculating_complete()? {
-                // Handling has been finished, pull all the data and add it to the profile.
-
-                let result = audio_handler.get_and_clear_calculating_result()?;
-                if result.result.is_err() {
-                    if let Err(error) = result.result {
-                        // We need to somehow push this to the user (via DaemonStatus probably)..
-                        self.last_sample_error = Some(error.to_string());
+        // Check the status of any processing audio files..
+        if audio_handler.is_calculating() && audio_handler.is_calculating_complete()? {
+            // Handling has been finished, pull all the data and add it to the profile.
+            let result = audio_handler.get_and_clear_calculating_result()?;
+            match result.result {
+                // We need to somehow push this to the user (via DaemonStatus probably)..
+                Err(error) => self.last_sample_error = Some(error.to_string()),
+                Ok(_) => match result.file.file_name() {
+                    Some(filename) => {
+                        let filename = filename.to_string_lossy().to_string();
+                        debug!("Calculated Gain: {}", result.gain);
+                        let track =
+                            self.profile
+                                .add_sample_file(result.bank, result.button, filename);
+                        track.normalized_gain = result.gain;
+                        refresh_colour_map = true;
                     }
-                } else {
-                    let bank = result.bank;
-                    let button = result.button;
-
-                    let filename = result.file.file_name().unwrap();
-                    let filename = filename.to_string_lossy().to_string();
-
-                    debug!("Calculated Gain: {}", result.gain);
-
-                    let track = self.profile.add_sample_file(bank, button, filename);
-                    track.normalized_gain = result.gain;
-
-                    refresh_colour_map = true;
-                }
-                state_updated = true;
+                    None => {
+                        self.last_sample_error =
+                            Some(format!("Invalid sample path: {}", result.file.display()));
+                    }
+                },
             }
+            state_updated = true;
+        }
 
+        if let Some(audio_handler) = &mut self.audio_handler {
             if audio_handler.is_calculating() {
                 // We need to update the percentage in DaemonStatus
                 debug!("Progress: {}", audio_handler.get_calculating_progress()?);
                 state_updated = true;
             }
 
-            if audio_handler.check_playing().await && !state_updated {
+            if audio_handler.check_playing().await {
                 state_updated = true;
             }
+        }
 
-            if self.sync_sample_lighting().await? && !state_updated {
-                state_updated = true;
-            };
+        if self.sync_sample_lighting().await? {
+            state_updated = true;
+        }
 
-            if refresh_colour_map {
-                self.load_colour_map().await?;
-            }
+        if refresh_colour_map {
+            self.load_colour_map().await?;
+        }
+        Ok(state_updated)
+    }
+
+    pub async fn update_state(&mut self) -> Result<bool> {
+        let mut state_updated = self.check_unsaved_changes();
+
+        // Audio problems are logged, they must not stop the hold detection below (mute to
+        // all, cough) from running.
+        match self.update_audio_state().await {
+            Ok(updated) => state_updated |= updated,
+            Err(e) => warn!("Unable to update the sampler state: {}", e),
         }
 
         // Find any buttons that have been held, and action if needed.
@@ -1056,7 +1084,7 @@ impl<'a> Device<'a> {
     async fn mute_fader_to_all(&mut self, fader: FaderName, blink: bool) -> Result<()> {
         let (muted_to_x, muted_to_all, mute_function) = self.profile.get_mute_button_state(fader);
         let channel = self.profile.get_fader_assignment(fader);
-        let lock_faders = self.settings.get_device_lock_faders(self.serial()).await;
+        let lock_faders = self.cached.lock_faders;
 
         // Are we already muted to all?
         if muted_to_all {
@@ -1125,7 +1153,7 @@ impl<'a> Device<'a> {
     async fn unmute_fader(&mut self, fader: FaderName) -> Result<()> {
         let (muted_to_x, muted_to_all, mute_function) = self.profile.get_mute_button_state(fader);
         let channel = self.profile.get_fader_assignment(fader);
-        let lock_faders = self.settings.get_device_lock_faders(self.serial()).await;
+        let lock_faders = self.cached.lock_faders;
 
         if !muted_to_x && !muted_to_all {
             // Nothing to do.
@@ -3117,6 +3145,7 @@ impl<'a> Device<'a> {
                 self.settings
                     .set_enable_monitor_with_fx(self.serial(), value)
                     .await;
+                self.cached.monitor_with_fx = value;
                 self.settings.save().await;
                 self.apply_routing(BasicInputDevice::Microphone).await?;
             }
@@ -3140,12 +3169,13 @@ impl<'a> Device<'a> {
             }
 
             GoXLRCommand::SetLockFaders(value) => {
-                let current = self.settings.get_device_lock_faders(self.serial()).await;
+                let current = self.cached.lock_faders;
 
                 if current != value {
                     self.settings
                         .set_device_lock_faders(self.serial(), value)
                         .await;
+                    self.cached.lock_faders = value;
 
                     self.settings.save().await;
 
@@ -3167,11 +3197,12 @@ impl<'a> Device<'a> {
                 let serial = self.serial();
 
                 // Get the current mode..
-                let current = self.settings.get_device_vod_mode(serial).await;
+                let current = self.cached.vod_mode;
                 debug!("Current: {}, New: {}", current, value);
 
                 if current != value {
                     self.settings.set_device_vod_mode(serial, value).await;
+                    self.cached.vod_mode = value;
                     self.load_submix_settings(false).await?;
 
                     // We need to reapply all routing to reconfigure as needed
@@ -3606,8 +3637,7 @@ impl<'a> Device<'a> {
         if input == BasicInputDevice::Microphone {
             // If the mic is muted, transient routing will forcefully disable this, so we should
             // be safe to simply set it true here, and hope for the best :D
-            let serial = self.hardware.serial_number.as_str();
-            if self.settings.get_enable_monitor_with_fx(serial).await {
+            if self.cached.monitor_with_fx {
                 // We need to adjust this based on the FX state..
                 if self.profile.is_fx_enabled() {
                     router[BasicOutputDevice::Headphones] = true;
@@ -3855,7 +3885,7 @@ impl<'a> Device<'a> {
     async fn load_colour_map(&mut self) -> Result<()> {
         // The new colour format occurred on different firmware versions depending on device,
         // so do the check here.
-        let lock_faders = self.settings.get_device_lock_faders(self.serial()).await;
+        let lock_faders = self.cached.lock_faders;
 
         let blank_mute = self.is_device_mini() || lock_faders;
 
@@ -4432,11 +4462,9 @@ impl<'a> Device<'a> {
     }
 
     async fn is_stream_no_music(&self) -> bool {
-        let mode = self.settings.get_device_vod_mode(self.serial()).await;
+        let mode = self.cached.vod_mode;
         let enabled = mode == VodMode::StreamNoMusic;
-        let result = enabled && self.device_supports_vod_mode().await;
-        debug!("IsStreamNoMusic: {}", result);
-        result
+        enabled && self.device_supports_vod_mode().await
     }
 
     async fn device_supports_vod_mode(&self) -> bool {

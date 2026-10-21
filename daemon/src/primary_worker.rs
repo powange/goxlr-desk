@@ -280,7 +280,12 @@ pub async fn spawn_usb_handler(
                     attaching = true;
                     let started = Instant::now();
                     tokio::task::spawn_blocking(move || {
-                        let result = attach_device(device, existing_serials, disconnect_sender, event_sender);
+                        // A panic in the USB or driver code must still answer, otherwise
+                        // 'attaching' stays set and no device is ever detected again.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            attach_device(device, existing_serials, disconnect_sender, event_sender)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow!("The device code panicked while attaching")));
                         let _ = attach_tx.blocking_send((key, started, result));
                     });
                 }
@@ -482,6 +487,7 @@ pub async fn spawn_usb_handler(
                             }
                             DaemonCommand::SetAutoStartEnabled(enabled) => {
                                 let _ = sender.send(set_autostart(enabled));
+                                forget_autostart();
                                 change_found = true;
                             }
                             DaemonCommand::SetLogLevel(level) => {
@@ -920,6 +926,30 @@ pub async fn spawn_usb_handler(
     }
 }
 
+// Whether autostart is set looks at the disk (shortcut, task, desktop file): it's checked at
+// most every few seconds, not on each status rebuild, and again right after it's changed.
+static AUTOSTART: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+
+fn autostart_enabled() -> bool {
+    let Ok(mut cached) = AUTOSTART.lock() else {
+        return has_autostart();
+    };
+    match *cached {
+        Some((checked, value)) if checked.elapsed() < Duration::from_secs(5) => value,
+        _ => {
+            let value = has_autostart();
+            *cached = Some((Instant::now(), value));
+            value
+        }
+    }
+}
+
+fn forget_autostart() {
+    if let Ok(mut cached) = AUTOSTART.lock() {
+        *cached = None;
+    }
+}
+
 // Dis getting big..
 #[allow(clippy::too_many_arguments)]
 async fn get_daemon_status(
@@ -942,7 +972,7 @@ async fn get_daemon_status(
                 user_locale: settings.get_selected_locale().await,
                 system_locale: SYSTEM_LOCALE.clone(),
             },
-            autostart_enabled: has_autostart(),
+            autostart_enabled: autostart_enabled(),
             show_tray_icon: settings.get_show_tray_icon().await,
             tts_enabled: settings.get_tts_enabled().await,
             allow_network_access: settings.get_allow_network_access().await,

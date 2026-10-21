@@ -51,9 +51,15 @@ pub async fn spawn_event_handler(
     device_state_tx: Sender<DeviceStateChange>,
 ) {
     let mut triggered_device_stop = false;
+    // A shutdown started elsewhere (a supervised task that died) ends this loop too.
+    let mut shutdown = state.shutdown.clone();
     debug!("Starting Event Loop..");
     loop {
         select! {
+            () = shutdown.recv() => {
+                debug!("Shutdown signalled, stopping the event loop");
+                break;
+            },
             Ok(()) = signal::ctrl_c() => {
                 debug!("Shutdown Phase 1 Triggered..");
 

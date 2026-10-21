@@ -20,6 +20,20 @@ impl Shutdown {
         let _ = self.sender.send(());
     }
 
+    /// Whether a shutdown was requested, without waiting.
+    pub fn triggered(&mut self) -> bool {
+        if !self.shutdown {
+            use broadcast::error::TryRecvError;
+            if matches!(
+                self.receiver.try_recv(),
+                Ok(()) | Err(TryRecvError::Lagged(_))
+            ) {
+                self.shutdown = true;
+            }
+        }
+        self.shutdown
+    }
+
     pub async fn recv(&mut self) {
         if self.shutdown {
             return;

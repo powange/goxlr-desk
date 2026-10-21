@@ -67,6 +67,8 @@ pub struct SettingsHandle {
     path: PathBuf,
     data_dir: PathBuf,
     settings: Arc<RwLock<Settings>>,
+    // One save at a time, so an older snapshot never overwrites a newer one
+    save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 enum Paths {
@@ -212,14 +214,32 @@ impl SettingsHandle {
             path,
             data_dir: data_dir.to_path_buf(),
             settings: Arc::new(RwLock::new(settings)),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         handle.save().await;
         Ok(handle)
     }
 
+    /// Writes the settings. They're serialised under a read lock, then written (with fsync) on
+    /// a blocking thread, so the runtime and the other readers don't wait for the disk.
     pub async fn save(&self) {
-        let settings = self.settings.write().await;
-        if let Err(e) = settings.write(&self.path) {
+        let _saving = self.save_lock.lock().await;
+        let snapshot = {
+            let settings = self.settings.read().await;
+            serde_json::to_vec_pretty(&*settings)
+        };
+        let contents = match snapshot {
+            Ok(contents) => contents,
+            Err(e) => {
+                error!("Couldn't serialise the settings: {}", e);
+                return;
+            }
+        };
+        let path = self.path.clone();
+        let written =
+            tokio::task::spawn_blocking(move || Settings::write_bytes(&path, &contents)).await;
+        let result = written.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+        if let Err(e) = result {
             error!(
                 "Couldn't save settings to {}: {}",
                 self.path.to_string_lossy(),
@@ -910,7 +930,13 @@ impl Settings {
         }
     }
 
+    #[cfg(test)]
     pub fn write(&self, path: &Path) -> Result<()> {
+        Self::write_bytes(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    fn write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+        use std::io::Write;
         debug!("Saving Settings");
         if let Some(parent) = path.parent()
             && let Err(e) = create_dir_all(parent)
@@ -922,7 +948,7 @@ impl Settings {
             ))?;
         }
 
-        let write = |file: &File| Ok(serde_json::to_writer_pretty(file, self)?);
+        let write = |mut file: &File| Ok(file.write_all(contents)?);
         atomic_write(path, write)?;
 
         // Keep a copy of these known good settings, used if the main file ever can't be read.
