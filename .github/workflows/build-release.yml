@@ -273,10 +273,18 @@ jobs:
           name: "macos-artifact-aarch64-apple-darwin"
 
       - name: "Install Packages App.."
+        # The download is plain HTTP and always the latest version, so the volume is mounted at a
+        # fixed path (its name carries the version) and the installer's Developer ID signature is
+        # checked before it runs as root.
         run: |
           wget http://s.sudre.free.fr/Software/files/Packages.dmg
-          hdiutil attach Packages.dmg
-          sudo installer -pkg /Volumes/Packages\ 1.2.10/Install\ Packages.pkg -target /
+          hdiutil attach Packages.dmg -nobrowse -mountpoint /Volumes/PackagesInstaller
+          pkg=$(find /Volumes/PackagesInstaller -maxdepth 1 -name "*.pkg" | head -n 1)
+          test -n "$pkg"
+          pkgutil --check-signature "$pkg" | tee signature.txt
+          grep -q "Status: signed by a developer certificate issued by Apple" signature.txt
+          grep -q "Developer ID Installer: Stephane Sudre (NL5M9E394P)" signature.txt
+          sudo installer -pkg "$pkg" -target /
       - name: "Build LIPO Binaries"
         run: ./ci/build-macos-package '${{ needs.get_version.outputs.version }}'
         shell: bash
