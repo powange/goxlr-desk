@@ -693,7 +693,14 @@ fn sha256_of(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut file = File::open(path)?;
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(hasher
         .finalize()
         .iter()

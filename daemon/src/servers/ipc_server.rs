@@ -89,6 +89,15 @@ pub async fn bind_socket() -> Result<LocalSocketListener> {
     };
 
     let opts = ListenerOptions::new().name(name.clone());
+    // Only this user (and the system) may open the pipe, never from the network
+    #[cfg(windows)]
+    let opts = match super::pipe_security::pipe_security() {
+        Some(descriptor) => {
+            use interprocess::os::windows::local_socket::ListenerOptionsExt;
+            opts.security_descriptor(descriptor)
+        }
+        None => opts,
+    };
     let listener = opts.create_tokio()?;
 
     // Only this user may talk to the daemon (it can run programs through the activator).
@@ -105,7 +114,7 @@ pub async fn bind_socket() -> Result<LocalSocketListener> {
 }
 
 /// Whether the client runs as the daemon's user (the IPC can run programs, through the
-/// activator). On Windows the check isn't available, the named pipe's default access applies.
+/// activator). On Windows the named pipe's security already restricts it to this user.
 #[cfg(unix)]
 fn same_user(connection: &LocalSocketStream) -> bool {
     use interprocess::local_socket::traits::StreamCommon;

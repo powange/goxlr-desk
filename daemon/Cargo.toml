@@ -16,7 +16,7 @@ tts = ["dep:tts"]
 [dependencies]
 goxlr-usb = { path = "../usb" }
 goxlr-ipc = { path = "../ipc" }
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 schemars = { workspace = true }
 goxlr-types = { path = "../types" }
 goxlr-audio = { path = "../audio" }
@@ -58,7 +58,7 @@ log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 directories = "6.0.0"
 
 # Linked Hashsets
-ritelinked = "0.3.2"
+hashlink = "0.12.2"
 
 # Opens a Browser or App
 open = "5.3.2"
@@ -81,7 +81,7 @@ sys-locale = "0.3.2"
 actix-web = { version = "4.11.0", default-features = false, features = ["macros", "compress-brotli", "compress-gzip"] }
 actix-ws = "0.3.0"
 actix-cors = "0.7.1"
-actix-multipart = "0.7.2"
+actix-multipart = "0.8.5"
 actix-files = "0.6.6"
 
 mime_guess = "2.0.5"
@@ -111,6 +111,7 @@ dunce = "1.0.5"
 windows-args = "0.2.0"
 
 winreg = { workspace = true }
+widestring = "1.2.0"
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_Shell",
@@ -119,7 +120,10 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Shutdown",
-    "Win32_System_RemoteDesktop"
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization"
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -9,8 +9,8 @@ use goxlr_types::{
     CompressorAttackTime, CompressorRatio, CompressorReleaseTime, DisplayMode, EffectKey,
     EqFrequencies, GateTimes, MicrophoneParamKey, MicrophoneType, MiniEqFrequencies,
 };
+use hashlink::LinkedHashSet;
 use log::warn;
-use ritelinked::LinkedHashSet;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek};

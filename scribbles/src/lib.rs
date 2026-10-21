@@ -143,6 +143,10 @@ fn create_text_image(text: &str) -> Result<DynamicImage> {
     // Calculate the draw width..
     let (width, _height) = text_size(scale, &draw_font, text);
     let draw_width = if width < 128 { width } else { 128 };
+    // An empty text has no width, and an image with no width can't be drawn on
+    if draw_width == 0 {
+        bail!("No text to draw");
+    }
 
     let mut image = DynamicImage::new_rgb8(draw_width, 19);
     image
@@ -150,9 +154,10 @@ fn create_text_image(text: &str) -> Result<DynamicImage> {
         .pixels()
         .for_each(|f| image.put_pixel(f.0, f.1, Rgba::from([255, 255, 255, 255])));
 
+    // Opaque black: the alpha is used when drawing (a transparent colour draws nothing)
     draw_text_mut(
         &mut image,
-        Rgba::from([0, 0, 0, 0]),
+        Rgba::from([0, 0, 0, 255]),
         0,
         0,
         scale,
@@ -241,4 +246,38 @@ fn to_goxlr(img: GrayImage, invert: bool) -> Result<[u8; 1024]> {
         }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// The 1-bit image the GoXLR receives for a few texts (an empty one included), compared
+    /// with what was drawn so far: a change of the drawing library mustn't move a pixel
+    /// (imageproc 0.27 moves the text by one).
+    #[test]
+    fn text_renders_as_before() {
+        let render = |top: &str, bottom: &str, invert: bool| {
+            get_scribble(
+                None,
+                Some(bottom.to_string()),
+                Some(top.to_string()),
+                invert,
+            )
+        };
+        let mut all = Vec::new();
+        for (top, bottom, invert) in [
+            ("Mic", "Chat", false),
+            ("1", "Game Audio", true),
+            ("", "AaWw@gjpqy", false),
+        ] {
+            all.extend_from_slice(&render(top, bottom, invert));
+        }
+        let sum = all.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        });
+        assert_eq!(format!("{sum:x}"), EXPECTED);
+    }
+
+    const EXPECTED: &str = "bf62d1399da4b053";
 }
