@@ -7,7 +7,7 @@ use mslnk::ShellLink;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::{env, fs};
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -33,7 +33,7 @@ pub fn perform_platform_preflight() -> Result<()> {
         bail!("The GoXLR Driver was not found, please install it and try again.");
     }
 
-    if get_official_app_count() > 0 {
+    if get_official_app_count(&mut System::new()) > 0 {
         error!("Detected Official GoXLR Application Running, Failing Preflight.");
         bail!(
             "The official GoXLR Application is currently running, Please close it before running the Utility"
@@ -56,10 +56,14 @@ pub fn display_error(message: String) {
     }
 }
 
-fn get_official_app_count() -> usize {
-    let process_refresh_kind = ProcessRefreshKind::everything().without_tasks();
-    let refresh_kind = RefreshKind::nothing().with_processes(process_refresh_kind);
-    let system = System::new_with_specifics(refresh_kind);
+/// Refreshes the process list, only the names are needed so nothing else is read (reading
+/// everything for every process each second was costly, especially while a session starts).
+fn refresh_process_names(system: &mut System) {
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+}
+
+fn get_official_app_count(system: &mut System) -> usize {
+    refresh_process_names(system);
 
     let stable = OsStr::new(GOXLR_APP_NAME);
     let beta = OsStr::new(GOXLR_BETA_APP_NAME);
@@ -70,9 +74,8 @@ fn get_utility_count() -> usize {
     if let Ok(exe) = env::current_exe()
         && let Some(file_name) = exe.file_name()
     {
-        let process_refresh_kind = ProcessRefreshKind::everything().without_tasks();
-        let refresh_kind = RefreshKind::nothing().with_processes(process_refresh_kind);
-        let system = System::new_with_specifics(refresh_kind);
+        let mut system = System::new();
+        refresh_process_names(&mut system);
 
         return system.processes_by_exact_name(file_name).count();
     }
@@ -87,6 +90,7 @@ pub async fn spawn_platform_runtime(
     // Grab an async shutdown event..
     let mut shutdown = state.shutdown.clone();
     let mut duration = time::interval(Duration::from_millis(1000));
+    let mut system = System::new();
 
     let mut ctrl_break = ctrl_break()?;
     let mut ctrl_close = ctrl_close()?;
@@ -96,7 +100,7 @@ pub async fn spawn_platform_runtime(
     loop {
         select! {
             _ = duration.tick() => {
-                let count = get_official_app_count();
+                let count = get_official_app_count(&mut system);
                 if count > 0 {
                     throw_notification();
                     // We're calling 'DevicesStopped' here to force an end to the util, we can't use

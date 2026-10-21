@@ -49,7 +49,7 @@ use goxlr_usb::colouring::ColourTargets;
 
 use crate::audio::{AudioFile, AudioHandler};
 use crate::device::CurrentState;
-use crate::files::can_create_new_file;
+use crate::files::{can_create_new_file, named_file_path};
 
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
 const DEFAULT_PROFILE: &[u8] = include_bytes!("../profiles/Default.goxlr");
@@ -62,7 +62,7 @@ pub struct ProfileAdapter {
 
 impl ProfileAdapter {
     pub fn from_named(name: String, directory: &Path) -> Result<Self> {
-        let path = directory.join(format!("{name}.goxlr"));
+        let path = named_file_path(directory, &name, "goxlr")?;
 
         if path.is_file() {
             debug!("Loading Profile From {}", path.to_string_lossy());
@@ -87,18 +87,20 @@ impl ProfileAdapter {
     }
 
     pub fn can_create_new_file(name: String, directory: &Path) -> Result<()> {
-        let path = directory.join(format!("{name}.goxlr"));
+        let path = named_file_path(directory, &name, "goxlr")?;
         can_create_new_file(path)
     }
 
     pub fn save_as(&mut self, name: String, directory: &Path, overwrite: bool) -> Result<()> {
+        // Check the name before adopting it, so a refused name doesn't rename this profile.
+        named_file_path(directory, &name, "goxlr")?;
         self.name = name;
         self.save(directory, overwrite)
     }
 
     pub fn save(&mut self, directory: &Path, overwrite: bool) -> Result<()> {
         let name = &self.name;
-        let path = directory.join(format!("{name}.goxlr"));
+        let path = named_file_path(directory, name, "goxlr")?;
         if !overwrite && path.is_file() {
             return Err(anyhow!("Profile exists, will not overwrite"));
         }
@@ -108,13 +110,13 @@ impl ProfileAdapter {
     }
 
     pub fn write_preset(&mut self, name: String, directory: &Path) -> Result<()> {
-        let path = directory.join(format!("{name}.preset"));
+        let path = named_file_path(directory, &name, "preset")?;
         self.profile.save_preset(path)?;
         Ok(())
     }
 
     pub fn delete_profile(&mut self, name: String, directory: &Path) -> Result<()> {
-        let path = directory.join(format!("{name}.goxlr"));
+        let path = named_file_path(directory, &name, "goxlr")?;
         if path.is_file() {
             remove_file(path)?;
         }
@@ -146,7 +148,7 @@ impl ProfileAdapter {
 
         // Loop through the provided directories, and try to find the preset..
         for directory in directories {
-            let path = directory.join(format!("{name}.preset"));
+            let path = named_file_path(directory, &name, "preset")?;
 
             if path.is_file() {
                 debug!("Loading Preset From {}", path.to_string_lossy());
@@ -993,9 +995,9 @@ impl ProfileAdapter {
         let mute_config = self.get_mute_button(fader);
         let colour_map = mute_config.colour_map();
 
-        // We should be safe to straight unwrap these, state and blink are always present.
-        let muted_to_x = colour_map.state().as_ref().unwrap() == &ColourState::On;
-        let muted_to_all = colour_map.blink().as_ref().unwrap() == &ColourState::On;
+        // A profile missing these attributes (edited by hand, or by another tool) isn't muted.
+        let muted_to_x = matches!(colour_map.state(), Some(ColourState::On));
+        let muted_to_all = matches!(colour_map.blink(), Some(ColourState::On));
         let mute_function = *mute_config.mute_function();
 
         (muted_to_x, muted_to_all, mute_function)

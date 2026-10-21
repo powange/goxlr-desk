@@ -5,6 +5,7 @@ categories = ["hardware-support", "command-line-utilities"]
 
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,4 +22,4 @@ rusb = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1.6"
-xpc-connection-sys = { git = "https://github.com/dfrankland/xpc-connection-rs.git" }
+xpc-connection-sys = { git = "https://github.com/dfrankland/xpc-connection-rs.git", rev = "cd4fb3d05edb4292ccb9566ae27cdeb874222d2a" }

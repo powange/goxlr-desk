@@ -45,12 +45,27 @@ pub trait ExecutableGoXLR {
     fn get_descriptor(&self) -> Result<UsbData>;
 }
 
+/// Responses come from the device (or the driver), a short or empty one must be an error, not a
+/// panic when the parsers below slice into it.
+fn expect_len(data: &[u8], length: usize, response: &str) -> Result<()> {
+    if data.len() < length {
+        bail!(
+            "{} response too short, expected {} bytes, received {}",
+            response,
+            length,
+            data.len()
+        );
+    }
+    Ok(())
+}
+
 // These are commands that can be executed, but perform_request must be implemented..
 pub trait GoXLRCommands: ExecutableGoXLR {
     fn supports_dcp_category(&mut self, category: DCPCategory) -> Result<bool> {
         let mut out = [0; 2];
         LittleEndian::write_u16(&mut out, category.id());
         let result = self.request_data(Command::SystemInfo(SupportsDCPCategory), &out)?;
+        expect_len(&result, 2, "DCP Category")?;
         Ok(LittleEndian::read_u16(&result) == 1)
     }
 
@@ -101,6 +116,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             &[],
         )?;
 
+        expect_len(&result, 24, "Serial Number")?;
         let serial_slice = &result[..24];
         let serial_len = serial_slice
             .iter()
@@ -224,6 +240,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
 
     fn get_microphone_level(&mut self) -> Result<u16> {
         let result = self.request_data(Command::GetMicrophoneLevel, &[])?;
+        expect_len(&result, 2, "Microphone Level")?;
         Ok(LittleEndian::read_u16(&result))
     }
 
@@ -256,6 +273,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         let mut pressed = EnumSet::empty();
         let mut mixers = [0; 4];
         let mut encoders = [0; 4];
+        expect_len(&result, 12, "Button States")?;
         let button_states = LittleEndian::read_u32(&result[0..4]);
 
         mixers[0] = result[8];
@@ -312,6 +330,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             Command::ExecuteFirmwareUpdateCommand(FirmwareCommand::START),
             &[],
         )?;
+        expect_len(&result, 4, "Firmware Start")?;
         let code = LittleEndian::read_u32(&result[0..4]);
         if code != 0 {
             bail!("Invalid Response Received!");
@@ -377,6 +396,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         )?;
 
         // Grab the Hash and Count from the result..
+        expect_len(&result, 8, "Firmware Validate")?;
         let hash = LittleEndian::read_u32(&result[0..4]);
         let count = LittleEndian::read_u32(&result[4..8]);
 
@@ -389,6 +409,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             &[],
         )?;
 
+        expect_len(&result, 4, "Firmware Verify")?;
         let output = LittleEndian::read_u32(&result);
         if output != 0 {
             bail!("Unexpected Result from Verify: {}", output);
@@ -461,6 +482,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             &[],
         )?;
 
+        expect_len(&result, 4, "Firmware Finalise")?;
         let output = LittleEndian::read_u32(&result);
         if output != 0 {
             bail!("Unexpected Result from Finalise: {}", output);
@@ -523,6 +545,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             Command::ExecuteFirmwareUpdateCommand(FirmwareCommand::ABORT),
             &[],
         )?;
+        expect_len(&result, 4, "Firmware Abort")?;
         let value = LittleEndian::read_u32(&result);
         Ok(value)
     }
@@ -533,6 +556,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
             &[],
         )?;
 
+        expect_len(&result, 4, "Firmware Reboot")?;
         let output = LittleEndian::read_u32(&result);
         if output != 0 {
             bail!("Unexpected Result from Reboot: {}", output);

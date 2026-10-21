@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::{File, create_dir_all};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 // use futures::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 
-use glob::glob;
+use glob::{Pattern, glob};
 use goxlr_ipc::PathTypes;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -153,25 +153,7 @@ impl FileManager {
         path: PathBuf,
         extensions: Vec<&str>,
     ) -> BTreeMap<String, String> {
-        let mut paths: Vec<PathBuf> = Vec::new();
-
-        for extension in extensions {
-            let format = format!("{}/**/*.{}", path.to_string_lossy(), extension);
-            let files = glob(format.as_str());
-            if let Ok(files) = files {
-                files.for_each(|f| paths.push(f.unwrap()));
-            }
-        }
-
-        let mut map: BTreeMap<String, String> = BTreeMap::new();
-        // Ok, we need to split stuff up..
-        for file_path in paths {
-            map.insert(
-                file_path.to_string_lossy()[path.to_string_lossy().len() + 1..].to_string(),
-                file_path.file_name().unwrap().to_string_lossy().to_string(),
-            );
-        }
-        map
+        recursive_file_list(path, extensions)
     }
 
     fn get_files_from_path(
@@ -349,16 +331,53 @@ fn create_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Resu
     Ok((watcher, rx))
 }
 
-pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
-    let format = format!("{}/**/{}", path.to_string_lossy(), file.to_string_lossy());
-    let files = glob(format.as_str());
-    if let Ok(files) = files
-        && let Some(file) = files.into_iter().next()
-    {
-        return Some(file.unwrap());
+/// Lists files with the given extensions below a path, keyed by their path relative to it.
+fn recursive_file_list(path: PathBuf, extensions: Vec<&str>) -> BTreeMap<String, String> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+
+    // Escape the directory, so names like '[Bob]' aren't treated as patterns.
+    let base = Pattern::escape(&path.to_string_lossy());
+    for extension in extensions {
+        let format = format!("{base}/**/*.{extension}");
+        if let Ok(files) = glob(format.as_str()) {
+            // Skip entries that can't be read (eg. a folder without permission).
+            paths.extend(files.filter_map(|file| file.ok()));
+        }
     }
 
-    None
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    // Ok, we need to split stuff up..
+    for file_path in paths {
+        if let (Ok(relative), Some(name)) = (file_path.strip_prefix(&path), file_path.file_name()) {
+            map.insert(
+                relative.to_string_lossy().to_string(),
+                name.to_string_lossy().to_string(),
+            );
+        }
+    }
+    map
+}
+
+pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
+    // The file name comes from profiles or clients, it must stay inside the directory.
+    let escapes = file
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir));
+    if escapes {
+        warn!(
+            "Refusing to look up {:?}, it points outside {:?}",
+            file, path
+        );
+        return None;
+    }
+
+    // Both parts are escaped, so names like 'Song [Live].wav' are matched literally.
+    let format = format!(
+        "{}/**/{}",
+        Pattern::escape(&path.to_string_lossy()),
+        Pattern::escape(&file.to_string_lossy())
+    );
+    glob(format.as_str()).ok()?.find_map(|file| file.ok())
 }
 
 pub fn create_path(path: &Path) -> Result<()> {
@@ -371,6 +390,21 @@ pub fn create_path(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Builds the path of a named file (profile, preset..) in a directory. Names come from clients,
+/// so refuse any that could point outside of that directory.
+pub fn named_file_path(directory: &Path, name: &str, extension: &str) -> Result<PathBuf> {
+    let invalid = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\' || (cfg!(windows) && c == ':'));
+    if invalid {
+        bail!("Invalid name: {:?}", name);
+    }
+    Ok(directory.join(format!("{name}.{extension}")))
 }
 
 pub fn can_create_new_file(path: PathBuf) -> Result<()> {
@@ -452,4 +486,58 @@ pub fn extract_defaults(file_type: PathTypes, path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_file_paths() {
+        let dir = Path::new("/profiles");
+        assert_eq!(
+            named_file_path(dir, "My Profile", "goxlr").unwrap(),
+            dir.join("My Profile.goxlr")
+        );
+        assert!(named_file_path(dir, "v1.2 (stream)", "preset").is_ok());
+
+        assert!(named_file_path(dir, "", "goxlr").is_err());
+        assert!(named_file_path(dir, "..", "goxlr").is_err());
+        assert!(named_file_path(dir, "../../x", "goxlr").is_err());
+        assert!(named_file_path(dir, "..\\..\\x", "goxlr").is_err());
+        assert!(named_file_path(dir, "/etc/passwd", "goxlr").is_err());
+        assert!(named_file_path(dir, "bad\nname", "goxlr").is_err());
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    #[test]
+    fn finds_files_with_pattern_characters() {
+        let base =
+            std::env::temp_dir().join(format!("goxlr-test-[samples]-{}", std::process::id()));
+        let sub = base.join("Recorded [Live]");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("Song [Live].wav"), b"").unwrap();
+        fs::write(base.join("other.wav"), b"").unwrap();
+
+        let found = find_file_in_path(base.clone(), PathBuf::from("Song [Live].wav"));
+        assert_eq!(found, Some(sub.join("Song [Live].wav")));
+        assert!(find_file_in_path(base.clone(), PathBuf::from("Song ?Live?.wav")).is_none());
+        assert!(find_file_in_path(base.clone(), PathBuf::from("../other.wav")).is_none());
+
+        let manager_list = recursive_file_list(base.clone(), vec!["wav"]);
+        assert_eq!(
+            manager_list.get(&format!(
+                "Recorded [Live]{}Song [Live].wav",
+                std::path::MAIN_SEPARATOR
+            )),
+            Some(&String::from("Song [Live].wav"))
+        );
+        assert_eq!(manager_list.len(), 2);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
 }

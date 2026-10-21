@@ -18,6 +18,8 @@ members = [
 [workspace.package]
 version = "1.2.4"
 edition = "2024"
+# Edition 2024 with let-chains needs Rust 1.88 or newer.
+rust-version = "1.88"
 
 authors = ["Nathan Adams <dinnerbone@dinnerbone.com>", "Craig McLure <craig@mclure.net>", "Lars Mühlbauer <lm41@dismail.de>"]
 license = "MIT"

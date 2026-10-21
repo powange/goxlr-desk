@@ -1,3 +1,4 @@
+use crate::atomic::atomic_write;
 use crate::microphone::compressor::Compressor;
 use crate::microphone::equalizer::Equalizer;
 use crate::microphone::equalizer_mini::EqualizerMini;
@@ -6,12 +7,10 @@ use crate::microphone::mic_setup::MicSetup;
 use crate::microphone::ui_setup::UiSetup;
 use crate::profile::wrap_start_event;
 use anyhow::{Result, anyhow, bail};
-use log::{debug, warn};
+use log::debug;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 use std::collections::HashMap;
-use std::fs;
-use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::os::raw::c_float;
 use std::path::Path;
@@ -109,7 +108,7 @@ impl MicProfileSettings {
                 // Event::Start/End only occurs for the top level micProfileTree, which has no
                 // attributes, so we don't need to worry about it :)
                 Ok(Event::Start(e)) => {
-                    if String::from_utf8_lossy(e.local_name().as_ref()) == "MicProfileTree" {
+                    if e.local_name().into_inner() == "MicProfileTree" {
                         valid_profile = true;
                     }
                 }
@@ -140,32 +139,8 @@ impl MicProfileSettings {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let mut tmp_file_name = path.as_ref().to_path_buf();
-        tmp_file_name.set_extension("tmp");
-        if tmp_file_name.exists() {
-            debug!("Temporary file already exists? Removing.");
-            fs::remove_file(&tmp_file_name)?;
-        }
-
-        debug!("Creating Temporary Save File: {:?}", tmp_file_name);
-        let temp_file = File::create(&tmp_file_name)?;
-        self.write_to(&temp_file)?;
-
-        // Sync the write to disk..
-        temp_file.sync_all()?;
-
-        debug!("Save Complete and synced, renaming to {:?}", path.as_ref());
-        if path.as_ref().exists() {
-            debug!("Target mic profile exists, removing..");
-            fs::remove_file(&path).unwrap_or_else(|e| {
-                warn!("Error Removing File: {}", e);
-            });
-        }
-        debug!("Renaming {:?} to {:?}", tmp_file_name, path.as_ref());
-        fs::rename(tmp_file_name, path)?;
-
-        // Ok, we're done.
-        Ok(())
+        debug!("Saving Mic Profile to {:?}", path.as_ref());
+        atomic_write(path, |file| self.write_to(file))
     }
 
     pub fn write_to<W: Write>(&self, sink: W) -> Result<()> {
@@ -275,5 +250,25 @@ impl MicProfileSettings {
     }
     pub fn set_comp_select(&mut self, comp_select: u8) {
         self.comp_select = comp_select;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_mic_profile_round_trip() {
+        let default = include_bytes!("../../daemon/profiles/DEFAULT.goxlrMicProfile");
+        let profile = MicProfileSettings::load(&default[..]).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "goxlr-test-mic-{}.goxlrMicProfile",
+            std::process::id()
+        ));
+        profile.save(&path).unwrap();
+        let reloaded = MicProfileSettings::load(std::fs::File::open(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(reloaded.is_ok());
     }
 }

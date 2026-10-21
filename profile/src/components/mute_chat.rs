@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use enum_map::Enum;
 use strum::EnumProperty;
 
 use anyhow::{Result, anyhow};
@@ -25,7 +24,9 @@ pub enum ParseError {
     #[error("[COUGH] Invalid colours: {0}")]
     InvalidColours(#[from] crate::components::colours::ParseError),
 }
+use crate::enum_from_index;
 use crate::profile::Attribute;
+use log::warn;
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 use std::str::FromStr;
@@ -86,7 +87,10 @@ impl MuteChat {
             }
 
             if attr.name == "coughButtonMuteSourceSelection" {
-                self.cough_mute_source = MuteFunction::from_usize(attr.value.parse()?);
+                match enum_from_index(attr.value.parse()?) {
+                    Some(mute_function) => self.cough_mute_source = mute_function,
+                    None => warn!("Ignoring unknown cough mute function: {}", attr.value),
+                }
                 continue;
             }
 

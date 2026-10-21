@@ -1,10 +1,9 @@
-use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{Context as ErrorContext, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use enum_map::{EnumMap, enum_map};
 use log::{debug, warn};
 use quick_xml::events::{BytesDecl, BytesStart, Event};
@@ -14,6 +13,7 @@ use strum::IntoEnumIterator;
 use zip::write::SimpleFileOptions;
 
 use crate::SampleButtons::{BottomLeft, BottomRight, Clear, TopLeft, TopRight};
+use crate::atomic::atomic_write;
 use crate::components::animation::AnimationTree;
 use crate::components::browser::BrowserPreviewTree;
 use crate::components::context::Context;
@@ -83,49 +83,27 @@ impl Profile {
 
     // Ok, this is better.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let mut tmp_file_name = path.as_ref().to_path_buf();
-        tmp_file_name.set_extension("tmp");
-        if tmp_file_name.exists() {
-            debug!("Temporary file already exists? Removing.");
-            fs::remove_file(&tmp_file_name)?;
-        }
+        debug!("Saving Profile to {:?}", path.as_ref());
+        atomic_write(path, |file| {
+            // Create a new ZipFile at the requested location
+            let mut archive = zip::ZipWriter::new(file);
 
-        debug!("Creating Temporary Save File: {:?}", tmp_file_name);
-        let temp_file = File::create(&tmp_file_name)?;
+            // Store the profile..
+            archive.start_file("profile.xml", SimpleFileOptions::default())?;
+            self.settings.write_to(&mut archive)?;
 
-        // Create a new ZipFile at the requested location
-        let mut archive = zip::ZipWriter::new(&temp_file);
-
-        // Store the profile..
-        archive.start_file("profile.xml", SimpleFileOptions::default())?;
-        self.settings.write_to(&mut archive)?;
-
-        // Write the scribbles..
-        for (i, scribble) in self.scribbles.iter().enumerate() {
-            // Only write if there's actually data stored..
-            if !self.scribbles[i].is_empty() {
-                let filename = format!("scribble{}.png", i + 1);
-                archive.start_file(filename, SimpleFileOptions::default())?;
-                archive.write_all(scribble)?;
+            // Write the scribbles..
+            for (i, scribble) in self.scribbles.iter().enumerate() {
+                // Only write if there's actually data stored..
+                if !self.scribbles[i].is_empty() {
+                    let filename = format!("scribble{}.png", i + 1);
+                    archive.start_file(filename, SimpleFileOptions::default())?;
+                    archive.write_all(scribble)?;
+                }
             }
-        }
-        archive.finish()?;
-
-        // The archive has finished writing, we don't need it anymore (keeping it live prevents
-        // us from removing the temporary file).
-        temp_file.sync_all()?;
-
-        // Once complete, we simply move the file over the existing file..
-        debug!("Save Complete and synced, renaming to {:?}", path.as_ref());
-        if path.as_ref().exists() {
-            debug!("Target profile exists, removing..");
-            fs::remove_file(&path).unwrap_or_else(|e| {
-                warn!("Error Removing File: {}", e);
-            });
-        }
-        debug!("Renaming {:?} to {:?}", tmp_file_name, path.as_ref());
-        fs::rename(tmp_file_name, &path)?;
-        Ok(())
+            archive.finish()?;
+            Ok(())
+        })
     }
 
     pub fn save_preset(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -653,56 +631,9 @@ impl ProfileSettings {
                 .set_headphone_mix(Mix::A);
         }
 
-        self.root.write_initial(&mut writer)?;
-        self.browser.write_browser(&mut writer)?;
-        self.animation_tree.write_animation(&mut writer)?;
-
-        self.mix_routing.write_mix_tree(&mut writer)?;
-        self.submix_tree.write_submixer(&mut writer)?;
-
-        self.mixer.write_mixers(&mut writer)?;
-        self.context.write_context(&mut writer)?;
-
-        self.mute_chat.write_mute_chat(&mut writer)?;
-
-        // The following three iters need the FaderName to be defined and passed
-        // forward, the tag names need to be dynamically generated to prevent breakage
-        // when .swap() is used to move them around.
-        for (faders, fader) in &self.faders {
-            fader.write_fader(&mut writer, faders)?;
-        }
-
-        for (fader, button) in &self.mute_buttons {
-            button.write_button(&mut writer, fader)?;
-        }
-
-        for (fader, scribble) in &self.scribbles {
-            scribble.write_scribble(&mut writer, fader)?;
-        }
-
-        for effect in self.effects.values() {
-            effect.write_effects(&mut writer)?;
-        }
-
-        self.megaphone_effect.write_megaphone(&mut writer)?;
-        self.robot_effect.write_robot(&mut writer)?;
-        self.hardtune_effect.write_hardtune(&mut writer)?;
-
-        self.reverb_encoder.write_reverb(&mut writer)?;
-        self.echo_encoder.write_echo(&mut writer)?;
-        self.pitch_encoder.write_pitch(&mut writer)?;
-        self.gender_encoder.write_gender(&mut writer)?;
-
-        for sampler in self.sampler_map.values() {
-            sampler.write_sample(&mut writer)?;
-        }
-
-        for element in self.simple_elements.values() {
-            element.write_simple(&mut writer)?;
-        }
-
-        // Finalise the XML..
-        self.root.write_final(&mut writer)?;
+        // Write everything, then restore the monitor settings even if writing failed, so the
+        // profile in memory always matches the device.
+        let result = self.write_elements(&mut writer);
 
         let routing = self.mixer.mixer_table_mut();
         // Everything's written, restore the original monitor settings..
@@ -718,13 +649,65 @@ impl ProfileSettings {
                 .set_headphone_mix(headphone_mix);
         }
 
+        result
+    }
+
+    fn write_elements<W: Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+        self.root.write_initial(writer)?;
+        self.browser.write_browser(writer)?;
+        self.animation_tree.write_animation(writer)?;
+
+        self.mix_routing.write_mix_tree(writer)?;
+        self.submix_tree.write_submixer(writer)?;
+
+        self.mixer.write_mixers(writer)?;
+        self.context.write_context(writer)?;
+
+        self.mute_chat.write_mute_chat(writer)?;
+
+        // The following three iters need the FaderName to be defined and passed
+        // forward, the tag names need to be dynamically generated to prevent breakage
+        // when .swap() is used to move them around.
+        for (faders, fader) in &self.faders {
+            fader.write_fader(writer, faders)?;
+        }
+
+        for (fader, button) in &self.mute_buttons {
+            button.write_button(writer, fader)?;
+        }
+
+        for (fader, scribble) in &self.scribbles {
+            scribble.write_scribble(writer, fader)?;
+        }
+
+        for effect in self.effects.values() {
+            effect.write_effects(writer)?;
+        }
+
+        self.megaphone_effect.write_megaphone(writer)?;
+        self.robot_effect.write_robot(writer)?;
+        self.hardtune_effect.write_hardtune(writer)?;
+
+        self.reverb_encoder.write_reverb(writer)?;
+        self.echo_encoder.write_echo(writer)?;
+        self.pitch_encoder.write_pitch(writer)?;
+        self.gender_encoder.write_gender(writer)?;
+
+        for sampler in self.sampler_map.values() {
+            sampler.write_sample(writer)?;
+        }
+
+        for element in self.simple_elements.values() {
+            element.write_simple(writer)?;
+        }
+
+        // Finalise the XML..
+        self.root.write_final(writer)?;
         Ok(())
     }
 
     pub fn write_preset<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let out_file = File::create(path)?;
-        self.write_preset_to(&out_file)?;
-        out_file.sync_all().context("Unable to Sync File")
+        atomic_write(path, |file| self.write_preset_to(file))
     }
 
     pub fn write_preset_to<W: Write>(&self, sink: W) -> Result<()> {
@@ -962,13 +945,18 @@ impl ProfileSettings {
 pub(crate) fn wrap_start_event(event: &BytesStart) -> Result<(String, Vec<Attribute>)> {
     let mut attributes = Vec::new();
 
-    let name = String::from_utf8_lossy(event.local_name().as_ref()).parse()?;
+    let name = event.local_name().into_inner().to_string();
     for attribute in event.attributes() {
         match attribute {
             Ok(a) => {
+                // unescape_value() is deprecated in favour of normalized_value(), which also
+                // rewrites whitespace in values. Keep the previous behaviour so profiles load and
+                // save exactly as before.
+                #[allow(deprecated)]
+                let value = a.unescape_value()?.to_string();
                 attributes.push(Attribute {
-                    name: String::from_utf8_lossy(a.key.local_name().as_ref()).parse()?,
-                    value: String::from(a.unescape_value()?.as_ref()),
+                    name: a.key.local_name().into_inner().to_string(),
+                    value,
                 });
             }
             Err(e) => {
@@ -977,4 +965,73 @@ pub(crate) fn wrap_start_event(event: &BytesStart) -> Result<(String, Vec<Attrib
         }
     }
     Ok((name, attributes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const TEST_PROFILE: &str = include_str!("../test-data/profile.xml");
+
+    #[test]
+    fn loads_test_profile() {
+        assert!(ProfileSettings::load(TEST_PROFILE.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn default_profile_round_trip() {
+        let default = include_bytes!("../../daemon/profiles/Default.goxlr");
+        let mut profile = Profile::load(std::io::Cursor::new(&default[..])).unwrap();
+
+        let path =
+            std::env::temp_dir().join(format!("goxlr-test-profile-{}.goxlr", std::process::id()));
+        profile.save(&path).unwrap();
+        let reloaded = Profile::load(File::open(&path).unwrap());
+        fs::remove_file(&path).unwrap();
+        assert!(reloaded.is_ok());
+    }
+
+    /// Accepts a few bytes, then fails (like a disk filling up during a save).
+    struct FailAfter(usize);
+
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 < buf.len() {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.0 -= buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_write_keeps_monitor_settings() {
+        let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        settings
+            .submix_tree
+            .monitor_tree_mut()
+            .set_monitored_output(OutputChannels::LineOut);
+
+        assert!(settings.write_to(FailAfter(2000)).is_err());
+        assert_eq!(
+            settings.submix_tree.monitor_tree().monitored_output(),
+            OutputChannels::LineOut
+        );
+    }
+
+    #[test]
+    fn out_of_range_enum_indexes_do_not_panic() {
+        let profile = TEST_PROFILE
+            .replacen("playbackMode=\"1\"", "playbackMode=\"9\"", 1)
+            .replacen(
+                "coughButtonMuteSourceSelection=\"0\"",
+                "coughButtonMuteSourceSelection=\"7\"",
+                1,
+            );
+        assert!(ProfileSettings::load(profile.as_bytes()).is_ok());
+    }
 }

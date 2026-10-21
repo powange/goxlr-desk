@@ -328,3 +328,54 @@ pub enum GoXLRCommand {
     // Mix Monitoring
     SetMonitorMix(OutputDevice),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use goxlr_types::ChannelName;
+
+    // The web UI and third party tools send these exact JSON shapes, changing them breaks them.
+    #[test]
+    fn request_wire_format() {
+        let request = DaemonRequest::Command(
+            "S220202153DI7".to_string(),
+            GoXLRCommand::SetVolume(ChannelName::Mic, 100),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"Command":["S220202153DI7",{"SetVolume":["Mic",100]}]}"#
+        );
+
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::Command(_, GoXLRCommand::SetVolume(ChannelName::Mic, 100))
+        ));
+
+        assert_eq!(
+            serde_json::to_string(&DaemonRequest::GetStatus).unwrap(),
+            r#""GetStatus""#
+        );
+    }
+
+    #[test]
+    fn websocket_wire_format() {
+        let request: WebsocketRequest =
+            serde_json::from_str(r#"{"id":7,"data":{"Daemon":"OpenUi"}}"#).unwrap();
+        assert_eq!(request.id, 7);
+        assert!(matches!(
+            request.data,
+            DaemonRequest::Daemon(DaemonCommand::OpenUi)
+        ));
+
+        let response = WebsocketResponse {
+            id: 7,
+            data: DaemonResponse::Error("Nope".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"id":7,"data":{"Error":"Nope"}}"#
+        );
+    }
+}

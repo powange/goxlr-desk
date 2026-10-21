@@ -4,6 +4,7 @@ use std::ffi::CStr;
 use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
@@ -14,13 +15,13 @@ use byteorder::{ByteOrder, LittleEndian};
 use lazy_static::lazy_static;
 use libloading::{Library, Symbol};
 use log::{debug, error, info, warn};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 use widestring::U16CStr;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeA,
     CM_Get_Device_Interface_ListA, CR_SUCCESS,
 };
-use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use windows::core::GUID;
 use winreg::RegKey;
@@ -37,9 +38,9 @@ type GetAPIVersion = unsafe extern "C" fn() -> ApiVersion;
 type CheckAPIVersion = unsafe extern "C" fn(u32, u32) -> bool;
 type GetDeviceCount = unsafe extern "C" fn() -> u32;
 type OpenDeviceByIndex = unsafe extern "C" fn(u32, *mut u32) -> u32;
-type GetDeviceInstanceIdString = unsafe extern "C" fn(u32, *const u16, u32) -> u32;
+type GetDeviceInstanceIdString = unsafe extern "C" fn(u32, *mut u16, u32) -> u32;
 type GetDeviceProperties = unsafe extern "C" fn(u32, *mut Properties) -> u32;
-type GetUsbConfigDescriptor = unsafe extern "C" fn(u32, *mut u8, u32, &u32) -> u32;
+type GetUsbConfigDescriptor = unsafe extern "C" fn(u32, *mut u8, u32, *mut u32) -> u32;
 type VendorRequestOut =
     unsafe extern "C" fn(u32, u32, u32, u32, u32, u16, u16, *const u8, *mut u8, u32) -> u32;
 type VendorRequestIn =
@@ -280,16 +281,18 @@ impl TUSBAudio<'_> {
     }
 
     fn get_device_id_string(&self, handle: u32) -> Result<String> {
-        let buffer: Vec<u16> = Vec::with_capacity(256);
-        let buffer_pointer = buffer.as_ptr();
-        let result = unsafe { (self.get_device_id_string)(handle, buffer_pointer, 256) };
+        // The driver writes the id into this buffer, so it must be initialised and writable.
+        let mut buffer = vec![0_u16; 256];
+        let buffer_len = buffer.len() as u32;
+        let result =
+            unsafe { (self.get_device_id_string)(handle, buffer.as_mut_ptr(), buffer_len) };
 
         if result != 0 {
             let error = self.get_error(result);
             bail!("Error Getting Device Id: {}", error);
         }
 
-        let device_id = unsafe { U16CStr::from_ptr_truncate(buffer_pointer, 256)? };
+        let device_id = U16CStr::from_slice_truncate(&buffer)?;
         Ok(device_id.to_string_lossy())
     }
 
@@ -301,12 +304,15 @@ impl TUSBAudio<'_> {
         index: u16,
         data: &[u8],
     ) -> Result<()> {
-        let data_length: u16 = data.len().try_into().unwrap();
+        let data_length: u16 = data
+            .len()
+            .try_into()
+            .map_err(|_| anyhow!("Request too large: {} bytes", data.len()))?;
         let data_pointer = data.as_ptr();
 
         // The Driver writes number of bytes written to a buffer, so create it here.
         let bytes_written_len: u32 = 64;
-        let mut bytes_written = Vec::with_capacity(bytes_written_len as usize);
+        let mut bytes_written = vec![0_u8; bytes_written_len as usize];
         let bytes_written_ptr = bytes_written.as_mut_ptr();
 
         let result = unsafe {
@@ -345,11 +351,16 @@ impl TUSBAudio<'_> {
         index: u16,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let mut buffer: Vec<u8> = Vec::with_capacity(length);
+        let request_length: u16 = length
+            .try_into()
+            .map_err(|_| anyhow!("Response length too large: {}", length))?;
+
+        // The driver writes into both buffers, so they must be initialised.
+        let mut buffer = vec![0_u8; length];
         let buffer_ptr = buffer.as_mut_ptr();
 
         let buffer2_len = 64;
-        let mut buffer2: Vec<u8> = Vec::with_capacity(buffer2_len as usize);
+        let mut buffer2 = vec![0_u8; buffer2_len as usize];
         let buffer2_ptr = buffer2.as_mut_ptr();
 
         // This likely has 'Bytes Returned' somewhere in there, we need to check for that!
@@ -361,7 +372,7 @@ impl TUSBAudio<'_> {
                 request as u32,
                 value as u32,
                 index,
-                length.try_into().unwrap(),
+                request_length,
                 buffer_ptr,
                 buffer2_ptr,
                 buffer2_len,
@@ -373,11 +384,17 @@ impl TUSBAudio<'_> {
         }
 
         // Ok, Buffer2 contains a u32 containing the length of the returned response..
-        let len = unsafe { std::slice::from_raw_parts(buffer2_ptr, 4) };
-        let read_len = LittleEndian::read_u32(len);
+        let read_len = LittleEndian::read_u32(&buffer2[0..4]) as usize;
+        if read_len > length {
+            bail!(
+                "Driver reported {} bytes read, but only {} were requested",
+                read_len,
+                length
+            );
+        }
 
-        let data = unsafe { std::slice::from_raw_parts(buffer_ptr, read_len as usize) };
-        Ok(Vec::from(data))
+        buffer.truncate(read_len);
+        Ok(buffer)
     }
 
     pub fn open_device_by_identifier(&self, identifier: String) -> Result<u32> {
@@ -420,19 +437,29 @@ impl TUSBAudio<'_> {
         // Open a Handle to the Device..
         let mut handle = TUSB_INTERFACE.open_device_by_identifier(device_identifier.clone())?;
 
-        // Register a new windows event..
-        let event = unsafe { CreateEventA(None, false, false, None)? };
+        // Register a new windows event, it's closed when this function returns..
+        let event = match unsafe { CreateEventA(None, false, false, None) } {
+            Ok(event) => EventGuard(event),
+            Err(error) => {
+                let _ = TUSB_INTERFACE.close_device(handle);
+                bail!("Unable to create event: {}", error);
+            }
+        };
+        let event = event.0;
 
         // Register this event with the notifier..
         let result = unsafe { (self.register_device_notification)(handle, u32::MAX, event, 0) };
         if result != 0 {
             warn!("Unable to Register Notifications");
+            let _ = TUSB_INTERFACE.close_device(handle);
             bail!("Unable to register notifications");
         }
 
         // Assign useful variables for later :p
-        let buffer = vec![0_u8; 1024];
-        let buffer_ptr = &buffer as *const _ as *mut u8;
+        // The driver writes into the Vec's heap data, so pass that pointer (not the Vec itself).
+        let mut buffer = vec![0_u8; 1024];
+        let buffer_len = buffer.len();
+        let buffer_ptr = buffer.as_mut_ptr();
 
         let mut response_len: u32 = 0;
         let len_ptr: *mut u32 = &mut response_len;
@@ -453,7 +480,13 @@ impl TUSBAudio<'_> {
                 // Check the Queued Events :)
                 loop {
                     let event_result = unsafe {
-                        (self.read_device_notification)(handle, &a, buffer_ptr, 1024, len_ptr)
+                        (self.read_device_notification)(
+                            handle,
+                            &a,
+                            buffer_ptr,
+                            buffer_len as u32,
+                            len_ptr,
+                        )
                     };
                     if event_result != 0 {
                         // We've either hit the end of the list, or something's gone wrong, break
@@ -464,8 +497,10 @@ impl TUSBAudio<'_> {
                         break;
                     }
 
+                    // Never trust the driver's length beyond the size of our buffer.
+                    let read_len = (response_len as usize).min(buffer_len);
                     let event_response =
-                        unsafe { std::slice::from_raw_parts(buffer_ptr, response_len as usize) };
+                        unsafe { std::slice::from_raw_parts(buffer_ptr, read_len) };
 
                     // Generally caused by an 'audio end' event.
                     if event_response.is_empty() {
@@ -482,13 +517,16 @@ impl TUSBAudio<'_> {
                     }
 
                     if event_response[0] == 1 && event_response[1] == 1 && event_response[2] == 1 {
-                        // This event indicates something waiting to be read..
-                        let se = callbacks.data_read.blocking_send(true);
-                        if se.is_err() {
-                            // Something's gone horribly wrong!
-                            debug!("Send Failed: {:?}", se.err());
-                            terminator.store(true, Ordering::Relaxed);
-                            break;
+                        // This event indicates something waiting to be read. If a token is
+                        // already waiting, the reader already knows, so never block here.
+                        match callbacks.data_read.try_send(true) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => {
+                                // Something's gone horribly wrong!
+                                debug!("Data channel closed, stopping event loop");
+                                terminator.store(true, Ordering::Relaxed);
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -533,7 +571,7 @@ impl TUSBAudio<'_> {
                     terminator.store(true, Ordering::Relaxed);
 
                     // Break any read locks which might be currently occurring, and tell then we're dead.
-                    let _ = callbacks.data_read.blocking_send(false);
+                    let _ = callbacks.data_read.try_send(false);
 
                     // Also trigger an 'input_changed' event, so the main handler can discover that
                     // we're dead if it wasn't previously active..
@@ -544,11 +582,13 @@ impl TUSBAudio<'_> {
                     break;
                 } else {
                     debug!("Handle Re-established, attempting to register for notifications..");
+                    let _ = TUSB_INTERFACE.close_device(handle);
                     handle = new_handle?;
 
                     let result =
                         unsafe { (self.register_device_notification)(handle, u32::MAX, event, 0) };
                     if result != 0 {
+                        let _ = TUSB_INTERFACE.close_device(handle);
                         bail!("Unable to register notifications");
                     }
                 }
@@ -600,17 +640,19 @@ impl TUSBAudio<'_> {
             bail!("Handler Thread already running...");
         }
         debug!("Spawning Win32 PnP Handler Thread");
+        let started = std::time::Instant::now();
 
-        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<bool>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
 
         thread::spawn(move || -> Result<()> {
             let mut ready_sender = Some(ready_tx);
 
             loop {
-                let length = 0_u64;
+                // The API writes the required size (a ULONG) into this value.
+                let mut length: u32 = 0;
                 let result = unsafe {
                     CM_Get_Device_Interface_List_SizeA(
-                        &length as *const _ as *mut _,
+                        &mut length,
                         &GOXLR_GUID as *const _,
                         None,
                         CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
@@ -654,13 +696,25 @@ impl TUSBAudio<'_> {
             }
         });
 
-        // Block until the 'ready' message has been sent..
-        while ready_rx.try_recv().is_err() {
-            sleep(Duration::from_millis(5));
-        }
-        debug!("Win32 PnP Handler Started");
-
+        // The thread is running, so mark it as spawned and release the lock before waiting, this
+        // prevents other callers from being blocked while we wait for the first device scan.
         *spawned = true;
+        drop(spawned);
+
+        // Wait for the first scan to complete, but never forever..
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(_) => info!("Win32 PnP Handler Started in {:?}", started.elapsed()),
+            Err(RecvTimeoutError::Timeout) => {
+                warn!(
+                    "Win32 PnP Handler has not completed its first scan after {:?}, continuing..",
+                    started.elapsed()
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                *self.pnp_thread_running.lock().unwrap() = false;
+                bail!("Win32 PnP Handler Thread stopped before it was ready");
+            }
+        }
         Ok(())
     }
 
@@ -758,6 +812,7 @@ impl TUSBAudio<'_> {
 
 pub struct DeviceHandle {
     handle: u32,
+    closed: AtomicBool,
 }
 
 impl DeviceHandle {
@@ -765,12 +820,19 @@ impl DeviceHandle {
         // This is simple enough, iterate the devices until we find the one we want..
         if let Some(identifier) = device.identifier {
             let handle = TUSB_INTERFACE.open_device_by_identifier(identifier)?;
-            return Ok(Self { handle });
+            return Ok(Self {
+                handle,
+                closed: AtomicBool::new(false),
+            });
         }
         bail!("Unable to Locate Device")
     }
 
+    /// Closes the handle, only once: the driver may hand the same number to another device later.
     pub fn close_handle(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
         TUSB_INTERFACE.close_device(self.handle)
     }
 
@@ -795,6 +857,21 @@ impl DeviceHandle {
 
     pub fn get_properties(&self) -> Result<Properties> {
         TUSB_INTERFACE.get_properties_by_handle(self.handle)
+    }
+}
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        let _ = self.close_handle();
+    }
+}
+
+/// Closes a Windows event handle when dropped.
+struct EventGuard(HANDLE);
+
+impl Drop for EventGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -884,12 +961,14 @@ pub fn get_version() -> Option<VersionNumber> {
 }
 
 pub struct EventChannelReceiver {
-    pub(crate) data_read: Receiver<bool>,
+    // A std channel so the reader can wait with a timeout instead of spinning, inside a Mutex
+    // because the device must be Sync (only accessed through &mut, so it never contends).
+    pub(crate) data_read: Mutex<std::sync::mpsc::Receiver<bool>>,
 }
 
 pub struct EventChannelSender {
     pub(crate) ready_notifier: tokio::sync::oneshot::Sender<bool>,
-    pub(crate) data_read: Sender<bool>,
+    pub(crate) data_read: SyncSender<bool>,
     pub(crate) input_changed: Sender<String>,
 }
 

@@ -2778,6 +2778,9 @@ impl<'a> Device<'a> {
                     false,
                 )?;
 
+                // Send the default mic settings to the device, so it matches the new profile.
+                self.apply_mic_profile().await?;
+
                 // Save the new name in the settings
                 self.settings
                     .set_device_mic_profile_name(self.serial(), mic_profile_name.as_str())
@@ -2818,7 +2821,7 @@ impl<'a> Device<'a> {
                                 self.mic_profile = profile;
 
                                 debug!("Overwriting existing corrupt profile..");
-                                self.profile.save(&path, true)?;
+                                self.mic_profile.save(&path, true)?;
                             }
                             Err(e) => {
                                 bail!("Failed to Load backup profile: {}", e);

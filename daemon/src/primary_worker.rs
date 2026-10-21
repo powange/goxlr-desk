@@ -17,7 +17,7 @@ use goxlr_ipc::{
     Paths, SampleFile, UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
-use goxlr_usb::device::base::GoXLRDevice;
+use goxlr_usb::device::base::{FullGoXLRDevice, GoXLRDevice};
 use goxlr_usb::device::{find_devices, from_device, get_version};
 use goxlr_usb::{PID_GOXLR_FULL, PID_GOXLR_MINI};
 use json_patch::diff;
@@ -34,6 +34,27 @@ use tokio::time::sleep;
 use xmltree::Element;
 
 const IGNORE_DEVICE_DURATION: Duration = Duration::from_secs(10);
+
+// Devices are identified by bus number, address and (on Windows) identifier.
+type DeviceKey = (u8, u8, Option<String>);
+
+// A device opened and identified on a blocking thread, or the reason it couldn't be.
+type AttachResult = (
+    DeviceKey,
+    Instant,
+    Result<(Box<dyn FullGoXLRDevice>, HardwareStatus)>,
+);
+
+/// How long to wait before trying a device again after it failed to load. A device often isn't
+/// ready right after a session starts (driver still loading), so retry quickly at first.
+fn retry_delay(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(5),
+        _ => IGNORE_DEVICE_DURATION,
+    }
+}
 const APP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 // Adding a third entry has tripped enum_variant_names, I'll probably need to rename
@@ -121,7 +142,12 @@ pub async fn spawn_usb_handler(
     // Create the Primary Device List, and 'Ignore' list..
     let mut devices: HashMap<String, Device> = HashMap::new();
     let mut devices_firmware: HashMap<String, FirmwareUpdateState> = HashMap::new();
-    let mut ignore_list = HashMap::new();
+    let mut ignore_list: HashMap<DeviceKey, (Instant, u32)> = HashMap::new();
+
+    // Devices are opened on a blocking thread (it takes a few seconds), one at a time, so this
+    // loop keeps answering requests meanwhile.
+    let (attach_tx, mut attach_rx) = mpsc::channel::<AttachResult>(1);
+    let mut attaching = false;
 
     let mut files = get_files(&mut file_manager, &settings).await;
     let mut daemon_status = get_daemon_status(
@@ -154,21 +180,9 @@ pub async fn spawn_usb_handler(
                             state.status.progress = 0;
                             change_found = true;
                         } else {
-                            // We don't have a state for this device, set one.
-                            let status = FirmwareStatus {
-                                state: status,
-                                progress: 0,
-                                error: None
-                            };
-
-                            // Only create this if the serial is present..
-                            if devices.contains_key(&serial) {
-                                // Get the current status..
-                                let state = devices_firmware.get_mut(&serial).unwrap();
-                                state.status = status;
-
-                                change_found = true;
-                            }
+                            // The update state was cleared while the update was still running,
+                            // there's nothing left to attach this state to.
+                            warn!("Ignoring firmware state {:?} for {}, update state was cleared", status, serial);
                         }
                     }
                     FirmwareRequest::SetStateProgress(serial, progress) => {
@@ -233,51 +247,76 @@ pub async fn spawn_usb_handler(
                 }
             }
             () = &mut detection_sleep => {
-                if let Some(device) = find_new_device(&daemon_status, &ignore_list) {
+                if !attaching && let Some(device) = find_new_device(&daemon_status, &ignore_list) {
+                    let key = (device.bus_number(), device.address(), device.identifier().clone());
                     let existing_serials: Vec<String> = get_all_serials(&devices);
-                    let bus_number = device.bus_number();
-                    let address = device.address();
+                    let disconnect_sender = disconnect_sender.clone();
+                    let event_sender = event_sender.clone();
+                    let attach_tx = attach_tx.clone();
 
-                    let mut device_identifier = None;
-                    if let Some(identifier) = device.identifier() {
-                        device_identifier = Some(identifier.clone());
-                    }
-
-                    match load_device(device, existing_serials, disconnect_sender.clone(), event_sender.clone(), global_tx.clone(), &settings).await {
-                        Ok(device) => {
-                            let serial = String::from(device.serial());
-
-                            devices.insert(serial.clone(), device);
-                            change_found = true;
-
-                            // Get the Driver Type and Details again as Theysecon does not show the driver
-                            // version when no device is connected..
-                            if driver_interface.version.is_none() {
-                                let (_, version) = get_version();
-                                if let Some(version) = version {
-                                    debug!("Driver Version found, updating.. {}", version);
-                                    driver_interface.version = Some(version);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "Couldn't load potential GoXLR on bus {} address {}: {}",
-                                bus_number, address, e
-                            );
-                            ignore_list
-                                .insert((bus_number, address, device_identifier), Instant::now() + IGNORE_DEVICE_DURATION);
-                        }
-                    };
+                    info!("Found GoXLR on bus {} address {}, attaching..", key.0, key.1);
+                    attaching = true;
+                    let started = Instant::now();
+                    tokio::task::spawn_blocking(move || {
+                        let result = attach_device(device, existing_serials, disconnect_sender, event_sender);
+                        let _ = attach_tx.blocking_send((key, started, result));
+                    });
                 }
                 detection_sleep.as_mut().reset(tokio::time::Instant::now() + detection_duration);
+            },
+            Some((key, started, attached)) = attach_rx.recv() => {
+                attaching = false;
+                let loaded = match attached {
+                    Ok((handled_device, hardware)) => {
+                        info!("Attached GoXLR {} in {:?}, loading profiles..", hardware.serial_number, started.elapsed());
+                        let profile_start = Instant::now();
+                        let loaded = load_device(handled_device, hardware, global_tx.clone(), &settings).await;
+                        if let Ok(device) = &loaded {
+                            info!(
+                                "GoXLR {} ready, profiles applied in {:?} ({:?} after it was found)",
+                                device.serial(), profile_start.elapsed(), started.elapsed()
+                            );
+                        }
+                        loaded
+                    }
+                    Err(error) => Err(error),
+                };
+
+                match loaded {
+                    Ok(device) => {
+                        let serial = String::from(device.serial());
+
+                        devices.insert(serial.clone(), device);
+                        ignore_list.remove(&key);
+                        change_found = true;
+
+                        // Get the Driver Type and Details again as Theysecon does not show the driver
+                        // version when no device is connected..
+                        if driver_interface.version.is_none() {
+                            let (_, version) = get_version();
+                            if let Some(version) = version {
+                                debug!("Driver Version found, updating.. {}", version);
+                                driver_interface.version = Some(version);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let failures = ignore_list.get(&key).map_or(0, |(_, count)| *count) + 1;
+                        let delay = retry_delay(failures);
+                        error!(
+                            "Couldn't load potential GoXLR on bus {} address {} (attempt {}), retrying in {:?}: {}",
+                            key.0, key.1, failures, delay, e
+                        );
+                        ignore_list.insert(key, (Instant::now() + delay, failures));
+                    }
+                }
             },
             () = &mut update_sleep => {
                 for device in devices.values_mut() {
                     let updated = device.update_state().await;
 
                     if let Ok(result) = updated {
-                        change_found = result;
+                        change_found |= result;
                     }
 
                     if let Err(error) = updated {
@@ -389,16 +428,20 @@ pub async fn spawn_usb_handler(
                             }
                             DaemonCommand::RecoverDefaults(path_type) => {
                                 let path = match path_type {
-                                    PathTypes::Profiles => settings.get_profile_directory().await,
-                                    PathTypes::Presets => settings.get_presets_directory().await,
-                                    PathTypes::Icons => settings.get_icons_directory().await,
-                                    PathTypes::MicProfiles => settings.get_mic_profile_directory().await,
-                                    _ => {
-                                        let _ = sender.send(Err(anyhow!("Invalid Path type Sent")));
-                                        return;
-                                    }
+                                    PathTypes::Profiles => Some(settings.get_profile_directory().await),
+                                    PathTypes::Presets => Some(settings.get_presets_directory().await),
+                                    PathTypes::Icons => Some(settings.get_icons_directory().await),
+                                    PathTypes::MicProfiles => Some(settings.get_mic_profile_directory().await),
+                                    _ => None,
                                 };
-                                let _ = sender.send(extract_defaults(path_type, &path));
+
+                                // An unsupported type is an error for this request only, the
+                                // worker must keep running for every other request.
+                                let result = match path {
+                                    Some(path) => extract_defaults(path_type, &path),
+                                    None => Err(anyhow!("Invalid Path type Sent")),
+                                };
+                                let _ = sender.send(result);
                             }
                             DaemonCommand::SetAutoStartEnabled(enabled) => {
                                 let _ = sender.send(set_autostart(enabled));
@@ -823,7 +866,7 @@ async fn update_files(
 
 fn find_new_device(
     current_status: &DaemonStatus,
-    devices_to_ignore: &HashMap<(u8, u8, Option<String>), Instant>,
+    devices_to_ignore: &HashMap<DeviceKey, (Instant, u32)>,
 ) -> Option<GoXLRDevice> {
     let now = Instant::now();
 
@@ -841,7 +884,7 @@ fn find_new_device(
                 && d.hardware.usb_device.address == device.address()
         }) && !devices_to_ignore
             .iter()
-            .any(|((bus_number, address, identifier), expires)| {
+            .any(|((bus_number, address, identifier), (expires, _))| {
                 if let Some(identifier) = identifier
                     && let Some(device_identifier) = device.identifier()
                 {
@@ -863,14 +906,14 @@ fn get_all_serials(existing_devices: &HashMap<String, Device>) -> Vec<String> {
     serials
 }
 
-async fn load_device(
+/// Opens a device and reads what identifies it. This blocks for a few seconds (the device is
+/// given time to settle, then several USB requests are made), so it runs on a blocking thread.
+fn attach_device(
     device: GoXLRDevice,
     existing_serials: Vec<String>,
     disconnect_sender: Sender<String>,
     event_sender: Sender<String>,
-    global_events: Sender<EventTriggers>,
-    settings: &SettingsHandle,
-) -> Result<Device<'_>> {
+) -> Result<(Box<dyn FullGoXLRDevice>, HardwareStatus)> {
     let device_copy = device.clone();
 
     let mut handled_device = from_device(device, disconnect_sender, event_sender, false)?;
@@ -923,6 +966,17 @@ async fn load_device(
         colour_way,
         usb_device,
     };
+    Ok((handled_device, hardware))
+}
+
+/// Sets up an attached device: loads its profiles and applies them to the hardware.
+async fn load_device(
+    handled_device: Box<dyn FullGoXLRDevice>,
+    hardware: HardwareStatus,
+    global_events: Sender<EventTriggers>,
+    settings: &SettingsHandle,
+) -> Result<Device<'_>> {
+    let serial_number = hardware.serial_number.clone();
     let device = Device::new(handled_device, hardware, settings, global_events).await?;
     settings
         .set_device_profile_name(&serial_number, device.profile().name())
@@ -1015,4 +1069,15 @@ async fn check_firmware_versions(x: FwSender, source: FirmwareSource) {
 
     debug!("Firmware Update Process Finished");
     let _ = x.send(map).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_quickly_then_backs_off() {
+        let delays: Vec<u64> = (1..=6).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, vec![1, 2, 5, 10, 10, 10]);
+    }
 }

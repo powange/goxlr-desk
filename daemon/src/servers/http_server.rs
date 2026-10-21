@@ -1,8 +1,11 @@
 use actix_cors::Cors;
 use actix_multipart::Multipart;
-use actix_web::dev::ServerHandle;
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServerHandle, ServiceRequest, ServiceResponse};
+use actix_web::error::ErrorForbidden;
+use actix_web::http::header;
 use actix_web::http::header::ContentType;
-use actix_web::middleware::Condition;
+use actix_web::middleware::{Condition, Next, from_fn};
 use actix_web::web::Data;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, get, post, web};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
@@ -17,10 +20,13 @@ use mime_guess::mime::IMAGE_PNG;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Component, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
+use sysinfo::System;
 use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{RwLock, oneshot};
@@ -28,8 +34,8 @@ use tokio::sync::{RwLock, oneshot};
 use crate::PatchEvent;
 use crate::files::{FilePaths, find_file_in_path};
 use goxlr_ipc::{
-    DaemonRequest, DaemonResponse, DaemonStatus, HttpSettings, Scribble, WebsocketRequest,
-    WebsocketResponse,
+    DaemonCommand, DaemonRequest, DaemonResponse, DaemonStatus, GoXLRCommand, HttpSettings,
+    Scribble, WebsocketRequest, WebsocketResponse,
 };
 use goxlr_scribbles::get_scribble_png;
 use goxlr_types::FaderName;
@@ -38,6 +44,195 @@ use crate::primary_worker::{DeviceCommand, DeviceSender};
 use crate::servers::server_packet::handle_packet;
 
 const WEB_CONTENT: Dir = include_dir!("./daemon/web-content/");
+
+// Firmware files are a few megabytes, anything far beyond this isn't a firmware.
+const MAX_FIRMWARE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Decides which requests may reach the HTTP server. Browsers let any web page send requests to
+/// localhost (WebSockets and form posts aren't blocked by CORS), so we check the Host and Origin
+/// headers to make sure a request comes from our own web UI and not from another site, or from a
+/// DNS rebinding domain pointing at this machine.
+struct RequestPolicy {
+    cors_enabled: bool,
+    host_names: Vec<String>,
+}
+
+impl RequestPolicy {
+    fn new(cors_enabled: bool, bind_address: &str) -> Self {
+        let mut host_names = vec![String::from("localhost"), bind_address.to_ascii_lowercase()];
+        if let Some(name) = System::host_name() {
+            let name = name.to_ascii_lowercase();
+            host_names.push(format!("{name}.local"));
+            host_names.push(name);
+        }
+        Self {
+            cors_enabled,
+            host_names,
+        }
+    }
+
+    /// A Host is accepted if it's an IP address, or a name that belongs to this machine.
+    fn is_host_allowed(&self, host: &str) -> bool {
+        let name = strip_port(host).to_ascii_lowercase();
+        name.parse::<IpAddr>().is_ok()
+            || name.ends_with(".localhost")
+            || self.host_names.contains(&name)
+    }
+
+    /// An Origin is accepted if it matches the Host (the request comes from a page we served), if
+    /// it's a local file, or if CORS is enabled and the page is served from this machine's loopback
+    /// address.
+    fn is_origin_allowed(&self, origin: &str, host: Option<&str>) -> bool {
+        // Local HTML apps, such as Stream Deck plugins, connect from a file:// page. No web site
+        // can send this origin ('null', which any site can produce with a sandboxed iframe, is
+        // still refused).
+        if origin.eq_ignore_ascii_case("file://") {
+            return true;
+        }
+        let Some(authority) = strip_scheme(origin) else {
+            return false;
+        };
+        if let Some(host) = host
+            && authority.eq_ignore_ascii_case(host)
+        {
+            return true;
+        }
+        self.cors_enabled && is_loopback_name(strip_port(authority))
+    }
+}
+
+/// Returns the 'host[:port]' part of an http(s) origin
+fn strip_scheme(origin: &str) -> Option<&str> {
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+}
+
+/// Removes the port from a 'host[:port]' string, handling bracketed IPv6 addresses
+fn strip_port(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(name, _)| name)
+}
+
+fn is_loopback_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("localhost")
+        || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    strip_scheme(origin).is_some_and(|authority| is_loopback_name(strip_port(authority)))
+}
+
+/// A 'null' origin: sent by some local apps, but also by sandboxed pages of any web site.
+fn is_opaque_origin(origin: &str) -> bool {
+    origin.eq_ignore_ascii_case("null")
+}
+
+/// Where a request comes from, which decides what it's allowed to do.
+#[derive(Clone, Copy)]
+struct RequestSource {
+    // From this machine, rather than another machine on the network.
+    local_peer: bool,
+    // With a 'null' origin, which a web page can also send.
+    opaque_origin: bool,
+}
+
+impl RequestSource {
+    fn of(req: &HttpRequest) -> Self {
+        Self {
+            local_peer: req
+                .peer_addr()
+                .is_some_and(|addr| addr.ip().to_canonical().is_loopback()),
+            opaque_origin: req
+                .headers()
+                .get(header::ORIGIN)
+                .and_then(|o| o.to_str().ok())
+                .is_some_and(is_opaque_origin),
+        }
+    }
+
+    /// Why this request is refused from this source, if it is. The HTTP API has no
+    /// authentication, so:
+    /// - from another machine, nothing that runs a program or flashes a file from this disk,
+    /// - with a 'null' origin (which any web page can send), only reading the status and
+    ///   controlling the mixer, the same things the Stream Deck plugin does.
+    fn refused_reason(&self, request: &DaemonRequest) -> Option<&'static str> {
+        if self.opaque_origin {
+            let allowed = match request {
+                DaemonRequest::Ping | DaemonRequest::GetStatus | DaemonRequest::GetMicLevel(_) => {
+                    true
+                }
+                DaemonRequest::Command(_, command) => !matches!(
+                    command,
+                    GoXLRCommand::DeleteProfile(_)
+                        | GoXLRCommand::DeleteMicProfile(_)
+                        | GoXLRCommand::SetShutdownCommands(_)
+                        | GoXLRCommand::SetSleepCommands(_)
+                        | GoXLRCommand::SetWakeCommands(_)
+                ),
+                _ => false,
+            };
+            if !allowed {
+                return Some("This request isn't allowed from a page without an origin");
+            }
+        }
+
+        if !self.local_peer {
+            match request {
+                DaemonRequest::Daemon(DaemonCommand::SetActivatorPath(_)) => {
+                    return Some("The activator can only be changed from this computer");
+                }
+                DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
+                    return Some("A firmware file on disk can only be flashed from this computer");
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+async fn check_request_source(
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
+    let rejection = {
+        let headers = req.headers();
+        let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+        let origin = headers
+            .get(header::ORIGIN)
+            .map(|o| o.to_str().unwrap_or_default());
+
+        // Requests without these headers don't come from a browser, so they can't be forged
+        // by a web page, and are let through.
+        // Some local apps (the Stream Deck plugin) send a 'null' origin, which any web page can
+        // also produce (with a sandboxed iframe). Those get limited access, only on the APIs the
+        // plugin uses, see restricted_reason().
+        let opaque = origin.is_some_and(is_opaque_origin)
+            && matches!(req.path(), "/api/websocket" | "/api/command");
+
+        let allowed = match req.app_data::<Data<RequestPolicy>>() {
+            Some(policy) => {
+                host.is_none_or(|host| policy.is_host_allowed(host))
+                    && (opaque
+                        || origin.is_none_or(|origin| policy.is_origin_allowed(origin, host)))
+            }
+            None => false,
+        };
+
+        (!allowed).then(|| format!("Host: {host:?}, Origin: {origin:?}"))
+    };
+
+    if let Some(details) = rejection {
+        warn!("Rejected HTTP request to {} ({})", req.path(), details);
+        return Err(ErrorForbidden("Request rejected, unknown Host or Origin"));
+    }
+    next.call(req).await
+}
 
 struct AppData {
     usb_tx: DeviceSender,
@@ -67,18 +262,21 @@ pub async fn spawn_http_server(
         file_paths: file_paths.clone(),
         scribble_state: EnumMap::default(),
     }));
+    let policy = Data::new(RequestPolicy::new(
+        settings.cors_enabled,
+        &settings.bind_address,
+    ));
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
-            .allowed_origin_fn(|origin, _req_head| {
-                origin.as_bytes().starts_with(b"http://127.0.0.1")
-                    || origin.as_bytes().starts_with(b"http://localhost")
-            })
+            .allowed_origin_fn(|origin, _req_head| origin.to_str().is_ok_and(is_loopback_origin))
             .allow_any_method()
             .allow_any_header()
             .max_age(300);
         App::new()
             .wrap(Condition::new(settings.cors_enabled, cors))
+            .wrap(from_fn(check_request_source))
+            .app_data(policy.clone())
             .app_data(app_data.clone())
             .service(websocket)
             .service(execute_command)
@@ -89,6 +287,8 @@ pub async fn spawn_http_server(
             .service(upload_firmware)
             .default_service(web::to(default))
     })
+    // Don't hold up the daemon's shutdown waiting for open connections (such as WebSockets).
+    .shutdown_timeout(2)
     .bind((settings.bind_address.clone(), settings.port));
 
     if let Err(e) = server {
@@ -109,6 +309,17 @@ pub async fn spawn_http_server(
         settings.bind_address.as_str(),
         settings.port,
     );
+    let loopback = settings
+        .bind_address
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+        || settings.bind_address.eq_ignore_ascii_case("localhost");
+    if !loopback {
+        warn!(
+            "The configuration interface is reachable from other machines and has no password, \
+            only enable network access on networks you trust."
+        );
+    }
 
     // Let upstream know we're running...
     let _ = handle_tx.send(Ok(Some(server.handle())));
@@ -133,6 +344,7 @@ async fn websocket(
     body: web::Payload,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, msg_stream) = actix_ws::handle(&req, body)?;
+    let source = RequestSource::of(&req);
 
     let data = app_data.read().await;
     let mut usb_tx = data.usb_tx.clone();
@@ -153,7 +365,12 @@ async fn websocket(
                         break e;
                     }
                 }
-                Some(Ok(msg)) = msg_stream.next() => {
+                msg = msg_stream.next() => {
+                    // The client has gone (or the stream failed), stop handling this socket,
+                    // otherwise this task lives on waiting for patches.
+                    let Some(Ok(msg)) = msg else {
+                        break None;
+                    };
                     match msg {
                         AggregatedMessage::Ping(msg) => {
                             if let Err(e) = session.pong(&msg).await {
@@ -168,7 +385,12 @@ async fn websocket(
                             match serde_json::from_slice::<WebsocketRequest>(msg.as_ref()) {
                                 Ok(request) => {
                                     let request_id = request.id;
-                                    let result = handle_packet(request.data, &mut usb_tx).await;
+                                    let result = match source.refused_reason(&request.data) {
+                                        Some(reason) => {
+                                            Ok(DaemonResponse::Error(reason.to_string()))
+                                        }
+                                        None => handle_packet(request.data, &mut usb_tx).await,
+                                    };
                                     let response = match result {
                                         Ok(resp) => {
                                             match resp {
@@ -311,7 +533,12 @@ async fn send_response(res: WsResponse, session: &mut Session) -> Result<(), Opt
 async fn execute_command(
     request: web::Json<DaemonRequest>,
     app_data: Data<RwLock<AppData>>,
+    req: HttpRequest,
 ) -> HttpResponse {
+    if let Some(reason) = RequestSource::of(&req).refused_reason(&request.0) {
+        return HttpResponse::Ok().json(DaemonResponse::Error(reason.to_string()));
+    }
+
     let mut data = app_data.write().await;
 
     // Errors propagate weirdly in the javascript world, so send all as OK, and handle there.
@@ -456,9 +683,18 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     if let Some(path) = file {
         debug!("Found at {:?}", path);
         let mime_type = MimeGuess::from_path(path.clone()).first_or_octet_stream();
-        let mut builder = HttpResponse::Ok();
-        builder.insert_header(ContentType(mime_type));
-        return builder.body(fs::read(path).unwrap());
+        return match fs::read(&path) {
+            Ok(contents) => {
+                let mut builder = HttpResponse::Ok();
+                builder.insert_header(ContentType(mime_type));
+                builder.body(contents)
+            }
+            // The file may have been removed, or be unreadable, since it was found.
+            Err(error) => {
+                warn!("Unable to read sample {:?}: {}", path, error);
+                HttpResponse::NotFound().finish()
+            }
+        };
     }
 
     HttpResponse::NotFound().finish()
@@ -471,7 +707,16 @@ async fn upload_firmware(
     app_data: Data<RwLock<AppData>>,
 ) -> HttpResponse {
     let serial = path.into_inner();
-    let file_path = env::temp_dir().join(format!("{serial}.bin"));
+
+    // The serial is used in the file name, so only accept characters a serial can contain.
+    let serial_valid = !serial.is_empty()
+        && serial.len() <= 64
+        && serial
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !serial_valid {
+        return firmware_error(HttpResponse::BadRequest(), "Invalid Serial");
+    }
 
     let mut field = match payload.next().await {
         Some(Ok(field)) => field,
@@ -482,46 +727,77 @@ async fn upload_firmware(
         None => return HttpResponse::BadRequest().body("No file found in request"),
     };
 
-    let mut file = match File::create(&file_path) {
+    // Use a unique name, and refuse to reuse an existing file (or link) at that path.
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let file_path = env::temp_dir().join(format!("goxlr-firmware-{serial}-{timestamp}.bin"));
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+    {
         Ok(f) => f,
         Err(e) => {
             return HttpResponse::InternalServerError().body(format!("Failed to create file: {e}"));
         }
     };
 
+    let mut size = 0;
     while let Some(chunk) = field.next().await {
-        match chunk {
+        let error = match chunk {
             Ok(data) => {
-                if let Err(e) = file.write_all(&data) {
-                    return HttpResponse::InternalServerError()
-                        .body(format!("Failed to write file: {e}"));
+                size += data.len();
+                if size > MAX_FIRMWARE_SIZE {
+                    Some(firmware_error(
+                        HttpResponse::PayloadTooLarge(),
+                        "File is too large to be a firmware",
+                    ))
+                } else if let Err(e) = file.write_all(&data) {
+                    Some(
+                        HttpResponse::InternalServerError()
+                            .body(format!("Failed to write file: {e}")),
+                    )
+                } else {
+                    None
                 }
             }
-            Err(e) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Error reading file chunk: {e}"));
-            }
+            Err(e) => Some(
+                HttpResponse::InternalServerError().body(format!("Error reading file chunk: {e}")),
+            ),
+        };
+        if let Some(response) = error {
+            drop(file);
+            let _ = fs::remove_file(&file_path);
+            return response;
         }
     }
+    drop(file);
 
     // When we get here, the file has been uploaded successfully...
     let data = app_data.read().await;
     let (tx, rx) = oneshot::channel();
 
-    let _ = data
-        .usb_tx
-        .send(DeviceCommand::RunFirmwareUpdate(
-            serial,
-            Some(file_path),
-            false,
-            tx,
-        ))
-        .await;
-    let result = rx.await;
-    match result {
-        Ok(_) => HttpResponse::Ok().body(serde_json::to_string(&DaemonResponse::Ok).unwrap()),
+    let command = DeviceCommand::RunFirmwareUpdate(serial, Some(file_path.clone()), false, tx);
+    if data.usb_tx.send(command).await.is_err() {
+        let _ = fs::remove_file(&file_path);
+        return HttpResponse::InternalServerError().body("Unable to reach the device handler");
+    }
+
+    match rx.await {
+        Ok(Ok(())) => HttpResponse::Ok().body(serde_json::to_string(&DaemonResponse::Ok).unwrap()),
+        Ok(Err(e)) => {
+            let _ = fs::remove_file(&file_path);
+            firmware_error(HttpResponse::BadRequest(), &e.to_string())
+        }
         Err(e) => HttpResponse::InternalServerError().body(format!("Error Occurred: {e}")),
     }
+}
+
+fn firmware_error(mut builder: actix_web::HttpResponseBuilder, message: &str) -> HttpResponse {
+    let response = DaemonResponse::Error(message.to_string());
+    builder.body(serde_json::to_string(&response).unwrap())
 }
 
 async fn default(req: HttpRequest) -> HttpResponse {
@@ -550,5 +826,138 @@ async fn get_status(app_data: Data<RwLock<AppData>>) -> Result<DaemonStatus> {
     match result {
         DaemonResponse::Status(status) => Ok(status),
         _ => Err(anyhow!("Unexpected Daemon Status Result: {:?}", result)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(cors_enabled: bool) -> RequestPolicy {
+        RequestPolicy {
+            cors_enabled,
+            host_names: vec!["localhost".into(), "0.0.0.0".into(), "my-pc".into()],
+        }
+    }
+
+    #[test]
+    fn hosts() {
+        let policy = policy(false);
+        assert!(policy.is_host_allowed("localhost:14564"));
+        assert!(policy.is_host_allowed("LOCALHOST:14564"));
+        assert!(policy.is_host_allowed("127.0.0.1:14564"));
+        assert!(policy.is_host_allowed("[::1]:14564"));
+        assert!(policy.is_host_allowed("192.168.1.20:14564"));
+        assert!(policy.is_host_allowed("my-pc:14564"));
+        assert!(policy.is_host_allowed("goxlr.localhost"));
+
+        // DNS rebinding domains
+        assert!(!policy.is_host_allowed("evil.com:14564"));
+        assert!(!policy.is_host_allowed("localhost.evil.com:14564"));
+        assert!(!policy.is_host_allowed("127.0.0.1.nip.io:14564"));
+    }
+
+    #[test]
+    fn same_origin() {
+        let policy = policy(false);
+        let host = Some("localhost:14564");
+        assert!(policy.is_origin_allowed("http://localhost:14564", host));
+        assert!(policy.is_origin_allowed("http://192.168.1.20:14564", Some("192.168.1.20:14564")));
+
+        assert!(!policy.is_origin_allowed("https://evil.com", host));
+        assert!(!policy.is_origin_allowed("http://localhost.evil.com", host));
+        assert!(!policy.is_origin_allowed("http://localhost:3000", host));
+        assert!(!policy.is_origin_allowed("null", host));
+
+        // Local HTML apps (Stream Deck plugins) connect from file:// pages.
+        assert!(policy.is_origin_allowed("file://", host));
+        assert!(!policy.is_origin_allowed("file://evil.com", host));
+        assert!(!policy.is_origin_allowed("http://localhost:14564", None));
+    }
+
+    #[test]
+    fn opaque_origin_is_restricted() {
+        let opaque = RequestSource {
+            local_peer: true,
+            opaque_origin: true,
+        };
+        let serial = "S1".to_string();
+
+        // What the Stream Deck plugin does
+        assert!(opaque.refused_reason(&DaemonRequest::GetStatus).is_none());
+        let volume = GoXLRCommand::SetVolume(goxlr_types::ChannelName::Mic, 100);
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial.clone(), volume))
+                .is_none()
+        );
+        let profile = GoXLRCommand::LoadProfile("Default".into(), true);
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial.clone(), profile))
+                .is_none()
+        );
+
+        // What a web page must not be able to do
+        let activator = DaemonCommand::SetActivatorPath(Some("/bin/sh".into()));
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Daemon(activator))
+                .is_some()
+        );
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Daemon(DaemonCommand::StopDaemon))
+                .is_some()
+        );
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::RunFirmwareUpdate(
+                    serial.clone(),
+                    None,
+                    false
+                ))
+                .is_some()
+        );
+        let delete = GoXLRCommand::DeleteProfile("Default".into());
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial.clone(), delete))
+                .is_some()
+        );
+        let shutdown = GoXLRCommand::SetShutdownCommands(vec![]);
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::Command(serial, shutdown))
+                .is_some()
+        );
+
+        // A normal local page keeps full access
+        let local = RequestSource {
+            local_peer: true,
+            opaque_origin: false,
+        };
+        let activator = DaemonCommand::SetActivatorPath(Some("/bin/sh".into()));
+        assert!(
+            local
+                .refused_reason(&DaemonRequest::Daemon(activator))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cors_origins() {
+        let policy = policy(true);
+        let host = Some("localhost:14564");
+        assert!(policy.is_origin_allowed("http://localhost:3000", host));
+        assert!(policy.is_origin_allowed("http://127.0.0.1:3000", host));
+        assert!(policy.is_origin_allowed("http://[::1]:3000", host));
+
+        assert!(!policy.is_origin_allowed("http://localhost.evil.com", host));
+        assert!(!policy.is_origin_allowed("http://127.0.0.1.evil.com", host));
+        assert!(!policy.is_origin_allowed("http://192.168.1.20:3000", host));
+
+        assert!(is_loopback_origin("http://localhost:8080"));
+        assert!(!is_loopback_origin("http://localhost.evil.com"));
     }
 }

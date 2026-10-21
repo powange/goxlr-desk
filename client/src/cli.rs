@@ -1187,3 +1187,15 @@ pub enum DeviceSettings {
         enabled: bool,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // Catches conflicting names, bad defaults and similar clap mistakes.
+        Cli::command().debug_assert();
+    }
+}
