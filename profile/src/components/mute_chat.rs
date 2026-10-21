@@ -24,6 +24,7 @@ pub enum ParseError {
     #[error("[COUGH] Invalid colours: {0}")]
     InvalidColours(#[from] crate::components::colours::ParseError),
 }
+use crate::components::UnknownAttributes;
 use crate::enum_from_index;
 use crate::profile::Attribute;
 use log::warn;
@@ -47,6 +48,9 @@ pub struct MuteChat {
     cough_behaviour: CoughToggle,
     cough_mute_source: MuteFunction,
     cough_button_on: bool,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl MuteChat {
@@ -67,6 +71,7 @@ impl MuteChat {
             cough_behaviour: Hold,
             cough_mute_source: MuteFunction::All,
             cough_button_on: false,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -105,7 +110,7 @@ impl MuteChat {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -148,6 +153,7 @@ impl MuteChat {
 
         self.colour_map.write_colours(&mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

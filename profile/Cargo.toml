@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+goxlr-types = { path = "../types" }
 # Common Workspace
 log = { workspace = true }
 anyhow = { workspace = true }

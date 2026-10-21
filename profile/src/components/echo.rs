@@ -12,7 +12,10 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 use crate::components::colours::{Colour, ColourMap};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -40,6 +43,9 @@ pub struct EchoEncoderBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, EchoEncoder>,
     active_set: u8, // Not sure what this does?
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl EchoEncoderBase {
@@ -54,6 +60,7 @@ impl EchoEncoderBase {
             colour_map,
             preset_map: EnumMap::default(),
             active_set: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -65,7 +72,7 @@ impl EchoEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[EchoEncoder] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -84,11 +91,8 @@ impl EchoEncoderBase {
             }
 
             if attr.name == "DELAY_STYLE" {
-                for style in EchoStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<EchoStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
@@ -98,7 +102,7 @@ impl EchoEncoderBase {
                 continue;
             }
 
-            log::warn!("[EchoEncoder] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         self.preset_map[preset_enum] = preset;
@@ -113,6 +117,7 @@ impl EchoEncoderBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -151,6 +156,7 @@ impl EchoEncoderBase {
         );
         value.write_numeric(&mut attributes);
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -171,7 +177,7 @@ impl EchoEncoderBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EchoEncoder {
     knob_position: i8,
     style: EchoStyle,
@@ -187,6 +193,9 @@ pub struct EchoEncoder {
     time_left: u16,
     time_right: u16,
     tempo: u16,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl EchoEncoder {
@@ -206,6 +215,7 @@ impl EchoEncoder {
             time_left: 0,
             time_right: 0,
             tempo: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -218,9 +228,7 @@ impl EchoEncoder {
         ((self.knob_position as u16 * 100) / 24) as u8
     }
     pub fn set_percentage_value(&mut self, percentage: u8) -> Result<()> {
-        if percentage > 100 {
-            return Err(anyhow!("Value must be a percentage"));
-        }
+        check_range(percentage, ranges::PERCENTAGE, "Amount")?;
         self.set_knob_position(((percentage as i16 * 24) / 100) as i8)?;
         Ok(())
     }
@@ -229,9 +237,7 @@ impl EchoEncoder {
         self.knob_position
     }
     pub fn set_knob_position(&mut self, knob_position: i8) -> Result<()> {
-        if !(0..=24).contains(&knob_position) {
-            return Err(anyhow!("Echo Knob Position should be between 0 and 24"));
-        }
+        check_range(knob_position, ranges::KNOB, "Echo Knob Position")?;
 
         self.knob_position = knob_position;
         Ok(())
@@ -288,9 +294,7 @@ impl EchoEncoder {
         self.feedback_left
     }
     pub fn set_feedback_left(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Feedback Left should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Feedback Left")?;
         self.feedback_left = value;
         Ok(())
     }
@@ -299,9 +303,7 @@ impl EchoEncoder {
         self.feedback_right
     }
     pub fn set_feedback_right(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Feedback Right should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Feedback Right")?;
         self.feedback_right = value;
         Ok(())
     }
@@ -309,9 +311,7 @@ impl EchoEncoder {
         self.feedback_control
     }
     pub fn set_feedback(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Feedback should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Feedback")?;
         self.feedback_control = value;
         Ok(())
     }
@@ -319,9 +319,7 @@ impl EchoEncoder {
         self.xfb_l_to_r
     }
     pub fn set_xfb_l_to_r(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("XFB L to R should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "XFB L to R")?;
         self.xfb_l_to_r = value;
         Ok(())
     }
@@ -330,9 +328,7 @@ impl EchoEncoder {
         self.xfb_r_to_l
     }
     pub fn set_xfb_r_to_l(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("XFB R to L should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "XFB R to L")?;
         self.xfb_r_to_l = value;
         Ok(())
     }
@@ -348,9 +344,7 @@ impl EchoEncoder {
         self.time_left
     }
     pub fn set_time_left(&mut self, value: u16) -> Result<()> {
-        if value > 2500 {
-            return Err(anyhow!("Delay Left should be below 2500"));
-        }
+        check_range(value, ranges::ECHO_DELAY, "Delay Left")?;
         if self.style != EchoStyle::ClassicSlap {
             return Err(anyhow!("Delay can only be set if Style is ClassicSlap"));
         }
@@ -363,9 +357,7 @@ impl EchoEncoder {
         self.time_right
     }
     pub fn set_time_right(&mut self, value: u16) -> Result<()> {
-        if value > 2500 {
-            return Err(anyhow!("Delay Right should be below 2500"));
-        }
+        check_range(value, ranges::ECHO_DELAY, "Delay Right")?;
         if self.style != EchoStyle::ClassicSlap {
             return Err(anyhow!("Delay can only be set if Style is ClassicSlap"));
         }
@@ -378,9 +370,7 @@ impl EchoEncoder {
         self.tempo
     }
     pub fn set_tempo(&mut self, value: u16) -> Result<()> {
-        if !(45..=300).contains(&value) {
-            return Err(anyhow!("Tempo must be between 45 and 300"));
-        }
+        check_range(value, ranges::ECHO_TEMPO, "Tempo")?;
         if self.style == EchoStyle::ClassicSlap {
             return Err(anyhow!("Tempo cannot be set if Style is ClassicSlap"));
         }
@@ -520,13 +510,13 @@ numeric_attributes!(EchoEncoder {
     source: u8 = "DELAY_SOURCE",
     div_l: u8 = "DELAY_DIV_L",
     div_r: u8 = "DELAY_DIV_R",
-    feedback_left: u8 = "DELAY_FB_L",
-    feedback_right: u8 = "DELAY_FB_R",
-    xfb_l_to_r: u8 = "DELAY_XFB_L_R",
-    xfb_r_to_l: u8 = "DELAY_XFB_R_L",
-    feedback_control: u8 = "DELAY_FB_CONTROL",
+    feedback_left: u8 = "DELAY_FB_L" in ranges::PERCENTAGE,
+    feedback_right: u8 = "DELAY_FB_R" in ranges::PERCENTAGE,
+    xfb_l_to_r: u8 = "DELAY_XFB_L_R" in ranges::PERCENTAGE,
+    xfb_r_to_l: u8 = "DELAY_XFB_R_L" in ranges::PERCENTAGE,
+    feedback_control: u8 = "DELAY_FB_CONTROL" in ranges::PERCENTAGE,
     filter_style: u8 = "DELAY_FILTER_STYLE",
-    time_left: u16 = "DELAY_TIME_L",
-    time_right: u16 = "DELAY_TIME_R",
-    tempo: u16 = "DELAY_TEMPO",
+    time_left: u16 = "DELAY_TIME_L" in ranges::ECHO_DELAY,
+    time_right: u16 = "DELAY_TIME_R" in ranges::ECHO_DELAY,
+    tempo: u16 = "DELAY_TEMPO" in ranges::ECHO_TEMPO,
 });

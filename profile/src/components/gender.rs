@@ -9,8 +9,11 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap};
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -38,6 +41,9 @@ pub struct GenderEncoderBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, GenderEncoder>,
     active_set: u8, // Not sure what this does?
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl GenderEncoderBase {
@@ -52,6 +58,7 @@ impl GenderEncoderBase {
             colour_map,
             preset_map: EnumMap::default(),
             active_set: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -63,7 +70,7 @@ impl GenderEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[GenderEncoder] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -82,16 +89,13 @@ impl GenderEncoderBase {
             }
 
             if attr.name == "GENDER_STYLE" {
-                for style in GenderStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<GenderStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
 
-            log::warn!("[GenderEncoder] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         self.preset_map[preset_enum] = preset;
@@ -106,6 +110,7 @@ impl GenderEncoderBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -140,6 +145,7 @@ impl GenderEncoderBase {
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -160,11 +166,14 @@ impl GenderEncoderBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GenderEncoder {
     knob_position: i8,
     style: GenderStyle,
     range: u8,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl GenderEncoder {
@@ -173,6 +182,7 @@ impl GenderEncoder {
             knob_position: 0,
             style: GenderStyle::Narrow,
             range: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -228,9 +238,7 @@ impl GenderEncoder {
     }
 
     pub fn set_knob_position(&mut self, knob_position: i8) -> Result<()> {
-        if !(-24..=24).contains(&knob_position) {
-            return Err(anyhow!("Gender Knob Position should be between -24 and 24"));
-        }
+        check_range(knob_position, ranges::KNOB_CENTRED, "Gender Knob Position")?;
 
         self.knob_position = knob_position;
         Ok(())
@@ -247,7 +255,7 @@ impl GenderEncoder {
     }
 }
 
-#[derive(Default, Debug, EnumIter, Enum, EnumProperty)]
+#[derive(Default, Debug, EnumIter, Enum, EnumProperty, Clone, Copy)]
 pub enum GenderStyle {
     #[default]
     #[strum(props(uiIndex = "0"))]
@@ -261,6 +269,6 @@ pub enum GenderStyle {
 }
 
 numeric_attributes!(GenderEncoder {
-    knob_position: i8 = "GENDER_KNOB_POSITION",
+    knob_position: i8 = "GENDER_KNOB_POSITION" in ranges::KNOB_CENTRED,
     range: u8 = "GENDER_RANGE",
 });

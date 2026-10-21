@@ -10,6 +10,7 @@ use quick_xml::events::{BytesEnd, BytesStart, Event};
 use ritelinked::LinkedHashMap;
 use strum::{Display, EnumIter, EnumProperty, EnumString};
 
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::components::sample::PlayOrder::{Random, Sequential};
 use crate::profile::Attribute;
@@ -44,6 +45,9 @@ pub struct SampleBase {
     colour_map: ColourMap,
     state: String, // Seems to be "Empty" most of the time..
     sample_stack: EnumMap<SampleBank, SampleStack>,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl SampleBase {
@@ -67,6 +71,7 @@ impl SampleBase {
             colour_map,
             state: "Empty".to_string(),
             sample_stack: Default::default(),
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -81,7 +86,7 @@ impl SampleBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[Sampler] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -180,6 +185,7 @@ impl SampleBase {
         }
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

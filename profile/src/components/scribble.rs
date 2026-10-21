@@ -8,6 +8,7 @@ use quick_xml::events::{BytesStart, Event};
 use strum::EnumProperty;
 
 use crate::Faders;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap};
 use crate::components::scribble::ScribbleStyle::{Inverted, Normal};
 use crate::profile::Attribute;
@@ -57,6 +58,9 @@ pub struct Scribble {
 
     // Filename in the .goxlr zip file to the prepared bitmap
     bitmap_file: String,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl Scribble {
@@ -81,6 +85,7 @@ impl Scribble {
             alpha: 0.0,
             style: Normal,
             bitmap_file: "".to_string(),
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -131,7 +136,7 @@ impl Scribble {
 
             // Send the rest out for colouring..
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[SCRIBBLE] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -170,6 +175,7 @@ impl Scribble {
         self.colour_map
             .write_colours_with_prefix(element_name.into(), &mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

@@ -7,6 +7,7 @@ use quick_xml::events::{BytesStart, Event};
 use strum::EnumProperty;
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::profile::Attribute;
 
@@ -33,6 +34,9 @@ pub struct Effects {
 
     // This is represented only in the UI.
     name: String,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl Effects {
@@ -56,6 +60,7 @@ impl Effects {
             element_name,
             colour_map,
             name: default_name,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -68,7 +73,7 @@ impl Effects {
 
             // Send the rest out for colouring..
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[EFFECTS] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -83,6 +88,7 @@ impl Effects {
 
         self.colour_map.write_colours(&mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

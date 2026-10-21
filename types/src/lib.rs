@@ -971,3 +971,60 @@ pub enum DriverInterface {
     TUSB,
     LIBUSB,
 }
+
+/// The values the effect settings accept. The client, the profile setters and the loading of a
+/// profile all use these, so a value is accepted (or refused) the same way everywhere.
+pub mod effect_ranges {
+    use std::ops::RangeInclusive;
+
+    pub const PERCENTAGE: RangeInclusive<i64> = 0..=100;
+    // The position of an encoder: 0..=24 for Reverb and Echo, -24..=24 for Pitch and Gender
+    pub const KNOB: RangeInclusive<i64> = 0..=24;
+    pub const KNOB_CENTRED: RangeInclusive<i64> = -24..=24;
+
+    pub const REVERB_DECAY_MILLIS: RangeInclusive<i64> = 10..=20000;
+    pub const REVERB_PREDELAY: RangeInclusive<i64> = 0..=100;
+    pub const REVERB_DIFFUSE: RangeInclusive<i64> = -50..=50;
+    pub const REVERB_COLOUR: RangeInclusive<i64> = -50..=50;
+    pub const REVERB_HIGH_FACTOR: RangeInclusive<i64> = -25..=25;
+    pub const REVERB_MOD: RangeInclusive<i64> = -25..=25;
+    pub const REVERB_LEVEL: RangeInclusive<i64> = -25..=0;
+
+    pub const ECHO_DELAY: RangeInclusive<i64> = 0..=2500;
+    pub const ECHO_TEMPO: RangeInclusive<i64> = 45..=300;
+
+    // The widest, Narrow and Hard Tune accept less (checked against the style)
+    pub const PITCH_AMOUNT: RangeInclusive<i64> = -24..=24;
+    pub const GENDER_AMOUNT: RangeInclusive<i64> = -50..=50;
+
+    pub const MEGAPHONE_POST_GAIN: RangeInclusive<i64> = -20..=20;
+
+    pub const ROBOT_GAIN: RangeInclusive<i64> = -12..=12;
+    pub const ROBOT_LOW_FREQ: RangeInclusive<i64> = 0..=88;
+    pub const ROBOT_MID_FREQ: RangeInclusive<i64> = 86..=184;
+    pub const ROBOT_HIGH_FREQ: RangeInclusive<i64> = 182..=240;
+    // Any of the three (the range given with it picks the one that applies)
+    pub const ROBOT_FREQ: RangeInclusive<i64> = 0..=240;
+    pub const ROBOT_WIDTH: RangeInclusive<i64> = 0..=32;
+    pub const ROBOT_WAVEFORM: RangeInclusive<i64> = 0..=3;
+    pub const ROBOT_LEVEL: RangeInclusive<i64> = -36..=0;
+
+    pub const HARDTUNE_WINDOW: RangeInclusive<i64> = 0..=600;
+
+    /// Checks `value` against `range`, the error names the setting.
+    pub fn check<T: Into<i64>>(
+        value: T,
+        range: RangeInclusive<i64>,
+        name: &str,
+    ) -> Result<(), String> {
+        if range.contains(&value.into()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{name} should be between {} and {}",
+                range.start(),
+                range.end()
+            ))
+        }
+    }
+}

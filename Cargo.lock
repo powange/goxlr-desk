@@ -2191,6 +2191,7 @@ dependencies = [
  "enum-map",
  "enum-map-derive",
  "fastrand",
+ "goxlr-types",
  "log",
  "quick-xml",
  "ritelinked",

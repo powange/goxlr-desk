@@ -8,6 +8,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 use strum::{Display, EnumIter, EnumString};
 
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::profile::Attribute;
 
@@ -35,6 +36,9 @@ pub struct SimpleElement {
     // Ok.
     element_name: String,
     colour_map: ColourMap,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl SimpleElement {
@@ -68,13 +72,14 @@ impl SimpleElement {
         Self {
             element_name,
             colour_map,
+            unknown: UnknownAttributes::default(),
         }
     }
 
     pub fn parse_simple(&mut self, attributes: &Vec<Attribute>) -> Result<(), ParseError> {
         for attr in attributes {
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -87,6 +92,7 @@ impl SimpleElement {
         let mut attributes: HashMap<String, String> = HashMap::default();
         self.colour_map.write_colours(&mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

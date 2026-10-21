@@ -4,14 +4,17 @@ use std::io::Write;
 use enum_map::EnumMap;
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::components::robot::RobotStyle::Robot1;
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -38,6 +41,9 @@ pub enum ParseError {
 pub struct RobotEffectBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, RobotEffect>,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl RobotEffectBase {
@@ -53,13 +59,14 @@ impl RobotEffectBase {
         Self {
             colour_map,
             preset_map: EnumMap::default(),
+            unknown: UnknownAttributes::default(),
         }
     }
 
     pub fn parse_robot_root(&mut self, attributes: &Vec<Attribute>) -> Result<()> {
         for attr in attributes {
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[robotEffect] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -82,11 +89,8 @@ impl RobotEffectBase {
                 continue;
             }
             if attr.name == "ROBOT_STYLE" {
-                for style in RobotStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<RobotStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
@@ -94,7 +98,7 @@ impl RobotEffectBase {
             /* Same as Microphone, I haven't seen any random float values in the config for robot
              * but I'm not gonna rule it out.. */
 
-            log::warn!("[RobotEffect] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         self.preset_map[preset_enum] = preset;
@@ -108,6 +112,7 @@ impl RobotEffectBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -150,6 +155,7 @@ impl RobotEffectBase {
         );
         value.write_numeric(&mut attributes);
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -168,7 +174,7 @@ impl RobotEffectBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RobotEffect {
     // State here determines if the robot effect is on or off when this preset is loaded.
     state: bool,
@@ -190,6 +196,9 @@ pub struct RobotEffect {
     vocoder_high_freq: u8,
     vocoder_high_gain: i8,
     vocoder_high_bw: u8,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl RobotEffect {
@@ -211,6 +220,7 @@ impl RobotEffect {
             vocoder_high_freq: 0,
             vocoder_high_gain: 0,
             vocoder_high_bw: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -249,9 +259,7 @@ impl RobotEffect {
         self.synthosc_pulse_width
     }
     pub fn set_synthosc_pulse_width(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Pulse Width must be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Pulse Width")?;
         self.synthosc_pulse_width = value;
         Ok(())
     }
@@ -260,11 +268,7 @@ impl RobotEffect {
         self.synthosc_waveform
     }
     pub fn set_synthosc_waveform(&mut self, value: u8) -> Result<()> {
-        if value > 3 {
-            return Err(anyhow!(
-                "Waveform must be Sawtooth (0), Square (1) or Triangle (2)"
-            ));
-        }
+        check_range(value, ranges::ROBOT_WAVEFORM, "Waveform")?;
         self.synthosc_waveform = value;
         Ok(())
     }
@@ -273,9 +277,7 @@ impl RobotEffect {
         self.vocoder_gate_threshold
     }
     pub fn set_vocoder_gate_threshold(&mut self, value: i8) -> Result<()> {
-        if !(-36..=0).contains(&value) {
-            return Err(anyhow!("Threshold must be between -36 and 0"));
-        }
+        check_range(value, ranges::ROBOT_LEVEL, "Threshold")?;
         self.vocoder_gate_threshold = value;
         Ok(())
     }
@@ -284,9 +286,7 @@ impl RobotEffect {
         self.dry_mix
     }
     pub fn set_dry_mix(&mut self, value: i8) -> Result<()> {
-        if !(-36..=0).contains(&value) {
-            return Err(anyhow!("Dry Mix must be between -36 and 0"));
-        }
+        check_range(value, ranges::ROBOT_LEVEL, "Dry Mix")?;
         self.dry_mix = value;
         Ok(())
     }
@@ -295,9 +295,7 @@ impl RobotEffect {
         self.vocoder_low_freq
     }
     pub fn set_vocoder_low_freq(&mut self, value: u8) -> Result<()> {
-        if value > 88 {
-            return Err(anyhow!("Low Freq should be between 0 and 88"));
-        }
+        check_range(value, ranges::ROBOT_LOW_FREQ, "Low Freq")?;
         self.vocoder_low_freq = value;
         Ok(())
     }
@@ -306,9 +304,7 @@ impl RobotEffect {
         self.vocoder_low_gain
     }
     pub fn set_vocoder_low_gain(&mut self, value: i8) -> Result<()> {
-        if !(-12..=12).contains(&value) {
-            return Err(anyhow!("Low Gain should be between -12 and 12"));
-        }
+        check_range(value, ranges::ROBOT_GAIN, "Low Gain")?;
         self.vocoder_low_gain = value;
         Ok(())
     }
@@ -317,9 +313,7 @@ impl RobotEffect {
         self.vocoder_low_bw
     }
     pub fn set_vocoder_low_bw(&mut self, value: u8) -> Result<()> {
-        if value > 32 {
-            return Err(anyhow!("Low Width should be between 0 and 32"));
-        }
+        check_range(value, ranges::ROBOT_WIDTH, "Low Width")?;
         self.vocoder_low_bw = value;
         Ok(())
     }
@@ -328,9 +322,7 @@ impl RobotEffect {
         self.vocoder_mid_freq
     }
     pub fn set_vocoder_mid_freq(&mut self, value: u8) -> Result<()> {
-        if !(86..=184).contains(&value) {
-            return Err(anyhow!("Mid Freq should be between 86 and 184"));
-        }
+        check_range(value, ranges::ROBOT_MID_FREQ, "Mid Freq")?;
         self.vocoder_mid_freq = value;
         Ok(())
     }
@@ -339,9 +331,7 @@ impl RobotEffect {
         self.vocoder_mid_gain
     }
     pub fn set_vocoder_mid_gain(&mut self, value: i8) -> Result<()> {
-        if !(-12..=12).contains(&value) {
-            return Err(anyhow!("Mid Gain should be between -12 and 12"));
-        }
+        check_range(value, ranges::ROBOT_GAIN, "Mid Gain")?;
         self.vocoder_mid_gain = value;
         Ok(())
     }
@@ -350,9 +340,7 @@ impl RobotEffect {
         self.vocoder_mid_bw
     }
     pub fn set_vocoder_mid_bw(&mut self, value: u8) -> Result<()> {
-        if value > 32 {
-            return Err(anyhow!("Mid Width should be between 0 and 32"));
-        }
+        check_range(value, ranges::ROBOT_WIDTH, "Mid Width")?;
         self.vocoder_mid_bw = value;
         Ok(())
     }
@@ -361,9 +349,7 @@ impl RobotEffect {
         self.vocoder_high_freq
     }
     pub fn set_vocoder_high_freq(&mut self, value: u8) -> Result<()> {
-        if !(182..=240).contains(&value) {
-            return Err(anyhow!("High Freq should be between 182 and 240"));
-        }
+        check_range(value, ranges::ROBOT_HIGH_FREQ, "High Freq")?;
         self.vocoder_high_freq = value;
         Ok(())
     }
@@ -372,9 +358,7 @@ impl RobotEffect {
         self.vocoder_high_gain
     }
     pub fn set_vocoder_high_gain(&mut self, value: i8) -> Result<()> {
-        if !(-12..=12).contains(&value) {
-            return Err(anyhow!("High Gain should be between -12 and 12"));
-        }
+        check_range(value, ranges::ROBOT_GAIN, "High Gain")?;
         self.vocoder_high_gain = value;
         Ok(())
     }
@@ -383,9 +367,7 @@ impl RobotEffect {
         self.vocoder_high_bw
     }
     pub fn set_vocoder_high_bw(&mut self, value: u8) -> Result<()> {
-        if value > 32 {
-            return Err(anyhow!("High Width should be between 0 and 32"));
-        }
+        check_range(value, ranges::ROBOT_WIDTH, "High Width")?;
         self.vocoder_high_bw = value;
         Ok(())
     }
@@ -476,17 +458,17 @@ impl RobotPresets {
 }
 
 numeric_attributes!(RobotEffect {
-    synthosc_pulse_width: u8 = "ROBOT_SYNTHOSC_PULSEWIDTH",
-    synthosc_waveform: u8 = "ROBOT_SYNTHOSC_WAVEFORM",
-    vocoder_gate_threshold: i8 = "ROBOT_VOCODER_GATE_THRESHOLD",
-    dry_mix: i8 = "ROBOT_DRY_MIX",
-    vocoder_low_freq: u8 = "ROBOT_VOCODER_LOW_FREQ",
-    vocoder_low_gain: i8 = "ROBOT_VOCODER_LOW_GAIN",
-    vocoder_low_bw: u8 = "ROBOT_VOCODER_LOW_BW",
-    vocoder_mid_freq: u8 = "ROBOT_VOCODER_MID_FREQ",
-    vocoder_mid_gain: i8 = "ROBOT_VOCODER_MID_GAIN",
-    vocoder_mid_bw: u8 = "ROBOT_VOCODER_MID_BW",
-    vocoder_high_freq: u8 = "ROBOT_VOCODER_HIGH_FREQ",
-    vocoder_high_gain: i8 = "ROBOT_VOCODER_HIGH_GAIN",
-    vocoder_high_bw: u8 = "ROBOT_VOCODER_HIGH_BW",
+    synthosc_pulse_width: u8 = "ROBOT_SYNTHOSC_PULSEWIDTH" in ranges::PERCENTAGE,
+    synthosc_waveform: u8 = "ROBOT_SYNTHOSC_WAVEFORM" in ranges::ROBOT_WAVEFORM,
+    vocoder_gate_threshold: i8 = "ROBOT_VOCODER_GATE_THRESHOLD" in ranges::ROBOT_LEVEL,
+    dry_mix: i8 = "ROBOT_DRY_MIX" in ranges::ROBOT_LEVEL,
+    vocoder_low_freq: u8 = "ROBOT_VOCODER_LOW_FREQ" in ranges::ROBOT_LOW_FREQ,
+    vocoder_low_gain: i8 = "ROBOT_VOCODER_LOW_GAIN" in ranges::ROBOT_GAIN,
+    vocoder_low_bw: u8 = "ROBOT_VOCODER_LOW_BW" in ranges::ROBOT_WIDTH,
+    vocoder_mid_freq: u8 = "ROBOT_VOCODER_MID_FREQ" in ranges::ROBOT_MID_FREQ,
+    vocoder_mid_gain: i8 = "ROBOT_VOCODER_MID_GAIN" in ranges::ROBOT_GAIN,
+    vocoder_mid_bw: u8 = "ROBOT_VOCODER_MID_BW" in ranges::ROBOT_WIDTH,
+    vocoder_high_freq: u8 = "ROBOT_VOCODER_HIGH_FREQ" in ranges::ROBOT_HIGH_FREQ,
+    vocoder_high_gain: i8 = "ROBOT_VOCODER_HIGH_GAIN" in ranges::ROBOT_GAIN,
+    vocoder_high_bw: u8 = "ROBOT_VOCODER_HIGH_BW" in ranges::ROBOT_WIDTH,
 });

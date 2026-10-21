@@ -5,6 +5,7 @@ use anyhow::Result;
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 
+use crate::components::UnknownAttributes;
 use crate::components::colours::ColourMap;
 use crate::profile::Attribute;
 
@@ -37,6 +38,9 @@ pub struct BrowserPreviewTree {
     file: String,
     play_toggle: u8,
     current_relative_time: f64,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl BrowserPreviewTree {
@@ -50,6 +54,7 @@ impl BrowserPreviewTree {
             file: "".to_string(),
             play_toggle: 0,
             current_relative_time: 0.0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -76,7 +81,7 @@ impl BrowserPreviewTree {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -97,6 +102,7 @@ impl BrowserPreviewTree {
 
         self.colour_map.write_colours(&mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

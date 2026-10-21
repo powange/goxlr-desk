@@ -10,6 +10,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::Faders;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::profile::Attribute;
 
@@ -38,6 +39,9 @@ pub struct MuteButton {
     // Labelled as 'fromMuteAllFlag' in the XML, honestly, not sure what this does either,
     // it's either 1, 0 or simply not there.
     from_mute_all: Option<bool>,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl MuteButton {
@@ -58,6 +62,7 @@ impl MuteButton {
             previous_volume: 0,
 
             from_mute_all: None,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -112,7 +117,7 @@ impl MuteButton {
 
             // Check to see if this is a colour related attribute..
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[MUTE BUTTON] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -145,6 +150,7 @@ impl MuteButton {
         self.colour_map
             .write_colours_with_prefix(element_name.into(), &mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

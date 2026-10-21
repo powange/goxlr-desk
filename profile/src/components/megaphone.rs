@@ -4,14 +4,17 @@ use std::io::Write;
 use enum_map::EnumMap;
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::components::megaphone::MegaphoneStyle::Megaphone;
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -38,6 +41,9 @@ pub enum ParseError {
 pub struct MegaphoneEffectBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, MegaphoneEffect>,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl MegaphoneEffectBase {
@@ -53,13 +59,14 @@ impl MegaphoneEffectBase {
         Self {
             colour_map,
             preset_map: EnumMap::default(),
+            unknown: UnknownAttributes::default(),
         }
     }
 
     pub fn parse_megaphone_root(&mut self, attributes: &Vec<Attribute>) -> Result<(), ParseError> {
         for attr in attributes {
             if !self.colour_map.read_colours(attr)? {
-                log::warn!("[megaphoneEffect] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -82,11 +89,8 @@ impl MegaphoneEffectBase {
                 continue;
             }
             if attr.name == "MEGAPHONE_STYLE" {
-                for style in MegaphoneStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<MegaphoneStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
@@ -102,7 +106,7 @@ impl MegaphoneEffectBase {
                 preset.trans_beatbox_enabled = attr.value != "0";
                 continue;
             }
-            log::warn!("[MegaphoneEffect] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
         self.preset_map[preset_enum] = preset;
         Ok(())
@@ -115,6 +119,7 @@ impl MegaphoneEffectBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -165,6 +170,7 @@ impl MegaphoneEffectBase {
             },
         );
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -193,7 +199,7 @@ impl MegaphoneEffectBase {
  * by several values, but still need to work out the mapping.
  *
  */
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MegaphoneEffect {
     // State here determines if the megaphone is on or off when this preset is loaded.
     state: bool,
@@ -213,6 +219,9 @@ pub struct MegaphoneEffect {
     trans_filter: u8,
     trans_drive_pot_gain_comp_mid: u8,
     trans_drive_pot_gain_comp_max: u8,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl MegaphoneEffect {
@@ -234,6 +243,7 @@ impl MegaphoneEffect {
             trans_filter: 0,
             trans_drive_pot_gain_comp_mid: 0,
             trans_drive_pot_gain_comp_max: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -273,9 +283,7 @@ impl MegaphoneEffect {
         self.trans_dist_amt
     }
     pub fn set_trans_dist_amt(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Amount should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Amount")?;
         self.trans_dist_amt = value;
         Ok(())
     }
@@ -305,9 +313,7 @@ impl MegaphoneEffect {
         self.trans_postgain
     }
     pub fn set_trans_postgain(&mut self, trans_postgain: i8) -> Result<()> {
-        if !(-20..=20).contains(&trans_postgain) {
-            return Err(anyhow!("Post Gain should be between -20 and 20"));
-        }
+        check_range(trans_postgain, ranges::MEGAPHONE_POST_GAIN, "Post Gain")?;
         self.trans_postgain = trans_postgain;
         Ok(())
     }
@@ -519,11 +525,11 @@ impl MegaphonePreset {
 }
 
 numeric_attributes!(MegaphoneEffect {
-    trans_dist_amt: u8 = "TRANS_DIST_AMT",
+    trans_dist_amt: u8 = "TRANS_DIST_AMT" in ranges::PERCENTAGE,
     trans_hp: u8 = "TRANS_HP",
     trans_lp: u8 = "TRANS_LP",
     trans_pregain: u8 = "TRANS_PREGAIN",
-    trans_postgain: i8 = "TRANS_POSTGAIN",
+    trans_postgain: i8 = "TRANS_POSTGAIN" in ranges::MEGAPHONE_POST_GAIN,
     trans_dist_type: u8 = "TRANS_DIST_TYPE",
     trans_presence_gain: u8 = "TRANS_PRESENCE_GAIN",
     trans_presence_fc: u8 = "TRANS_PRESENCE_FC",

@@ -550,7 +550,35 @@ impl ProfileSettings {
         })
     }
 
+    /// Loads an effect preset into the active effect bank. It's all or nothing: a preset that
+    /// can't be read completely leaves the bank as it was.
     pub fn load_preset<R: Read>(&mut self, read: R) -> Result<()> {
+        let current = self.context().selected_effects();
+        let before = (
+            self.reverb_encoder.get_preset(current).clone(),
+            self.echo_encoder.get_preset(current).clone(),
+            self.pitch_encoder.get_preset(current).clone(),
+            self.gender_encoder.get_preset(current).clone(),
+            self.megaphone_effect.get_preset(current).clone(),
+            self.robot_effect.get_preset(current).clone(),
+            self.hardtune_effect.get_preset(current).clone(),
+            self.effects(current).name().to_string(),
+        );
+        let result = self.read_preset(read);
+        if result.is_err() {
+            *self.reverb_encoder.get_preset_mut(current) = before.0;
+            *self.echo_encoder.get_preset_mut(current) = before.1;
+            *self.pitch_encoder.get_preset_mut(current) = before.2;
+            *self.gender_encoder.get_preset_mut(current) = before.3;
+            *self.megaphone_effect.get_preset_mut(current) = before.4;
+            *self.robot_effect.get_preset_mut(current) = before.5;
+            *self.hardtune_effect.get_preset_mut(current) = before.6;
+            self.effects_mut(current).set_name(before.7)?;
+        }
+        result
+    }
+
+    fn read_preset<R: Read>(&mut self, read: R) -> Result<()> {
         let buf_reader = BufReader::new(read);
         let mut reader = Reader::from_reader(buf_reader);
 
@@ -619,7 +647,7 @@ impl ProfileSettings {
                 }
 
                 Ok(_) => {}
-                Err(_) => {}
+                Err(e) => bail!("The preset can't be read: {}", e),
             }
         }
         Ok(())
@@ -1092,6 +1120,155 @@ mod tests {
                         "{name}: {key} not written"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_profiles_keep_their_effect_values() {
+        // Their values are inside the ranges: loading and writing them changes nothing
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = vec![root.join("daemon/profiles/Default.goxlr")];
+        for entry in fs::read_dir(root.join("defaults/resources/profiles")).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+        for file in files {
+            let mut archive = zip::ZipArchive::new(File::open(&file).unwrap()).unwrap();
+            let mut source = String::new();
+            archive
+                .by_name("profile.xml")
+                .unwrap()
+                .read_to_string(&mut source)
+                .unwrap();
+            let mut settings = ProfileSettings::load(source.as_bytes()).unwrap();
+            let out = normalised(&written(&mut settings));
+            for element in normalised(source.as_bytes()) {
+                let mut parts = element.split(' ');
+                let name = parts.next().unwrap();
+                let effects = [
+                    "reverb",
+                    "echo",
+                    "pitch",
+                    "gender",
+                    "megaphone",
+                    "robot",
+                    "hardtune",
+                ];
+                if !effects.iter().any(|effect| name.starts_with(effect)) {
+                    continue;
+                }
+                let Some(line) = out.iter().find(|l| l.split(' ').next() == Some(name)) else {
+                    continue;
+                };
+                for attribute in parts {
+                    let Some((key, value)) = attribute.split_once('=') else {
+                        continue;
+                    };
+                    // Derived from the style when loading, not read
+                    if key == "PITCH_SHIFT_THRESHOLD" {
+                        continue;
+                    }
+                    let Ok(value) = value.parse::<f64>() else {
+                        continue;
+                    };
+                    let prefix = format!("{key}=");
+                    let Some(now) = line.split(' ').find(|a| a.starts_with(&prefix)) else {
+                        continue;
+                    };
+                    if let Ok(now) = now[prefix.len()..].parse::<f64>() {
+                        assert_eq!(
+                            value.trunc(),
+                            now,
+                            "{}: {name} {key} changed",
+                            file.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_attributes_are_written_back() {
+        // Attributes from a newer app, on an effect preset and on a root element
+        let profile = TEST_PROFILE
+            .replacen(
+                "<echoEncoderpreset1 DELAY_KNOB_POSITION=\"0\"",
+                "<echoEncoderpreset1 FUTURE_DELAY=\"7\" DELAY_KNOB_POSITION=\"0\"",
+                1,
+            )
+            .replacen(
+                "<mixerTree headphoneLevel",
+                "<mixerTree futureLevel=\"3\" headphoneLevel",
+                1,
+            );
+        let mut settings = ProfileSettings::load(profile.as_bytes()).unwrap();
+        let out = normalised(&written(&mut settings));
+        let line = |name: &str| out.iter().find(|l| l.starts_with(name)).unwrap().clone();
+        assert!(line("echoEncoderpreset1 ").contains("FUTURE_DELAY=7"));
+        assert!(line("mixerTree ").contains("futureLevel=3"));
+    }
+
+    #[test]
+    fn a_broken_preset_changes_nothing() {
+        let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let current = settings.context().selected_effects();
+        let before = format!("{:?}", settings.reverb_encoder.get_preset(current));
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let preset = fs::read_to_string(root.join("defaults/resources/presets/Big Echo.preset"))
+            .unwrap()
+            .replace("TRANS_DIST_AMT=\"30\"", "TRANS_DIST_AMT=\"thirty\"");
+        // The reverb comes first in the file, the error is in the megaphone after it
+        assert!(settings.load_preset(preset.as_bytes()).is_err());
+        assert_eq!(
+            format!("{:?}", settings.reverb_encoder.get_preset(current)),
+            before
+        );
+    }
+
+    /// A light fuzz: random attribute values (empty, huge, negative, not numbers..) never make
+    /// the loading panic, and what loads also writes and loads again.
+    #[test]
+    fn random_attribute_values_never_panic() {
+        let values = [
+            "",
+            "-1",
+            "0",
+            "255",
+            "256",
+            "65536",
+            "-129",
+            "999999999999",
+            "1e40",
+            "-1e40",
+            "NaN",
+            "inf",
+            "abc",
+            "1.5",
+            "-0.5",
+            "\u{e9}",
+        ];
+        let positions: Vec<usize> = TEST_PROFILE
+            .match_indices("=\"")
+            .map(|(i, _)| i + 2)
+            .collect();
+        let mut rng = fastrand::Rng::with_seed(0x60_7c_1e);
+        for _ in 0..300 {
+            let mut profile = TEST_PROFILE.to_string();
+            // Replace a few values, from the end so the earlier positions stay valid
+            let mut chosen: Vec<usize> = (0..rng.usize(1..8))
+                .map(|_| positions[rng.usize(..positions.len())])
+                .collect();
+            chosen.sort_unstable();
+            chosen.dedup();
+            for start in chosen.into_iter().rev() {
+                let end = start + profile[start..].find('"').unwrap();
+                profile.replace_range(start..end, values[rng.usize(..values.len())]);
+            }
+            if let Ok(mut settings) = ProfileSettings::load(profile.as_bytes()) {
+                let out = written(&mut settings);
+                assert!(ProfileSettings::load(&out[..]).is_ok());
             }
         }
     }
