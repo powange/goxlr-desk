@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::raw::c_float;
 
 use enum_map::{Enum, EnumMap};
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
@@ -78,6 +77,10 @@ impl GenderEncoderBase {
     ) -> Result<(), ParseError> {
         let mut preset = GenderEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "GENDER_STYLE" {
                 for style in GenderStyle::iter() {
                     if style.get_str("uiIndex").unwrap() == attr.value {
@@ -85,16 +88,6 @@ impl GenderEncoderBase {
                         break;
                     }
                 }
-                continue;
-            }
-
-            if attr.name == "GENDER_KNOB_POSITION" {
-                preset.knob_position = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-
-            if attr.name == "GENDER_RANGE" {
-                preset.range = attr.value.parse::<c_float>()? as u8;
                 continue;
             }
 
@@ -141,15 +134,11 @@ impl GenderEncoderBase {
         let mut attributes = HashMap::new();
         let value = &self.preset_map[preset];
 
-        attributes.insert(
-            "GENDER_KNOB_POSITION".to_string(),
-            format!("{}", value.knob_position),
-        );
+        value.write_numeric(&mut attributes);
         attributes.insert(
             "GENDER_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("GENDER_RANGE".to_string(), format!("{}", value.range));
 
         attributes
     }
@@ -270,3 +259,8 @@ pub enum GenderStyle {
     #[strum(props(uiIndex = "2"))]
     Wide,
 }
+
+numeric_attributes!(GenderEncoder {
+    knob_position: i8 = "GENDER_KNOB_POSITION",
+    range: u8 = "GENDER_RANGE",
+});

@@ -79,6 +79,10 @@ impl EchoEncoderBase {
     ) -> Result<()> {
         let mut preset = EchoEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "DELAY_STYLE" {
                 for style in EchoStyle::iter() {
                     if style.get_str("uiIndex").unwrap() == attr.value {
@@ -91,55 +95,6 @@ impl EchoEncoderBase {
 
             if attr.name == "DELAY_KNOB_POSITION" {
                 preset.set_knob_position(attr.value.parse::<c_float>()? as i8)?;
-                continue;
-            }
-
-            if attr.name == "DELAY_SOURCE" {
-                preset.source = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_DIV_L" {
-                preset.div_l = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_DIV_R" {
-                preset.div_r = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_FB_L" {
-                preset.feedback_left = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_FB_R" {
-                preset.feedback_right = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_XFB_L_R" {
-                preset.xfb_l_to_r = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_XFB_R_L" {
-                preset.xfb_r_to_l = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_FB_CONTROL" {
-                preset.feedback_control = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_FILTER_STYLE" {
-                preset.filter_style = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "DELAY_TIME_L" {
-                preset.time_left = attr.value.parse::<c_float>()? as u16;
-                continue;
-            }
-            if attr.name == "DELAY_TIME_R" {
-                preset.time_right = attr.value.parse::<c_float>()? as u16;
-                continue;
-            }
-            if attr.name == "DELAY_TEMPO" {
-                preset.tempo = attr.value.parse::<c_float>()? as u16;
                 continue;
             }
 
@@ -194,27 +149,7 @@ impl EchoEncoderBase {
             "DELAY_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("DELAY_SOURCE".to_string(), format!("{}", value.source));
-        attributes.insert("DELAY_DIV_L".to_string(), format!("{}", value.div_l));
-        attributes.insert("DELAY_DIV_R".to_string(), format!("{}", value.div_r));
-        attributes.insert("DELAY_FB_L".to_string(), format!("{}", value.feedback_left));
-        attributes.insert(
-            "DELAY_FB_R".to_string(),
-            format!("{}", value.feedback_right),
-        );
-        attributes.insert("DELAY_XFB_L_R".to_string(), format!("{}", value.xfb_l_to_r));
-        attributes.insert("DELAY_XFB_R_L".to_string(), format!("{}", value.xfb_r_to_l));
-        attributes.insert(
-            "DELAY_FB_CONTROL".to_string(),
-            format!("{}", value.feedback_control),
-        );
-        attributes.insert(
-            "DELAY_FILTER_STYLE".to_string(),
-            format!("{}", value.filter_style),
-        );
-        attributes.insert("DELAY_TIME_L".to_string(), format!("{}", value.time_left));
-        attributes.insert("DELAY_TIME_R".to_string(), format!("{}", value.time_right));
-        attributes.insert("DELAY_TEMPO".to_string(), format!("{}", value.tempo));
+        value.write_numeric(&mut attributes);
 
         attributes
     }
@@ -580,3 +515,18 @@ impl EchoPreset {
         }
     }
 }
+
+numeric_attributes!(EchoEncoder {
+    source: u8 = "DELAY_SOURCE",
+    div_l: u8 = "DELAY_DIV_L",
+    div_r: u8 = "DELAY_DIV_R",
+    feedback_left: u8 = "DELAY_FB_L",
+    feedback_right: u8 = "DELAY_FB_R",
+    xfb_l_to_r: u8 = "DELAY_XFB_L_R",
+    xfb_r_to_l: u8 = "DELAY_XFB_R_L",
+    feedback_control: u8 = "DELAY_FB_CONTROL",
+    filter_style: u8 = "DELAY_FILTER_STYLE",
+    time_left: u16 = "DELAY_TIME_L",
+    time_right: u16 = "DELAY_TIME_R",
+    tempo: u16 = "DELAY_TEMPO",
+});

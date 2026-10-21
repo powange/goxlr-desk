@@ -78,6 +78,10 @@ impl PitchEncoderBase {
     ) -> Result<(), ParseError> {
         let mut preset = PitchEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "PITCH_STYLE" {
                 for style in PitchStyle::iter() {
                     if style.get_str("uiIndex").unwrap() == attr.value {
@@ -92,16 +96,6 @@ impl PitchEncoderBase {
                     PitchStyle::Wide => preset.threshold = -26,
                 }
 
-                continue;
-            }
-
-            if attr.name == "PITCH_KNOB_POSITION" {
-                preset.knob_position = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-
-            if attr.name == "PITCH_RANGE" {
-                preset.range = attr.value.parse::<c_float>()? as u8;
                 continue;
             }
 
@@ -158,15 +152,11 @@ impl PitchEncoderBase {
         let mut attributes = HashMap::new();
         let value = &self.preset_map[preset];
 
-        attributes.insert(
-            "PITCH_KNOB_POSITION".to_string(),
-            format!("{}", value.knob_position),
-        );
+        value.write_numeric(&mut attributes);
         attributes.insert(
             "PITCH_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("PITCH_RANGE".to_string(), format!("{}", value.range));
         attributes.insert(
             "PITCH_SHIFT_THRESHOLD".to_string(),
             format!("{}", value.threshold()),
@@ -378,3 +368,8 @@ pub enum PitchStyle {
     #[strum(props(uiIndex = "1"))]
     Wide,
 }
+
+numeric_attributes!(PitchEncoder {
+    knob_position: i8 = "PITCH_KNOB_POSITION",
+    range: u8 = "PITCH_RANGE",
+});

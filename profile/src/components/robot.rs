@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::raw::c_float;
 
 use enum_map::EnumMap;
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
@@ -74,6 +73,10 @@ impl RobotEffectBase {
     ) -> Result<(), ParseError> {
         let mut preset = RobotEffect::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "robotEffectstate" {
                 preset.state = matches!(attr.value.as_str(), "1");
                 continue;
@@ -91,58 +94,6 @@ impl RobotEffectBase {
             /* Same as Microphone, I haven't seen any random float values in the config for robot
              * but I'm not gonna rule it out.. */
 
-            if attr.name == "ROBOT_SYNTHOSC_PULSEWIDTH" {
-                preset.synthosc_pulse_width = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_SYNTHOSC_WAVEFORM" {
-                preset.synthosc_waveform = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_GATE_THRESHOLD" {
-                preset.vocoder_gate_threshold = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "ROBOT_DRY_MIX" {
-                preset.dry_mix = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_LOW_FREQ" {
-                preset.vocoder_low_freq = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_LOW_GAIN" {
-                preset.vocoder_low_gain = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_LOW_BW" {
-                preset.vocoder_low_bw = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_MID_FREQ" {
-                preset.vocoder_mid_freq = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_MID_GAIN" {
-                preset.vocoder_mid_gain = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_MID_BW" {
-                preset.vocoder_mid_bw = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_HIGH_FREQ" {
-                preset.vocoder_high_freq = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_HIGH_GAIN" {
-                preset.vocoder_high_gain = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "ROBOT_VOCODER_HIGH_BW" {
-                preset.vocoder_high_bw = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
             log::warn!("[RobotEffect] Unparsed Child Attribute: {}", attr.name);
         }
 
@@ -197,55 +148,7 @@ impl RobotEffectBase {
             "ROBOT_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert(
-            "ROBOT_SYNTHOSC_PULSEWIDTH".to_string(),
-            format!("{}", value.synthosc_pulse_width),
-        );
-        attributes.insert(
-            "ROBOT_SYNTHOSC_WAVEFORM".to_string(),
-            format!("{}", value.synthosc_waveform),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_GATE_THRESHOLD".to_string(),
-            format!("{}", value.vocoder_gate_threshold),
-        );
-        attributes.insert("ROBOT_DRY_MIX".to_string(), format!("{}", value.dry_mix));
-        attributes.insert(
-            "ROBOT_VOCODER_LOW_FREQ".to_string(),
-            format!("{}", value.vocoder_low_freq),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_LOW_GAIN".to_string(),
-            format!("{}", value.vocoder_low_gain),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_LOW_BW".to_string(),
-            format!("{}", value.vocoder_low_bw),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_MID_FREQ".to_string(),
-            format!("{}", value.vocoder_mid_freq),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_MID_GAIN".to_string(),
-            format!("{}", value.vocoder_mid_gain),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_MID_BW".to_string(),
-            format!("{}", value.vocoder_mid_bw),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_HIGH_FREQ".to_string(),
-            format!("{}", value.vocoder_high_freq),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_HIGH_GAIN".to_string(),
-            format!("{}", value.vocoder_high_gain),
-        );
-        attributes.insert(
-            "ROBOT_VOCODER_HIGH_BW".to_string(),
-            format!("{}", value.vocoder_high_bw),
-        );
+        value.write_numeric(&mut attributes);
 
         attributes
     }
@@ -571,3 +474,19 @@ impl RobotPresets {
         }
     }
 }
+
+numeric_attributes!(RobotEffect {
+    synthosc_pulse_width: u8 = "ROBOT_SYNTHOSC_PULSEWIDTH",
+    synthosc_waveform: u8 = "ROBOT_SYNTHOSC_WAVEFORM",
+    vocoder_gate_threshold: i8 = "ROBOT_VOCODER_GATE_THRESHOLD",
+    dry_mix: i8 = "ROBOT_DRY_MIX",
+    vocoder_low_freq: u8 = "ROBOT_VOCODER_LOW_FREQ",
+    vocoder_low_gain: i8 = "ROBOT_VOCODER_LOW_GAIN",
+    vocoder_low_bw: u8 = "ROBOT_VOCODER_LOW_BW",
+    vocoder_mid_freq: u8 = "ROBOT_VOCODER_MID_FREQ",
+    vocoder_mid_gain: i8 = "ROBOT_VOCODER_MID_GAIN",
+    vocoder_mid_bw: u8 = "ROBOT_VOCODER_MID_BW",
+    vocoder_high_freq: u8 = "ROBOT_VOCODER_HIGH_FREQ",
+    vocoder_high_gain: i8 = "ROBOT_VOCODER_HIGH_GAIN",
+    vocoder_high_bw: u8 = "ROBOT_VOCODER_HIGH_BW",
+});

@@ -79,6 +79,10 @@ impl ReverbEncoderBase {
     ) -> Result<(), ParseError> {
         let mut preset = ReverbEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "REVERB_STYLE" {
                 for style in ReverbStyle::iter() {
                     if style.get_str("uiIndex").unwrap() == attr.value {
@@ -99,55 +103,6 @@ impl ReverbEncoderBase {
                 };
 
                 preset.knob_position = position;
-                continue;
-            }
-
-            if attr.name == "REVERB_TYPE" {
-                preset.reverb_type = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "REVERB_DECAY" {
-                preset.decay = attr.value.parse::<c_float>()? as u16;
-                continue;
-            }
-            if attr.name == "REVERB_PREDELAY" {
-                preset.pre_delay = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "REVERB_DIFFUSE" {
-                preset.diffuse = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_LOCOLOR" {
-                preset.low_color = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_HICOLOR" {
-                preset.high_color = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_HIFACTOR" {
-                preset.high_factor = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_MODSPEED" {
-                preset.mod_speed = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_MODDEPTH" {
-                preset.mod_depth = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_EARLYLEVEL" {
-                preset.early_level = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_TAILLEVEL" {
-                preset.tail_level = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_DRYLEVEL" {
-                preset.dry_level = attr.value.parse::<c_float>()? as i8;
                 continue;
             }
 
@@ -203,42 +158,7 @@ impl ReverbEncoderBase {
             "REVERB_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("REVERB_TYPE".to_string(), format!("{}", value.reverb_type));
-        attributes.insert("REVERB_DECAY".to_string(), format!("{}", value.decay));
-        attributes.insert(
-            "REVERB_PREDELAY".to_string(),
-            format!("{}", value.pre_delay),
-        );
-        attributes.insert("REVERB_DIFFUSE".to_string(), format!("{}", value.diffuse));
-        attributes.insert("REVERB_LOCOLOR".to_string(), format!("{}", value.low_color));
-        attributes.insert(
-            "REVERB_HICOLOR".to_string(),
-            format!("{}", value.high_color),
-        );
-        attributes.insert(
-            "REVERB_HIFACTOR".to_string(),
-            format!("{}", value.high_factor),
-        );
-        attributes.insert(
-            "REVERB_MODSPEED".to_string(),
-            format!("{}", value.mod_speed),
-        );
-        attributes.insert(
-            "REVERB_MODDEPTH".to_string(),
-            format!("{}", value.mod_depth),
-        );
-        attributes.insert(
-            "REVERB_EARLYLEVEL".to_string(),
-            format!("{}", value.early_level),
-        );
-        attributes.insert(
-            "REVERB_TAILLEVEL".to_string(),
-            format!("{}", value.tail_level),
-        );
-        attributes.insert(
-            "REVERB_DRYLEVEL".to_string(),
-            format!("{}", value.dry_level),
-        );
+        value.write_numeric(&mut attributes);
 
         attributes
     }
@@ -625,3 +545,18 @@ impl ReverbPreset {
         }
     }
 }
+
+numeric_attributes!(ReverbEncoder {
+    reverb_type: u8 = "REVERB_TYPE",
+    decay: u16 = "REVERB_DECAY",
+    pre_delay: u8 = "REVERB_PREDELAY",
+    diffuse: i8 = "REVERB_DIFFUSE",
+    low_color: i8 = "REVERB_LOCOLOR",
+    high_color: i8 = "REVERB_HICOLOR",
+    high_factor: i8 = "REVERB_HIFACTOR",
+    mod_speed: i8 = "REVERB_MODSPEED",
+    mod_depth: i8 = "REVERB_MODDEPTH",
+    early_level: i8 = "REVERB_EARLYLEVEL",
+    tail_level: i8 = "REVERB_TAILLEVEL",
+    dry_level: i8 = "REVERB_DRYLEVEL",
+});

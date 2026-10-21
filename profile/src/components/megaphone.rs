@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::raw::c_float;
 
 use enum_map::EnumMap;
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
@@ -74,6 +73,10 @@ impl MegaphoneEffectBase {
     ) -> Result<(), ParseError> {
         let mut preset = MegaphoneEffect::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "megaphoneEffectstate" {
                 preset.state = matches!(attr.value.as_str(), "1");
                 continue;
@@ -95,60 +98,8 @@ impl MegaphoneEffectBase {
              * across to their correct type.
              */
 
-            if attr.name == "TRANS_DIST_AMT" {
-                preset.trans_dist_amt = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_HP" {
-                preset.trans_hp = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_LP" {
-                preset.trans_lp = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_PREGAIN" {
-                preset.trans_pregain = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_POSTGAIN" {
-                preset.trans_postgain = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "TRANS_DIST_TYPE" {
-                preset.trans_dist_type = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_PRESENCE_GAIN" {
-                preset.trans_presence_gain = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_PRESENCE_FC" {
-                preset.trans_presence_fc = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_PRESENCE_BW" {
-                preset.trans_presence_bw = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
             if attr.name == "TRANS_BEATBOX_ENABLE" {
                 preset.trans_beatbox_enabled = attr.value != "0";
-                continue;
-            }
-            if attr.name == "TRANS_FILTER_CONTROL" {
-                preset.trans_filter_control = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_FILTER" {
-                preset.trans_filter = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_DRIVE_POT_GAIN_COMP_MID" {
-                preset.trans_drive_pot_gain_comp_mid = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "TRANS_DRIVE_POT_GAIN_COMP_MAX" {
-                preset.trans_drive_pot_gain_comp_max = attr.value.parse::<c_float>()? as u8;
                 continue;
             }
             log::warn!("[MegaphoneEffect] Unparsed Child Attribute: {}", attr.name);
@@ -204,36 +155,7 @@ impl MegaphoneEffectBase {
             "MEGAPHONE_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert(
-            "TRANS_DIST_AMT".to_string(),
-            format!("{}", value.trans_dist_amt),
-        );
-        attributes.insert("TRANS_HP".to_string(), format!("{}", value.trans_hp));
-        attributes.insert("TRANS_LP".to_string(), format!("{}", value.trans_lp));
-        attributes.insert(
-            "TRANS_PREGAIN".to_string(),
-            format!("{}", value.trans_pregain),
-        );
-        attributes.insert(
-            "TRANS_POSTGAIN".to_string(),
-            format!("{}", value.trans_postgain),
-        );
-        attributes.insert(
-            "TRANS_DIST_TYPE".to_string(),
-            format!("{}", value.trans_dist_type),
-        );
-        attributes.insert(
-            "TRANS_PRESENCE_GAIN".to_string(),
-            format!("{}", value.trans_presence_gain),
-        );
-        attributes.insert(
-            "TRANS_PRESENCE_FC".to_string(),
-            format!("{}", value.trans_presence_fc),
-        );
-        attributes.insert(
-            "TRANS_PRESENCE_BW".to_string(),
-            format!("{}", value.trans_presence_bw),
-        );
+        value.write_numeric(&mut attributes);
         attributes.insert(
             "TRANS_BEATBOX_ENABLE".to_string(),
             if value.trans_beatbox_enabled {
@@ -241,22 +163,6 @@ impl MegaphoneEffectBase {
             } else {
                 "0".to_string()
             },
-        );
-        attributes.insert(
-            "TRANS_FILTER_CONTROL".to_string(),
-            format!("{}", value.trans_filter_control),
-        );
-        attributes.insert(
-            "TRANS_FILTER".to_string(),
-            format!("{}", value.trans_filter),
-        );
-        attributes.insert(
-            "TRANS_DRIVE_POT_GAIN_COMP_MID".to_string(),
-            format!("{}", value.trans_drive_pot_gain_comp_mid),
-        );
-        attributes.insert(
-            "TRANS_DRIVE_POT_GAIN_COMP_MAX".to_string(),
-            format!("{}", value.trans_drive_pot_gain_comp_max),
         );
 
         attributes
@@ -611,3 +517,19 @@ impl MegaphonePreset {
         }
     }
 }
+
+numeric_attributes!(MegaphoneEffect {
+    trans_dist_amt: u8 = "TRANS_DIST_AMT",
+    trans_hp: u8 = "TRANS_HP",
+    trans_lp: u8 = "TRANS_LP",
+    trans_pregain: u8 = "TRANS_PREGAIN",
+    trans_postgain: i8 = "TRANS_POSTGAIN",
+    trans_dist_type: u8 = "TRANS_DIST_TYPE",
+    trans_presence_gain: u8 = "TRANS_PRESENCE_GAIN",
+    trans_presence_fc: u8 = "TRANS_PRESENCE_FC",
+    trans_presence_bw: u8 = "TRANS_PRESENCE_BW",
+    trans_filter_control: u8 = "TRANS_FILTER_CONTROL",
+    trans_filter: u8 = "TRANS_FILTER",
+    trans_drive_pot_gain_comp_mid: u8 = "TRANS_DRIVE_POT_GAIN_COMP_MID",
+    trans_drive_pot_gain_comp_max: u8 = "TRANS_DRIVE_POT_GAIN_COMP_MAX",
+});

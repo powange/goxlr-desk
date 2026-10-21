@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::raw::c_float;
 use std::str::FromStr;
 
 use enum_map::EnumMap;
@@ -84,6 +83,10 @@ impl HardtuneEffectBase {
     ) -> Result<(), ParseError> {
         let mut preset = HardTuneEffect::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "hardtuneEffectstate" {
                 preset.state = matches!(attr.value.as_str(), "1");
                 continue;
@@ -98,30 +101,6 @@ impl HardtuneEffectBase {
                 continue;
             }
 
-            if attr.name == "HARDTUNE_KEYSOURCE" {
-                preset.key_source = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_AMOUNT" {
-                preset.amount = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_WINDOW" {
-                preset.window = attr.value.parse::<c_float>()? as u16;
-                continue;
-            }
-            if attr.name == "HARDTUNE_RATE" {
-                preset.rate = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_SCALE" {
-                preset.scale = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_PITCH_AMT" {
-                preset.pitch_amt = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
             if attr.name == "HARDTUNE_SOURCE" {
                 preset.source = Some(HardTuneSource::from_str(&attr.value)?);
                 continue;
@@ -182,18 +161,7 @@ impl HardtuneEffectBase {
             "HARDTUNE_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert(
-            "HARDTUNE_KEYSOURCE".to_string(),
-            format!("{}", value.key_source),
-        );
-        attributes.insert("HARDTUNE_AMOUNT".to_string(), format!("{}", value.amount));
-        attributes.insert("HARDTUNE_WINDOW".to_string(), format!("{}", value.window));
-        attributes.insert("HARDTUNE_RATE".to_string(), format!("{}", value.rate));
-        attributes.insert("HARDTUNE_SCALE".to_string(), format!("{}", value.scale));
-        attributes.insert(
-            "HARDTUNE_PITCH_AMT".to_string(),
-            format!("{}", value.pitch_amt),
-        );
+        value.write_numeric(&mut attributes);
 
         if let Some(source) = &value.source {
             attributes.insert("HARDTUNE_SOURCE".to_string(), source.to_string());
@@ -415,3 +383,12 @@ impl HardtunePreset {
         }
     }
 }
+
+numeric_attributes!(HardTuneEffect {
+    key_source: u8 = "HARDTUNE_KEYSOURCE",
+    amount: u8 = "HARDTUNE_AMOUNT",
+    window: u16 = "HARDTUNE_WINDOW",
+    rate: u8 = "HARDTUNE_RATE",
+    scale: u8 = "HARDTUNE_SCALE",
+    pitch_amt: u8 = "HARDTUNE_PITCH_AMT",
+});

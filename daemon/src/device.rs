@@ -49,6 +49,36 @@ use crate::profile_store::load_with_backup;
 use crate::profile_trash::trash_profile;
 use crate::sample_trash::TrashedTrack;
 
+/// Sets one effect value in the active profile, then sends it to the GoXLR:
+/// `set_effect!(self.reverb.set_decay_millis(value) => ReverbDecay)`
+macro_rules! set_effect {
+    ($self:ident . reverb . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_reverb_profile_mut, $setter, $value, $key)
+    };
+    ($self:ident . echo . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_echo_profile_mut, $setter, $value, $key)
+    };
+    ($self:ident . pitch . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_pitch_profile_mut, $setter, $value, $key)
+    };
+    ($self:ident . gender . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_gender_profile_mut, $setter, $value, $key)
+    };
+    ($self:ident . megaphone . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_megaphone_profile_mut, $setter, $value, $key)
+    };
+    ($self:ident . robot . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_robot_profile_mut, $setter, $value, $key)
+    };
+    ($self:ident . hardtune . $setter:ident ($value:expr) => $key:ident) => {
+        set_effect!(@ $self, get_active_hardtune_profile_mut, $setter, $value, $key)
+    };
+    (@ $self:ident, $effect:ident, $setter:ident, $value:expr, $key:ident) => {{
+        $self.profile.$effect().$setter($value)?;
+        $self.apply_effect(EffectKey::$key)?;
+    }};
+}
+
 pub struct Device<'a> {
     goxlr: Box<dyn FullGoXLRDevice>,
     hardware: HardwareStatus,
@@ -663,52 +693,19 @@ impl<'a> Device<'a> {
             Buttons::Bleep => {
                 self.handle_swear_button(false).await?;
             }
-            Buttons::EffectSelect1 => {
-                if self.profile.get_active_effect_bank() != EffectBankPresets::Preset1 {
-                    self.load_effect_bank(EffectBankPresets::Preset1).await?;
-                    self.tap_tempo.clear();
-                } else {
-                    self.handle_tempo_tap().await?;
-                }
-            }
-            Buttons::EffectSelect2 => {
-                if self.profile.get_active_effect_bank() != EffectBankPresets::Preset2 {
-                    self.load_effect_bank(EffectBankPresets::Preset2).await?;
-                    self.tap_tempo.clear();
-                } else {
-                    self.handle_tempo_tap().await?;
-                }
-            }
-            Buttons::EffectSelect3 => {
-                if self.profile.get_active_effect_bank() != EffectBankPresets::Preset3 {
-                    self.load_effect_bank(EffectBankPresets::Preset3).await?;
-                    self.tap_tempo.clear();
-                } else {
-                    self.handle_tempo_tap().await?;
-                }
-            }
-            Buttons::EffectSelect4 => {
-                if self.profile.get_active_effect_bank() != EffectBankPresets::Preset4 {
-                    self.load_effect_bank(EffectBankPresets::Preset4).await?;
-                    self.tap_tempo.clear();
-                } else {
-                    self.handle_tempo_tap().await?;
-                }
-            }
-            Buttons::EffectSelect5 => {
-                if self.profile.get_active_effect_bank() != EffectBankPresets::Preset5 {
-                    self.load_effect_bank(EffectBankPresets::Preset5).await?;
-                    self.tap_tempo.clear();
-                } else {
-                    self.handle_tempo_tap().await?;
-                }
-            }
-            Buttons::EffectSelect6 => {
-                if self.profile.get_active_effect_bank() != EffectBankPresets::Preset6 {
-                    self.load_effect_bank(EffectBankPresets::Preset6).await?;
-                    self.tap_tempo.clear();
-                } else {
-                    self.handle_tempo_tap().await?;
+            Buttons::EffectSelect1
+            | Buttons::EffectSelect2
+            | Buttons::EffectSelect3
+            | Buttons::EffectSelect4
+            | Buttons::EffectSelect5
+            | Buttons::EffectSelect6 => {
+                if let Some(preset) = effect_bank_for(button) {
+                    if self.profile.get_active_effect_bank() != preset {
+                        self.load_effect_bank(preset).await?;
+                        self.tap_tempo.clear();
+                    } else {
+                        self.handle_tempo_tap().await?;
+                    }
                 }
             }
 
@@ -1921,6 +1918,52 @@ impl<'a> Device<'a> {
 
     async fn perform_command_inner(&mut self, command: GoXLRCommand) -> Result<()> {
         match command {
+            // The effect settings
+            command @ (GoXLRCommand::SetReverbStyle(_)
+            | GoXLRCommand::SetReverbAmount(_)
+            | GoXLRCommand::SetReverbDecay(_)
+            | GoXLRCommand::SetReverbEarlyLevel(_)
+            | GoXLRCommand::SetReverbTailLevel(_)
+            | GoXLRCommand::SetReverbPreDelay(_)
+            | GoXLRCommand::SetReverbLowColour(_)
+            | GoXLRCommand::SetReverbHighColour(_)
+            | GoXLRCommand::SetReverbHighFactor(_)
+            | GoXLRCommand::SetReverbDiffuse(_)
+            | GoXLRCommand::SetReverbModSpeed(_)
+            | GoXLRCommand::SetReverbModDepth(_)
+            | GoXLRCommand::SetEchoStyle(_)
+            | GoXLRCommand::SetEchoAmount(_)
+            | GoXLRCommand::SetEchoFeedback(_)
+            | GoXLRCommand::SetEchoTempo(_)
+            | GoXLRCommand::SetEchoDelayLeft(_)
+            | GoXLRCommand::SetEchoDelayRight(_)
+            | GoXLRCommand::SetEchoFeedbackLeft(_)
+            | GoXLRCommand::SetEchoFeedbackRight(_)
+            | GoXLRCommand::SetEchoFeedbackXFBRtoL(_)
+            | GoXLRCommand::SetEchoFeedbackXFBLtoR(_)
+            | GoXLRCommand::SetPitchStyle(_)
+            | GoXLRCommand::SetPitchAmount(_)
+            | GoXLRCommand::SetPitchCharacter(_)
+            | GoXLRCommand::SetGenderStyle(_)
+            | GoXLRCommand::SetGenderAmount(_)
+            | GoXLRCommand::SetMegaphoneStyle(_)
+            | GoXLRCommand::SetMegaphoneAmount(_)
+            | GoXLRCommand::SetMegaphonePostGain(_)
+            | GoXLRCommand::SetRobotStyle(_)
+            | GoXLRCommand::SetRobotGain(_, _)
+            | GoXLRCommand::SetRobotFreq(_, _)
+            | GoXLRCommand::SetRobotWidth(_, _)
+            | GoXLRCommand::SetRobotWaveform(_)
+            | GoXLRCommand::SetRobotPulseWidth(_)
+            | GoXLRCommand::SetRobotThreshold(_)
+            | GoXLRCommand::SetRobotDryMix(_)
+            | GoXLRCommand::SetHardTuneStyle(_)
+            | GoXLRCommand::SetHardTuneAmount(_)
+            | GoXLRCommand::SetHardTuneRate(_)
+            | GoXLRCommand::SetHardTuneWindow(_)) => {
+                self.perform_effect_command(command)?;
+            }
+
             GoXLRCommand::SetShutdownCommands(commands) => {
                 self.settings
                     .set_device_shutdown_commands(self.serial(), commands)
@@ -2337,316 +2380,6 @@ impl<'a> Device<'a> {
                 self.profile.write_preset(name, &preset_directory)?;
             }
 
-            // Reverb
-            GoXLRCommand::SetReverbStyle(style) => {
-                self.profile.set_reverb_style(style)?;
-                self.apply_effects(self.mic_profile.get_reverb_keyset())?;
-            }
-            GoXLRCommand::SetReverbAmount(amount) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_percentage_amount(amount)?;
-
-                let encoder_value = self.profile.get_reverb_value();
-                self.goxlr
-                    .set_encoder_value(EncoderName::Reverb, encoder_value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbAmount]))?;
-            }
-            GoXLRCommand::SetReverbDecay(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_decay_millis(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbDecay]))?;
-            }
-            GoXLRCommand::SetReverbEarlyLevel(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_early_level(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbEarlyLevel]))?;
-            }
-            GoXLRCommand::SetReverbTailLevel(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_tail_level(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbTailLevel]))?;
-            }
-            GoXLRCommand::SetReverbPreDelay(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_predelay(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbPredelay]))?;
-            }
-            GoXLRCommand::SetReverbLowColour(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_low_color(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbLowColor]))?;
-            }
-            GoXLRCommand::SetReverbHighColour(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_hi_color(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbHighColor]))?;
-            }
-            GoXLRCommand::SetReverbHighFactor(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_hi_factor(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbHighFactor]))?;
-            }
-            GoXLRCommand::SetReverbDiffuse(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_diffuse(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbDiffuse]))?;
-            }
-            GoXLRCommand::SetReverbModSpeed(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_mod_speed(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbModSpeed]))?;
-            }
-            GoXLRCommand::SetReverbModDepth(value) => {
-                self.profile
-                    .get_active_reverb_profile_mut()
-                    .set_mod_depth(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::ReverbModDepth]))?;
-            }
-
-            // Echo..
-            GoXLRCommand::SetEchoStyle(value) => {
-                self.profile.set_echo_style(value)?;
-                self.apply_effects(
-                    self.mic_profile
-                        .get_echo_keyset(self.profile.has_echo_tempo()),
-                )?;
-            }
-            GoXLRCommand::SetEchoAmount(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_percentage_value(value)?;
-
-                let encoder_value = self.profile.get_echo_value();
-                self.goxlr
-                    .set_encoder_value(EncoderName::Echo, encoder_value)?;
-
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoAmount]))?;
-            }
-            GoXLRCommand::SetEchoFeedback(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_feedback(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoFeedback]))?;
-            }
-            GoXLRCommand::SetEchoTempo(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_tempo(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoTempo]))?;
-            }
-            GoXLRCommand::SetEchoDelayLeft(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_time_left(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoDelayL]))?;
-            }
-            GoXLRCommand::SetEchoDelayRight(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_time_right(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoDelayR]))?;
-            }
-            GoXLRCommand::SetEchoFeedbackLeft(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_feedback_left(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoFeedbackL]))?;
-            }
-            GoXLRCommand::SetEchoFeedbackRight(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_feedback_right(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoFeedbackR]))?;
-            }
-            GoXLRCommand::SetEchoFeedbackXFBRtoL(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_xfb_r_to_l(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoXFBRtoL]))?;
-            }
-            GoXLRCommand::SetEchoFeedbackXFBLtoR(value) => {
-                self.profile
-                    .get_active_echo_profile_mut()
-                    .set_xfb_l_to_r(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::EchoXFBLtoR]))?;
-            }
-
-            // Pitch
-            GoXLRCommand::SetPitchStyle(value) => {
-                self.profile.set_pitch_style(value)?;
-                self.set_pitch_mode()?;
-
-                // Force set the encoder position, when going from Wide -> Narrow, the encoder
-                // will still return it's 'Wide' value during polls which error out otherwise.
-                let value = self.profile.get_pitch_encoder_position();
-                self.goxlr.set_encoder_value(EncoderName::Pitch, value)?;
-
-                // Update the pitch 'Threshold' value which may have changed..
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::PitchThreshold]))?;
-            }
-            GoXLRCommand::SetPitchAmount(value) => {
-                let hard_tune_enabled = self.profile.is_hardtune_enabled(true);
-                self.profile
-                    .get_active_pitch_profile_mut()
-                    .set_knob_position(value, hard_tune_enabled)?;
-
-                let value = self.profile.get_pitch_encoder_position();
-                self.goxlr.set_encoder_value(EncoderName::Pitch, value)?;
-
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::PitchAmount]))?;
-            }
-            GoXLRCommand::SetPitchCharacter(value) => {
-                self.profile
-                    .get_active_pitch_profile_mut()
-                    .set_inst_ratio(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::PitchCharacter]))?;
-            }
-
-            // Gender
-            GoXLRCommand::SetGenderStyle(value) => {
-                self.profile.set_gender_style(value)?;
-                self.apply_effects(self.mic_profile.get_gender_keyset())?;
-            }
-            GoXLRCommand::SetGenderAmount(value) => {
-                self.profile
-                    .get_active_gender_profile_mut()
-                    .set_amount(value)?;
-                let value = self.profile.get_gender_value();
-                self.goxlr.set_encoder_value(EncoderName::Gender, value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GenderAmount]))?;
-            }
-
-            GoXLRCommand::SetMegaphoneStyle(value) => {
-                self.profile.set_megaphone_style(value)?;
-                self.apply_effects(self.mic_profile.get_megaphone_keyset())?;
-            }
-            GoXLRCommand::SetMegaphoneAmount(value) => {
-                self.profile
-                    .get_active_megaphone_profile_mut()
-                    .set_trans_dist_amt(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::MegaphoneAmount]))?;
-            }
-            GoXLRCommand::SetMegaphonePostGain(value) => {
-                self.profile
-                    .get_active_megaphone_profile_mut()
-                    .set_trans_postgain(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::MegaphonePostGain]))?;
-            }
-
-            // Robot
-            GoXLRCommand::SetRobotStyle(value) => {
-                self.profile.set_robot_style(value)?;
-                self.apply_effects(self.mic_profile.get_robot_keyset())?;
-            }
-            GoXLRCommand::SetRobotGain(range, value) => {
-                let profile = self.profile.get_active_robot_profile_mut();
-                match range {
-                    RobotRange::Low => {
-                        profile.set_vocoder_low_gain(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotLowGain]))?;
-                    }
-                    RobotRange::Medium => {
-                        profile.set_vocoder_mid_gain(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotMidGain]))?;
-                    }
-                    RobotRange::High => {
-                        profile.set_vocoder_high_gain(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotHiGain]))?;
-                    }
-                }
-            }
-            GoXLRCommand::SetRobotFreq(range, value) => {
-                let profile = self.profile.get_active_robot_profile_mut();
-                match range {
-                    RobotRange::Low => {
-                        profile.set_vocoder_low_freq(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotLowFreq]))?;
-                    }
-                    RobotRange::Medium => {
-                        profile.set_vocoder_mid_freq(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotMidFreq]))?;
-                    }
-                    RobotRange::High => {
-                        profile.set_vocoder_high_freq(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotHiFreq]))?;
-                    }
-                }
-            }
-            GoXLRCommand::SetRobotWidth(range, value) => {
-                let profile = self.profile.get_active_robot_profile_mut();
-                match range {
-                    RobotRange::Low => {
-                        profile.set_vocoder_low_bw(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotLowWidth]))?;
-                    }
-                    RobotRange::Medium => {
-                        profile.set_vocoder_mid_bw(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotMidWidth]))?;
-                    }
-                    RobotRange::High => {
-                        profile.set_vocoder_high_bw(value)?;
-                        self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotHiWidth]))?;
-                    }
-                }
-            }
-            GoXLRCommand::SetRobotWaveform(value) => {
-                self.profile
-                    .get_active_robot_profile_mut()
-                    .set_synthosc_waveform(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotWaveform]))?;
-            }
-            GoXLRCommand::SetRobotPulseWidth(value) => {
-                self.profile
-                    .get_active_robot_profile_mut()
-                    .set_synthosc_pulse_width(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotPulseWidth]))?;
-            }
-            GoXLRCommand::SetRobotThreshold(value) => {
-                self.profile
-                    .get_active_robot_profile_mut()
-                    .set_vocoder_gate_threshold(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotThreshold]))?;
-            }
-            GoXLRCommand::SetRobotDryMix(value) => {
-                self.profile
-                    .get_active_robot_profile_mut()
-                    .set_dry_mix(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::RobotDryMix]))?;
-            }
-
-            // Hard Tune
-            GoXLRCommand::SetHardTuneStyle(value) => {
-                self.profile.set_hardtune_style(value)?;
-                self.apply_effects(self.mic_profile.get_hardtune_keyset())?;
-            }
-            GoXLRCommand::SetHardTuneAmount(value) => {
-                self.profile
-                    .get_active_hardtune_profile_mut()
-                    .set_amount(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::HardTuneAmount]))?;
-            }
-            GoXLRCommand::SetHardTuneRate(value) => {
-                self.profile
-                    .get_active_hardtune_profile_mut()
-                    .set_rate(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::HardTuneRate]))?;
-            }
-            GoXLRCommand::SetHardTuneWindow(value) => {
-                self.profile
-                    .get_active_hardtune_profile_mut()
-                    .set_window(value)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::HardTuneWindow]))?;
-            }
             GoXLRCommand::SetHardTuneSource(value) => {
                 if self.profile.get_hardtune_source() == value {
                     // Do nothing, we're already there.
@@ -3179,6 +2912,242 @@ impl<'a> Device<'a> {
                 // Make sure to switch Headphones from A to B if needed.
                 self.load_submix_settings(false).await?;
             }
+        }
+        Ok(())
+    }
+
+    /// The effect settings (reverb, echo, pitch, gender, megaphone, robot, hard tune): change the
+    /// value in the active profile, then send it.
+    fn perform_effect_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            // Reverb
+            GoXLRCommand::SetReverbStyle(style) => {
+                self.profile.set_reverb_style(style)?;
+                self.apply_effects(self.mic_profile.get_reverb_keyset())?;
+            }
+            GoXLRCommand::SetReverbAmount(amount) => {
+                self.profile
+                    .get_active_reverb_profile_mut()
+                    .set_percentage_amount(amount)?;
+
+                let encoder_value = self.profile.get_reverb_value();
+                self.goxlr
+                    .set_encoder_value(EncoderName::Reverb, encoder_value)?;
+                self.apply_effect(EffectKey::ReverbAmount)?;
+            }
+            GoXLRCommand::SetReverbDecay(v) => {
+                set_effect!(self.reverb.set_decay_millis(v) => ReverbDecay)
+            }
+            GoXLRCommand::SetReverbEarlyLevel(v) => {
+                set_effect!(self.reverb.set_early_level(v) => ReverbEarlyLevel)
+            }
+            GoXLRCommand::SetReverbTailLevel(v) => {
+                set_effect!(self.reverb.set_tail_level(v) => ReverbTailLevel)
+            }
+            GoXLRCommand::SetReverbPreDelay(v) => {
+                set_effect!(self.reverb.set_predelay(v) => ReverbPredelay)
+            }
+            GoXLRCommand::SetReverbLowColour(v) => {
+                set_effect!(self.reverb.set_low_color(v) => ReverbLowColor)
+            }
+            GoXLRCommand::SetReverbHighColour(v) => {
+                set_effect!(self.reverb.set_hi_color(v) => ReverbHighColor)
+            }
+            GoXLRCommand::SetReverbHighFactor(v) => {
+                set_effect!(self.reverb.set_hi_factor(v) => ReverbHighFactor)
+            }
+            GoXLRCommand::SetReverbDiffuse(v) => {
+                set_effect!(self.reverb.set_diffuse(v) => ReverbDiffuse)
+            }
+            GoXLRCommand::SetReverbModSpeed(v) => {
+                set_effect!(self.reverb.set_mod_speed(v) => ReverbModSpeed)
+            }
+            GoXLRCommand::SetReverbModDepth(v) => {
+                set_effect!(self.reverb.set_mod_depth(v) => ReverbModDepth)
+            }
+
+            // Echo..
+            GoXLRCommand::SetEchoStyle(value) => {
+                self.profile.set_echo_style(value)?;
+                self.apply_effects(
+                    self.mic_profile
+                        .get_echo_keyset(self.profile.has_echo_tempo()),
+                )?;
+            }
+            GoXLRCommand::SetEchoAmount(value) => {
+                self.profile
+                    .get_active_echo_profile_mut()
+                    .set_percentage_value(value)?;
+
+                let encoder_value = self.profile.get_echo_value();
+                self.goxlr
+                    .set_encoder_value(EncoderName::Echo, encoder_value)?;
+
+                self.apply_effect(EffectKey::EchoAmount)?;
+            }
+            GoXLRCommand::SetEchoFeedback(v) => {
+                set_effect!(self.echo.set_feedback(v) => EchoFeedback)
+            }
+            GoXLRCommand::SetEchoTempo(v) => set_effect!(self.echo.set_tempo(v) => EchoTempo),
+            GoXLRCommand::SetEchoDelayLeft(v) => {
+                set_effect!(self.echo.set_time_left(v) => EchoDelayL)
+            }
+            GoXLRCommand::SetEchoDelayRight(v) => {
+                set_effect!(self.echo.set_time_right(v) => EchoDelayR)
+            }
+            GoXLRCommand::SetEchoFeedbackLeft(v) => {
+                set_effect!(self.echo.set_feedback_left(v) => EchoFeedbackL)
+            }
+            GoXLRCommand::SetEchoFeedbackRight(v) => {
+                set_effect!(self.echo.set_feedback_right(v) => EchoFeedbackR)
+            }
+            GoXLRCommand::SetEchoFeedbackXFBRtoL(v) => {
+                set_effect!(self.echo.set_xfb_r_to_l(v) => EchoXFBRtoL)
+            }
+            GoXLRCommand::SetEchoFeedbackXFBLtoR(v) => {
+                set_effect!(self.echo.set_xfb_l_to_r(v) => EchoXFBLtoR)
+            }
+
+            // Pitch
+            GoXLRCommand::SetPitchStyle(value) => {
+                self.profile.set_pitch_style(value)?;
+                self.set_pitch_mode()?;
+
+                // Force set the encoder position, when going from Wide -> Narrow, the encoder
+                // will still return it's 'Wide' value during polls which error out otherwise.
+                let value = self.profile.get_pitch_encoder_position();
+                self.goxlr.set_encoder_value(EncoderName::Pitch, value)?;
+
+                // Update the pitch 'Threshold' value which may have changed..
+                self.apply_effect(EffectKey::PitchThreshold)?;
+            }
+            GoXLRCommand::SetPitchAmount(value) => {
+                let hard_tune_enabled = self.profile.is_hardtune_enabled(true);
+                self.profile
+                    .get_active_pitch_profile_mut()
+                    .set_knob_position(value, hard_tune_enabled)?;
+
+                let value = self.profile.get_pitch_encoder_position();
+                self.goxlr.set_encoder_value(EncoderName::Pitch, value)?;
+
+                self.apply_effect(EffectKey::PitchAmount)?;
+            }
+            GoXLRCommand::SetPitchCharacter(v) => {
+                set_effect!(self.pitch.set_inst_ratio(v) => PitchCharacter)
+            }
+
+            // Gender
+            GoXLRCommand::SetGenderStyle(value) => {
+                self.profile.set_gender_style(value)?;
+                self.apply_effects(self.mic_profile.get_gender_keyset())?;
+            }
+            GoXLRCommand::SetGenderAmount(value) => {
+                self.profile
+                    .get_active_gender_profile_mut()
+                    .set_amount(value)?;
+                let value = self.profile.get_gender_value();
+                self.goxlr.set_encoder_value(EncoderName::Gender, value)?;
+                self.apply_effect(EffectKey::GenderAmount)?;
+            }
+
+            GoXLRCommand::SetMegaphoneStyle(value) => {
+                self.profile.set_megaphone_style(value)?;
+                self.apply_effects(self.mic_profile.get_megaphone_keyset())?;
+            }
+            GoXLRCommand::SetMegaphoneAmount(v) => {
+                set_effect!(self.megaphone.set_trans_dist_amt(v) => MegaphoneAmount)
+            }
+            GoXLRCommand::SetMegaphonePostGain(v) => {
+                set_effect!(self.megaphone.set_trans_postgain(v) => MegaphonePostGain)
+            }
+
+            // Robot
+            GoXLRCommand::SetRobotStyle(value) => {
+                self.profile.set_robot_style(value)?;
+                self.apply_effects(self.mic_profile.get_robot_keyset())?;
+            }
+            GoXLRCommand::SetRobotGain(range, value) => {
+                let profile = self.profile.get_active_robot_profile_mut();
+                let key = match range {
+                    RobotRange::Low => {
+                        profile.set_vocoder_low_gain(value)?;
+                        EffectKey::RobotLowGain
+                    }
+                    RobotRange::Medium => {
+                        profile.set_vocoder_mid_gain(value)?;
+                        EffectKey::RobotMidGain
+                    }
+                    RobotRange::High => {
+                        profile.set_vocoder_high_gain(value)?;
+                        EffectKey::RobotHiGain
+                    }
+                };
+                self.apply_effect(key)?;
+            }
+            GoXLRCommand::SetRobotFreq(range, value) => {
+                let profile = self.profile.get_active_robot_profile_mut();
+                let key = match range {
+                    RobotRange::Low => {
+                        profile.set_vocoder_low_freq(value)?;
+                        EffectKey::RobotLowFreq
+                    }
+                    RobotRange::Medium => {
+                        profile.set_vocoder_mid_freq(value)?;
+                        EffectKey::RobotMidFreq
+                    }
+                    RobotRange::High => {
+                        profile.set_vocoder_high_freq(value)?;
+                        EffectKey::RobotHiFreq
+                    }
+                };
+                self.apply_effect(key)?;
+            }
+            GoXLRCommand::SetRobotWidth(range, value) => {
+                let profile = self.profile.get_active_robot_profile_mut();
+                let key = match range {
+                    RobotRange::Low => {
+                        profile.set_vocoder_low_bw(value)?;
+                        EffectKey::RobotLowWidth
+                    }
+                    RobotRange::Medium => {
+                        profile.set_vocoder_mid_bw(value)?;
+                        EffectKey::RobotMidWidth
+                    }
+                    RobotRange::High => {
+                        profile.set_vocoder_high_bw(value)?;
+                        EffectKey::RobotHiWidth
+                    }
+                };
+                self.apply_effect(key)?;
+            }
+            GoXLRCommand::SetRobotWaveform(v) => {
+                set_effect!(self.robot.set_synthosc_waveform(v) => RobotWaveform)
+            }
+            GoXLRCommand::SetRobotPulseWidth(v) => {
+                set_effect!(self.robot.set_synthosc_pulse_width(v) => RobotPulseWidth)
+            }
+            GoXLRCommand::SetRobotThreshold(v) => {
+                set_effect!(self.robot.set_vocoder_gate_threshold(v) => RobotThreshold)
+            }
+            GoXLRCommand::SetRobotDryMix(v) => {
+                set_effect!(self.robot.set_dry_mix(v) => RobotDryMix)
+            }
+
+            // Hard Tune
+            GoXLRCommand::SetHardTuneStyle(value) => {
+                self.profile.set_hardtune_style(value)?;
+                self.apply_effects(self.mic_profile.get_hardtune_keyset())?;
+            }
+            GoXLRCommand::SetHardTuneAmount(v) => {
+                set_effect!(self.hardtune.set_amount(v) => HardTuneAmount)
+            }
+            GoXLRCommand::SetHardTuneRate(v) => {
+                set_effect!(self.hardtune.set_rate(v) => HardTuneRate)
+            }
+            GoXLRCommand::SetHardTuneWindow(v) => {
+                set_effect!(self.hardtune.set_window(v) => HardTuneWindow)
+            }
+            other => bail!("Not an effect command: {:?}", other),
         }
         Ok(())
     }
@@ -3963,6 +3932,10 @@ impl<'a> Device<'a> {
         Ok(())
     }
 
+    fn apply_effect(&mut self, key: EffectKey) -> Result<()> {
+        self.apply_effects(LinkedHashSet::from_iter([key]))
+    }
+
     fn apply_effects(&mut self, params: LinkedHashSet<EffectKey>) -> Result<()> {
         let mut vec = Vec::new();
         for effect in params {
@@ -4381,4 +4354,17 @@ fn scene_command_allowed(command: &GoXLRCommand) -> bool {
             | GoXLRCommand::RenameMicProfile(..)
             | GoXLRCommand::DuplicateMicProfile(..)
     )
+}
+
+/// The effect preset an Effect Select button switches to.
+fn effect_bank_for(button: Buttons) -> Option<EffectBankPresets> {
+    match button {
+        Buttons::EffectSelect1 => Some(EffectBankPresets::Preset1),
+        Buttons::EffectSelect2 => Some(EffectBankPresets::Preset2),
+        Buttons::EffectSelect3 => Some(EffectBankPresets::Preset3),
+        Buttons::EffectSelect4 => Some(EffectBankPresets::Preset4),
+        Buttons::EffectSelect5 => Some(EffectBankPresets::Preset5),
+        Buttons::EffectSelect6 => Some(EffectBankPresets::Preset6),
+        _ => None,
+    }
 }

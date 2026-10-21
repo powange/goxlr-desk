@@ -1020,6 +1020,92 @@ mod tests {
         assert!(ProfileSettings::load(TEST_PROFILE.as_bytes()).is_ok());
     }
 
+    /// Every element with its attributes sorted (they're written from HashMaps, in any order).
+    fn normalised(xml: &[u8]) -> Vec<String> {
+        let mut reader = Reader::from_reader(xml);
+        let (mut lines, mut buf) = (Vec::new(), Vec::new());
+        loop {
+            match reader.read_event_into(&mut buf).unwrap() {
+                Event::Start(e) | Event::Empty(e) => {
+                    let mut attributes: Vec<String> = e
+                        .attributes()
+                        .map(|a| {
+                            let a = a.unwrap();
+                            let key = a.key.as_ref().to_string();
+                            format!("{key}={}", a.value)
+                        })
+                        .collect();
+                    attributes.sort();
+                    let name = e.name().as_ref().to_string();
+                    lines.push(format!("{name} {}", attributes.join(" ")));
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        lines
+    }
+
+    fn written(settings: &mut ProfileSettings) -> Vec<u8> {
+        let mut out = Vec::new();
+        settings.write_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_profile_round_trip() {
+        // What's written reads back to the same thing (load -> write -> load -> write)
+        let mut first = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let once = written(&mut first);
+        let mut second = ProfileSettings::load(&once[..]).unwrap();
+        let twice = written(&mut second);
+        assert_eq!(normalised(&once), normalised(&twice));
+
+        // And every effect preset value of the source is kept
+        let source = normalised(TEST_PROFILE.as_bytes());
+        let once = normalised(&once);
+        for prefix in [
+            "reverbEncoder",
+            "echoEncoder",
+            "pitchEncoder",
+            "genderEncoder",
+            "megaphoneEffect",
+            "robotEffect",
+            "hardtuneEffect",
+        ] {
+            let elements: Vec<&String> = source.iter().filter(|l| l.starts_with(prefix)).collect();
+            assert!(
+                !elements.is_empty(),
+                "{prefix} missing from the test profile"
+            );
+            for element in elements {
+                let name = element.split(' ').next().unwrap();
+                let out = once
+                    .iter()
+                    .find(|l| l.split(' ').next() == Some(name))
+                    .unwrap_or_else(|| panic!("{name} not written"));
+                for attribute in element.split(' ').skip(1) {
+                    let key = attribute.split('=').next().unwrap();
+                    assert!(
+                        out.split(' ').any(|a| a.starts_with(&format!("{key}="))),
+                        "{name}: {key} not written"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Writes the normalised output of the test profile, to compare before and after a change
+    /// of the parsing or writing code: GOXLR_PROFILE_DUMP=<file> cargo test dump_normalised
+    #[test]
+    fn dump_normalised() {
+        if let Ok(path) = std::env::var("GOXLR_PROFILE_DUMP") {
+            let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+            fs::write(path, normalised(&written(&mut settings)).join("\n")).unwrap();
+        }
+    }
+
     #[test]
     fn default_profile_round_trip() {
         let default = include_bytes!("../../daemon/profiles/Default.goxlr");
