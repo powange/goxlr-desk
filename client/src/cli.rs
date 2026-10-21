@@ -364,6 +364,7 @@ pub enum EqualiserMiniCommands {
         frequency: MiniEqFrequencies,
 
         /// The new Frequency
+        #[arg(allow_hyphen_values = true)]
         value: f32,
     },
 
@@ -389,6 +390,7 @@ pub enum EqualiserCommands {
         frequency: EqFrequencies,
 
         /// The new frequency
+        #[arg(allow_hyphen_values = true)]
         value: f32,
     },
     Gain {
@@ -457,6 +459,7 @@ pub enum CompressorCommands {
         value: CompressorReleaseTime,
     },
     MakeUp {
+        #[arg(allow_hyphen_values = true)]
         value: i8,
     },
 }
@@ -853,31 +856,55 @@ pub enum Reverb {
     Decay { decay: u16 },
 
     /// Set the Reverb Early Level
-    EarlyLevel { level: i8 },
+    EarlyLevel {
+        #[arg(allow_hyphen_values = true)]
+        level: i8,
+    },
 
     /// Set the Reverb Tail Level
-    TailLevel { level: i8 },
+    TailLevel {
+        #[arg(allow_hyphen_values = true)]
+        level: i8,
+    },
 
     /// Set the Reverb Pre-Delay
     PreDelay { delay: u8 },
 
     /// Set the Reverb Low 'Colour'
-    LowColour { colour: i8 },
+    LowColour {
+        #[arg(allow_hyphen_values = true)]
+        colour: i8,
+    },
 
     /// Set the Reverb High 'Colour'
-    HighColour { colour: i8 },
+    HighColour {
+        #[arg(allow_hyphen_values = true)]
+        colour: i8,
+    },
 
     /// Set the Reverb High Factor
-    HighFactor { factor: i8 },
+    HighFactor {
+        #[arg(allow_hyphen_values = true)]
+        factor: i8,
+    },
 
     /// Set the Reverb Diffuse Level
-    Diffuse { diffuse: i8 },
+    Diffuse {
+        #[arg(allow_hyphen_values = true)]
+        diffuse: i8,
+    },
 
     /// Set the Reverb Mod Speed
-    ModSpeed { speed: i8 },
+    ModSpeed {
+        #[arg(allow_hyphen_values = true)]
+        speed: i8,
+    },
 
     /// Set the Reverb Mod Depth
-    ModDepth { depth: i8 },
+    ModDepth {
+        #[arg(allow_hyphen_values = true)]
+        depth: i8,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -921,7 +948,10 @@ pub enum Pitch {
     },
 
     /// Set the pitch Amount
-    Amount { amount: i8 },
+    Amount {
+        #[arg(allow_hyphen_values = true)]
+        amount: i8,
+    },
 
     /// Set the Pitch Character
     Character { character: u8 },
@@ -935,6 +965,7 @@ pub enum Gender {
         style: GenderStyle,
     },
     Amount {
+        #[arg(allow_hyphen_values = true)]
         amount: i8,
     },
 }
@@ -952,7 +983,10 @@ pub enum Megaphone {
     Amount { amount: u8 },
 
     /// Set the Post Processing Gain
-    PostGain { gain: i8 },
+    PostGain {
+        #[arg(allow_hyphen_values = true)]
+        gain: i8,
+    },
 
     /// Sets the State of the Megaphone Button
     Enabled {
@@ -977,6 +1011,7 @@ pub enum Robot {
         range: RobotRange,
 
         /// The Gain Value
+        #[arg(allow_hyphen_values = true)]
         gain: i8,
     },
 
@@ -1003,10 +1038,16 @@ pub enum Robot {
     PulseWidth { width: u8 },
 
     /// Sets the Robot Activation Threshold
-    Threshold { threshold: i8 },
+    Threshold {
+        #[arg(allow_hyphen_values = true)]
+        threshold: i8,
+    },
 
     /// Sets the Robot Dry Mix
-    DryMix { dry_mix: i8 },
+    DryMix {
+        #[arg(allow_hyphen_values = true)]
+        dry_mix: i8,
+    },
 
     /// Sets the Current state of the Robot Button
     Enabled {
@@ -1127,6 +1168,7 @@ pub enum SamplerCommands {
         sample_id: usize,
 
         #[arg(value_parser=percent_value_float)]
+        #[arg(allow_hyphen_values = true)]
         start_position: f32,
     },
 
@@ -1140,6 +1182,7 @@ pub enum SamplerCommands {
         sample_id: usize,
 
         #[arg(value_parser=percent_value_float)]
+        #[arg(allow_hyphen_values = true)]
         stop_position: f32,
     },
 
@@ -1197,5 +1240,21 @@ mod tests {
     fn cli_definition_is_valid() {
         // Catches conflicting names, bad defaults and similar clap mistakes.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn negative_values_are_accepted() {
+        for args in [
+            "effects reverb early-level -5",
+            "effects robot gain low -5",
+            "effects pitch amount -12",
+            "microphone equaliser gain equalizer31-hz -3",
+            "microphone noise-gate threshold -40",
+            "microphone compressor threshold -20",
+        ] {
+            let full = format!("goxlr-client {args}");
+            let result = Cli::try_parse_from(full.split(' '));
+            assert!(result.is_ok(), "{args}: {:?}", result.err());
+        }
     }
 }

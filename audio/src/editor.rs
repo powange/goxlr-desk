@@ -9,6 +9,10 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 
+/// The longest sample that can be edited. A whole file is decoded into memory as f32, so an
+/// hour long recording would need over a gigabyte.
+pub const MAX_EDIT_SECONDS: u64 = 10 * 60;
+
 /// A whole audio file decoded into memory, for editing.
 pub struct DecodedAudio {
     pub sample_rate: u32,
@@ -78,6 +82,15 @@ impl DecodedAudio {
                     }
                     buffer.copy_interleaved_ref(decoded);
                     samples.extend_from_slice(buffer.samples());
+                    // Files whose length isn't known up front are stopped at the limit too.
+                    if samples.len()
+                        > MAX_EDIT_SECONDS as usize * sample_rate as usize * channels as usize
+                    {
+                        bail!(
+                            "The sample is longer than {} minutes, which is too long to edit",
+                            MAX_EDIT_SECONDS / 60
+                        );
+                    }
                 }
                 // A damaged packet is skipped, the rest of the file is still usable.
                 Err(Error::DecodeError(_)) => continue,

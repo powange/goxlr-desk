@@ -49,7 +49,7 @@ use goxlr_usb::colouring::ColourTargets;
 
 use crate::audio::{AudioFile, AudioHandler};
 use crate::device::CurrentState;
-use crate::files::{can_create_new_file, named_file_path};
+use crate::files::{can_create_new_file, named_file_path, new_named_file_path};
 
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
 
@@ -143,13 +143,13 @@ impl ProfileAdapter {
     }
 
     pub fn can_create_new_file(name: String, directory: &Path) -> Result<()> {
-        let path = named_file_path(directory, &name, "goxlr")?;
+        let path = new_named_file_path(directory, &name, "goxlr")?;
         can_create_new_file(path)
     }
 
     pub fn save_as(&mut self, name: String, directory: &Path, overwrite: bool) -> Result<()> {
         // Check the name before adopting it, so a refused name doesn't rename this profile.
-        named_file_path(directory, &name, "goxlr")?;
+        new_named_file_path(directory, &name, "goxlr")?;
         self.name = name;
         self.save(directory, overwrite)
     }
@@ -166,7 +166,7 @@ impl ProfileAdapter {
     }
 
     pub fn write_preset(&mut self, name: String, directory: &Path) -> Result<()> {
-        let path = named_file_path(directory, &name, "preset")?;
+        let path = new_named_file_path(directory, &name, "preset")?;
         self.profile.save_preset(path)?;
         Ok(())
     }
@@ -190,8 +190,57 @@ impl ProfileAdapter {
         self.profile.settings_mut().rename_sample_file(old, new) > 0
     }
 
+    /// Tells whether the profile changed since it was loaded or saved (compare two values).
+    pub fn fingerprint(&mut self) -> u64 {
+        self.profile.fingerprint().unwrap_or_default()
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The sampler tracks playing one of these sample files, with where they sit.
+    pub fn sample_tracks_using(
+        &mut self,
+        names: &HashSet<String>,
+    ) -> Vec<(
+        goxlr_types::SampleBank,
+        goxlr_types::SampleButtons,
+        usize,
+        Track,
+    )> {
+        let mut found = vec![];
+        for bank in goxlr_types::SampleBank::iter() {
+            for button in goxlr_types::SampleButtons::iter() {
+                for (index, track) in self.get_sample_bank(bank, button).iter().enumerate() {
+                    if names.contains(&track.track) {
+                        found.push((bank, button, index, track.clone()));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Puts a track back on a button at its former position, unless the button already has it.
+    pub fn restore_sample_track(
+        &mut self,
+        bank: goxlr_types::SampleBank,
+        button: goxlr_types::SampleButtons,
+        index: usize,
+        track: Track,
+    ) -> bool {
+        let tracks = self.get_sample_bank(bank, button);
+        if tracks.iter().any(|existing| existing.track == track.track) {
+            return false;
+        }
+        let index = index.min(tracks.len());
+        tracks.insert(index, track);
+        true
     }
 
     pub fn load_colour_profile(&mut self, new_profile: ProfileAdapter) {
@@ -2579,12 +2628,22 @@ impl ProfileAdapter {
             return Ok(());
         }
 
-        // If we get here, we're simply moving between two monitors not involving headphones,
-        // so we just update the routing table.
+        // If we get here, we're simply moving between two monitors not involving headphones:
+        // the headphones take the new output's routing, and its mix too (as Headphones -> X
+        // does), otherwise they stay on the previous output's mix.
         for input in InputDevice::iter() {
             let router = self.get_router(input);
             self.set_monitor_routing(input, OutputDevice::Headphones, router[device]);
         }
+        let new_mix = self
+            .profile
+            .settings()
+            .mix_routing()
+            .get_assignment(profile_device);
+        self.profile
+            .settings_mut()
+            .mix_routing_mut()
+            .set_assignment(OutputChannels::Headphones, new_mix)?;
 
         Ok(())
     }
@@ -3454,5 +3513,34 @@ mod tests {
         assert!(!reloaded.rename_sample_file("intro.wav", "check.wav"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use crate::mic_profile::MicProfileAdapter;
+
+    #[test]
+    fn fingerprints_are_stable_and_follow_changes() {
+        let mut profile = ProfileAdapter::default();
+        let first = profile.fingerprint();
+        assert_eq!(first, profile.fingerprint());
+        assert_eq!(ProfileAdapter::default().fingerprint(), first);
+
+        // Saved and loaded back, it's the same profile
+        let dir = tempfile::tempdir().unwrap();
+        profile.save_as("Copy".into(), dir.path(), false).unwrap();
+        let mut loaded = ProfileAdapter::from_named("Copy".into(), dir.path()).unwrap();
+        assert_eq!(loaded.fingerprint(), first);
+
+        profile.set_scribble_text(FaderName::A, "changed".into());
+        assert_ne!(profile.fingerprint(), first);
+
+        let mic = MicProfileAdapter::default();
+        assert_eq!(
+            mic.fingerprint(),
+            MicProfileAdapter::default().fingerprint()
+        );
     }
 }

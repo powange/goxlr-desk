@@ -17,6 +17,7 @@ use goxlr_ipc::{
     SampleProcessState, Settings,
 };
 use goxlr_profile_loader::components::mute::MuteFunction;
+use goxlr_profile_loader::components::sample::Track;
 use goxlr_types::{
     Button, ChannelName, DeviceType, DisplayModeComponents, EffectBankPresets, EffectKey,
     EncoderName, FaderName, HardTuneSource, InputDevice as BasicInputDevice, MicrophoneParamKey,
@@ -34,7 +35,7 @@ use crate::SettingsHandle;
 use crate::audio::{AudioFile, AudioHandler};
 use crate::events::EventTriggers;
 use crate::events::EventTriggers::TTSMessage;
-use crate::files::find_file_in_path;
+use crate::files::{duplicate_named_file, find_file_in_path, rename_named_file};
 use crate::firmware::firmware_update::{
     FirmwareMessages, HardwareProgressResponse, ProgressResponse, ValidateUploadChunkResponse,
 };
@@ -42,6 +43,8 @@ use crate::mic_profile::{DEFAULT_MIC_PROFILE_NAME, MicProfileAdapter};
 use crate::profile::{
     DEFAULT_PROFILE_NAME, ProfileAdapter, usb_to_standard_button, version_newer_or_equal_to,
 };
+use crate::profile_trash::trash_profile;
+use crate::sample_trash::TrashedTrack;
 
 pub struct Device<'a> {
     goxlr: Box<dyn FullGoXLRDevice>,
@@ -61,6 +64,21 @@ pub struct Device<'a> {
 
     last_sample_error: Option<String>,
     tap_tempo: VecDeque<Instant>,
+
+    // Unsaved changes: the profiles' fingerprints when last loaded or saved, compared with the
+    // current ones at most once per CHANGES_CHECK_INTERVAL.
+    saved: ProfileFingerprints,
+    changes_checked: Instant,
+}
+
+const CHANGES_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Default, Copy, Clone)]
+struct ProfileFingerprints {
+    profile: u64,
+    mic_profile: u64,
+    profile_modified: bool,
+    mic_profile_modified: bool,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -228,16 +246,44 @@ impl<'a> Device<'a> {
 
             last_sample_error: None,
             tap_tempo: VecDeque::with_capacity(4),
+
+            saved: ProfileFingerprints::default(),
+            changes_checked: Instant::now(),
         };
 
         device.apply_profile(None).await?;
         device.apply_mic_profile().await?;
+        device.mark_saved(true, true);
 
         Ok(device)
     }
 
     pub fn serial(&self) -> &str {
         &self.hardware.serial_number
+    }
+
+    /// The profile and / or mic profile now match what's on disk (loaded, created or saved).
+    fn mark_saved(&mut self, profile: bool, mic_profile: bool) {
+        if profile {
+            self.saved.profile = self.profile.fingerprint();
+            self.saved.profile_modified = false;
+        }
+        if mic_profile {
+            self.saved.mic_profile = self.mic_profile.fingerprint();
+            self.saved.mic_profile_modified = false;
+        }
+    }
+
+    /// Compares the profiles with their saved state, returns whether that changed.
+    fn check_unsaved_changes(&mut self) -> bool {
+        if self.changes_checked.elapsed() < CHANGES_CHECK_INTERVAL {
+            return false;
+        }
+        self.changes_checked = Instant::now();
+        let before = (self.saved.profile_modified, self.saved.mic_profile_modified);
+        self.saved.profile_modified = self.profile.fingerprint() != self.saved.profile;
+        self.saved.mic_profile_modified = self.mic_profile.fingerprint() != self.saved.mic_profile;
+        before != (self.saved.profile_modified, self.saved.mic_profile_modified)
     }
 
     pub async fn status(&self) -> MixerStatus {
@@ -264,6 +310,7 @@ impl<'a> Device<'a> {
             .await;
 
         let sleep_commands = self.settings.get_device_sleep_commands(self.serial()).await;
+        let scenes = self.settings.get_device_scenes(self.serial()).await;
 
         let wake_commands = self.settings.get_device_wake_commands(self.serial()).await;
 
@@ -309,6 +356,7 @@ impl<'a> Device<'a> {
             hardware: self.hardware.clone(),
             shutdown_commands,
             sleep_commands,
+            scenes,
             wake_commands,
             fader_status: fader_map,
             cough_button: self.profile.get_cough_status(),
@@ -360,6 +408,8 @@ impl<'a> Device<'a> {
             button_down: button_states,
             profile_name: self.profile.name().to_owned(),
             mic_profile_name: self.mic_profile.name().to_owned(),
+            profile_modified: self.saved.profile_modified,
+            mic_profile_modified: self.saved.mic_profile_modified,
         }
     }
 
@@ -419,6 +469,12 @@ impl<'a> Device<'a> {
                 | GoXLRCommand::LoadMicProfile(_, true)
                 | GoXLRCommand::SaveMicProfile()
                 | GoXLRCommand::SaveMicProfileAs(_)
+                | GoXLRCommand::RenameProfile(..)
+                | GoXLRCommand::DuplicateProfile(..)
+                | GoXLRCommand::RenameMicProfile(..)
+                | GoXLRCommand::DuplicateMicProfile(..)
+                | GoXLRCommand::SaveScene(..)
+                | GoXLRCommand::DeleteScene(_)
                 // settings.json variables
                 | GoXLRCommand::SetSamplerPreBufferDuration(_)
                 | GoXLRCommand::SetVCMuteAlsoMuteCM(_)
@@ -454,7 +510,7 @@ impl<'a> Device<'a> {
     }
 
     pub async fn update_state(&mut self) -> Result<bool> {
-        let mut state_updated = false;
+        let mut state_updated = self.check_unsaved_changes();
         let mut refresh_colour_map = false;
 
         // Update any audio related states..
@@ -1225,6 +1281,55 @@ impl<'a> Device<'a> {
         Ok(())
     }
 
+    /// The sampler tracks of the loaded profile that play one of these files, recorded so they
+    /// can be put back if the files come back from the trash.
+    pub fn trashed_tracks(&mut self, names: &HashSet<String>) -> Vec<TrashedTrack> {
+        let serial = self.serial().to_string();
+        let profile = self.profile.name().to_string();
+        self.profile
+            .sample_tracks_using(names)
+            .into_iter()
+            .map(|(bank, button, index, track)| TrashedTrack {
+                serial: serial.clone(),
+                profile: profile.clone(),
+                bank,
+                button,
+                index,
+                track: track.track,
+                start: track.start_position,
+                end: track.end_position,
+                gain: track.normalized_gain,
+            })
+            .collect()
+    }
+
+    /// Puts back the tracks recorded for this device, if the same profile is still loaded.
+    pub async fn restore_trashed_tracks(&mut self, tracks: &[TrashedTrack]) -> Result<()> {
+        let mut changed = false;
+        for trashed in tracks {
+            if trashed.serial != self.serial() || trashed.profile != self.profile.name() {
+                continue;
+            }
+            let track = Track::new(
+                trashed.track.clone(),
+                trashed.start,
+                trashed.end,
+                trashed.gain,
+            );
+            changed |= self.profile.restore_sample_track(
+                trashed.bank,
+                trashed.button,
+                trashed.index,
+                track,
+            );
+        }
+        if changed {
+            self.load_colour_map().await?;
+            self.update_button_states()?;
+        }
+        Ok(())
+    }
+
     pub async fn validate_sampler(&mut self) -> Result<()> {
         let sample_path = self.settings.get_samples_directory().await;
         for bank in SampleBank::iter() {
@@ -1403,28 +1508,7 @@ impl<'a> Device<'a> {
 
         let sample_bank = self.profile.get_active_sample_bank();
         if !self.profile.current_sample_bank_has_samples(button) {
-            if self
-                .audio_handler
-                .as_mut()
-                .unwrap()
-                .sample_recording(sample_bank, button)
-            {
-                let file_name = self
-                    .audio_handler
-                    .as_mut()
-                    .unwrap()
-                    .stop_record(sample_bank, button)?;
-
-                if let Some((file_name, gain)) = file_name {
-                    let track = self.profile.add_sample_file(sample_bank, button, file_name);
-                    track.normalized_gain = gain;
-                }
-            }
-            // In all cases, we should stop the colour flashing.
-            self.profile.set_sample_button_blink(button, false);
-            self.load_colour_map().await?;
-
-            return Ok(());
+            return self.finish_recording(button).await;
         }
 
         let mode = self.profile.get_sample_playback_mode(button);
@@ -1502,12 +1586,32 @@ impl<'a> Device<'a> {
         Ok(())
     }
 
+    /// Stops a recording on a button of the active bank, and adds the recorded file to it.
+    async fn finish_recording(&mut self, button: SampleButtons) -> Result<()> {
+        let sample_bank = self.profile.get_active_sample_bank();
+        if let Some(audio) = self.audio_handler.as_mut()
+            && audio.sample_recording(sample_bank, button)
+            && let Some((file_name, gain)) = audio.stop_record(sample_bank, button)?
+        {
+            let track = self.profile.add_sample_file(sample_bank, button, file_name);
+            track.normalized_gain = gain;
+        }
+        // In all cases, we should stop the colour flashing.
+        self.profile.set_sample_button_blink(button, false);
+        self.load_colour_map().await?;
+        Ok(())
+    }
+
     async fn record_audio_file(&mut self, button: SampleButtons, file_name: String) -> Result<()> {
         let sample_bank = self.profile.get_active_sample_bank();
 
         // Create the full Path..
         let mut sample_path = self.settings.get_samples_directory().await;
         sample_path = sample_path.join("Recorded");
+        // It's created at startup, but recreate it if it went missing since.
+        if let Err(e) = std::fs::create_dir_all(&sample_path) {
+            warn!("Unable to create the recordings folder: {}", e);
+        }
         sample_path = sample_path.join(file_name);
 
         if let Some(audio_handler) = &mut self.audio_handler {
@@ -1848,10 +1952,69 @@ impl<'a> Device<'a> {
     }
 
     pub async fn perform_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        // Commands after which a profile matches its file again
+        let saves = match &command {
+            GoXLRCommand::NewProfile(_)
+            | GoXLRCommand::LoadProfile(..)
+            | GoXLRCommand::SaveProfile()
+            | GoXLRCommand::SaveProfileAs(_) => (true, false),
+            GoXLRCommand::NewMicProfile(_)
+            | GoXLRCommand::LoadMicProfile(..)
+            | GoXLRCommand::SaveMicProfile()
+            | GoXLRCommand::SaveMicProfileAs(_) => (false, true),
+            _ => (false, false),
+        };
+        self.perform_command_inner(command).await?;
+        if saves != (false, false) {
+            self.mark_saved(saves.0, saves.1);
+        }
+        // Check soon, the status shows changes quickly
+        self.changes_checked = Instant::now()
+            .checked_sub(CHANGES_CHECK_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        Ok(())
+    }
+
+    async fn perform_command_inner(&mut self, command: GoXLRCommand) -> Result<()> {
         match command {
             GoXLRCommand::SetShutdownCommands(commands) => {
                 self.settings
                     .set_device_shutdown_commands(self.serial(), commands)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SaveScene(name, commands) => {
+                let name = name.trim().to_string();
+                if name.is_empty() || name.chars().count() > 64 {
+                    bail!("A scene needs a name of 1 to 64 characters");
+                }
+                if let Some(command) = commands.iter().find(|c| !scene_command_allowed(c)) {
+                    bail!("A scene can't contain {:?}", command);
+                }
+                self.settings
+                    .set_device_scene(self.serial(), &name, Some(commands))
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::RunScene(name) => {
+                let scenes = self.settings.get_device_scenes(self.serial()).await;
+                let Some(commands) = scenes.get(&name) else {
+                    bail!("There is no scene named {}", name);
+                };
+                for command in commands.clone() {
+                    // Stored scenes were checked when saved, but the settings file can be edited.
+                    if !scene_command_allowed(&command) {
+                        warn!("Skipping {:?} in scene {}", command, name);
+                        continue;
+                    }
+                    if let Err(e) = Box::pin(self.perform_command(command)).await {
+                        warn!("Scene {}: {}", name, e);
+                    }
+                }
+            }
+            GoXLRCommand::DeleteScene(name) => {
+                self.settings
+                    .set_device_scene(self.serial(), &name, None)
                     .await;
                 self.settings.save().await;
             }
@@ -2622,6 +2785,30 @@ impl<'a> Device<'a> {
                 self.play_audio_file(bank, button, track, false).await?;
                 self.update_button_states()?;
             }
+            GoXLRCommand::StartSampleRecording(bank, button) => {
+                if bank != self.profile.get_active_sample_bank() {
+                    bail!("Recording is only possible on the active bank");
+                }
+                let Some(audio) = &self.audio_handler else {
+                    bail!("The sampler isn't available");
+                };
+                if audio.is_sample_recording() {
+                    bail!("A sample is already being recorded");
+                }
+                if self.profile.current_sample_bank_has_samples(button) {
+                    bail!("Only an empty button can record");
+                }
+                let file_date = Local::now().format("%Y-%m-%dT%H%M%S").to_string();
+                self.record_audio_file(button, format!("Recording_{file_date}.wav"))
+                    .await?;
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::StopSampleRecording(bank, button) => {
+                if bank != self.profile.get_active_sample_bank() {
+                    bail!("Recording is only possible on the active bank");
+                }
+                self.finish_recording(button).await?;
+            }
             GoXLRCommand::StopSamplePlayback(bank, button) => {
                 self.stop_sample_playback(bank, button).await?;
                 self.update_button_states()?;
@@ -2759,8 +2946,27 @@ impl<'a> Device<'a> {
 
                 let profiles = self.settings.get_profile_directory().await;
                 let backups = self.settings.get_backup_directory().await;
-                self.profile.delete_profile(name.clone(), &profiles)?;
+                // Kept in the profile trash, so it can be restored.
+                trash_profile(&profiles, &backups, &name, false)?;
                 self.profile.delete_profile(name.clone(), &backups)?;
+            }
+            GoXLRCommand::RenameProfile(from, to) => {
+                let profiles = self.settings.get_profile_directory().await;
+                rename_named_file(&profiles, &from, &to, "goxlr")?;
+                // The backup copy follows, it's only a convenience
+                let backups = self.settings.get_backup_directory().await;
+                let _ = rename_named_file(&backups, &from, &to, "goxlr");
+                if self.profile.name() == from {
+                    self.profile.set_name(to.clone());
+                    self.settings
+                        .set_device_profile_name(self.serial(), to.as_str())
+                        .await;
+                    self.settings.save().await;
+                }
+            }
+            GoXLRCommand::DuplicateProfile(from, to) => {
+                let profiles = self.settings.get_profile_directory().await;
+                duplicate_named_file(&profiles, &from, &to, "goxlr")?;
             }
             GoXLRCommand::ReloadSettings() => {
                 // This is a simple command that will reload the current profile settings
@@ -2866,8 +3072,26 @@ impl<'a> Device<'a> {
                 }
 
                 let profile_directory = self.settings.get_mic_profile_directory().await;
-                self.mic_profile
-                    .delete_profile(profile_name.clone(), &profile_directory)?;
+                let backups = self.settings.get_backup_directory().await;
+                // Kept in the profile trash, so it can be restored.
+                trash_profile(&profile_directory, &backups, &profile_name, true)?;
+            }
+            GoXLRCommand::RenameMicProfile(from, to) => {
+                let profiles = self.settings.get_mic_profile_directory().await;
+                rename_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
+                let backups = self.settings.get_backup_directory().await;
+                let _ = rename_named_file(&backups, &from, &to, "goxlrMicProfile");
+                if self.mic_profile.name() == from {
+                    self.mic_profile.set_name(to.clone());
+                    self.settings
+                        .set_device_mic_profile_name(self.serial(), to.as_str())
+                        .await;
+                    self.settings.save().await;
+                }
+            }
+            GoXLRCommand::DuplicateMicProfile(from, to) => {
+                let profiles = self.settings.get_mic_profile_directory().await;
+                duplicate_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
             }
 
             GoXLRCommand::SetMuteHoldDuration(duration) => {
@@ -4116,13 +4340,21 @@ impl<'a> Device<'a> {
                 return Ok(());
             } else {
                 // We need to work out the current ratio between the channel, and it's mix..
-                let volume = self.profile.get_channel_volume(channel);
+                let mut volume = self.profile.get_channel_volume(channel);
+                // A channel muted to all sits at 0 for the moment: its real level is the one
+                // it goes back to on unmute.
+                if volume == 0
+                    && let Some(fader) = self.profile.get_fader_from_channel(channel)
+                {
+                    volume = self.profile.get_mute_button_previous_volume(fader);
+                }
                 let channel_volume = if volume == 0 { 1 } else { volume };
 
                 let profile_mix = self.profile.get_submix_volume(mix);
                 let mix_volume = if profile_mix == 0 { 1 } else { profile_mix };
 
-                let ratio = mix_volume as f64 / channel_volume as f64;
+                // Bounded, so a near silent channel can't make the mix jump to full volume
+                let ratio = (mix_volume as f64 / channel_volume as f64).clamp(0.0, 4.0);
 
                 // Enable the link, and set the ratio..
                 self.profile.set_submix_linked(mix, linked)?;
@@ -4230,4 +4462,31 @@ fn tts_target(target: MuteFunction) -> String {
         MuteFunction::ToStream2 => " to Stream Mix 2".to_string(),
         MuteFunction::ToStreams => " to Stream Mix 1 and 2".to_string(),
     }
+}
+
+/// Commands a scene may hold: what changes the device's state, not files, settings or other
+/// command lists (a scene can't run another one).
+fn scene_command_allowed(command: &GoXLRCommand) -> bool {
+    !matches!(
+        command,
+        GoXLRCommand::SaveScene(..)
+            | GoXLRCommand::RunScene(_)
+            | GoXLRCommand::DeleteScene(_)
+            | GoXLRCommand::SetShutdownCommands(_)
+            | GoXLRCommand::SetSleepCommands(_)
+            | GoXLRCommand::SetWakeCommands(_)
+            | GoXLRCommand::SaveActivePreset()
+            | GoXLRCommand::NewProfile(_)
+            | GoXLRCommand::SaveProfile()
+            | GoXLRCommand::SaveProfileAs(_)
+            | GoXLRCommand::DeleteProfile(_)
+            | GoXLRCommand::RenameProfile(..)
+            | GoXLRCommand::DuplicateProfile(..)
+            | GoXLRCommand::NewMicProfile(_)
+            | GoXLRCommand::SaveMicProfile()
+            | GoXLRCommand::SaveMicProfileAs(_)
+            | GoXLRCommand::DeleteMicProfile(_)
+            | GoXLRCommand::RenameMicProfile(..)
+            | GoXLRCommand::DuplicateMicProfile(..)
+    )
 }

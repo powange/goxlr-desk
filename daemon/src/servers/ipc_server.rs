@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use goxlr_ipc::clients::ipc::ipc_socket::Socket;
+use goxlr_ipc::location::{NAMED_PIPE, socket_path};
 use goxlr_ipc::{DaemonRequest, DaemonResponse};
 use interprocess::local_socket::tokio::prelude::{LocalSocketListener, LocalSocketStream};
 use interprocess::local_socket::traits::tokio::{Listener, Stream};
@@ -8,25 +9,23 @@ use interprocess::local_socket::{
 };
 use log::{debug, info, warn};
 use std::fs;
-use std::path::Path;
+use std::time::Duration;
 
 use crate::Shutdown;
 use crate::primary_worker::DeviceSender;
 use crate::servers::server_packet::handle_packet;
 
-static SOCKET_PATH: &str = "/tmp/goxlr.socket";
-static NAMED_PIPE: &str = "@goxlr.socket";
-
 async fn ipc_tidy() -> Result<()> {
+    let socket_file = socket_path();
     // We only need a possible cleanup if we're using file based sockets, this has changed
     // substantially with the latest interprocess crate, so we're OS based now..
     let socket_type = if cfg!(windows) {
         NAMED_PIPE.to_ns_name::<GenericNamespaced>()?
     } else {
-        if !Path::new(SOCKET_PATH).exists() {
+        if !socket_file.exists() {
             return Ok(());
         }
-        SOCKET_PATH.to_fs_name::<GenericFilePath>()?
+        socket_file.clone().to_fs_name::<GenericFilePath>()?
     };
 
     let connection = LocalSocketStream::connect(socket_type).await;
@@ -37,7 +36,7 @@ async fn ipc_tidy() -> Result<()> {
             }
             false => {
                 debug!("Connection Failed. Socket File is stale, removing..");
-                fs::remove_file(SOCKET_PATH)?;
+                fs::remove_file(&socket_file)?;
             }
         }
         return Ok(());
@@ -55,9 +54,24 @@ async fn ipc_tidy() -> Result<()> {
             }
             false => {
                 debug!("Unable to send messages, removing socket..");
-                fs::remove_file(SOCKET_PATH)?;
+                fs::remove_file(&socket_file)?;
             }
         }
+        return Ok(());
+    }
+
+    // Accepting a message isn't enough (anything can listen there): only a reply means a
+    // daemon is running.
+    let reply = tokio::time::timeout(Duration::from_secs(2), socket.read()).await;
+    if !matches!(reply, Ok(Some(Ok(_)))) {
+        if cfg!(windows) {
+            bail!("Something else holds the GoXLR named pipe");
+        }
+        warn!(
+            "The socket at {:?} doesn't answer like a GoXLR daemon, replacing it",
+            socket_file
+        );
+        fs::remove_file(&socket_file)?;
         return Ok(());
     }
 
@@ -71,11 +85,20 @@ pub async fn bind_socket() -> Result<LocalSocketListener> {
     let name = if cfg!(windows) {
         NAMED_PIPE.to_ns_name::<GenericNamespaced>()?
     } else {
-        SOCKET_PATH.to_fs_name::<GenericFilePath>()?
+        socket_path().to_fs_name::<GenericFilePath>()?
     };
 
     let opts = ListenerOptions::new().name(name.clone());
     let listener = opts.create_tokio()?;
+
+    // Only this user may talk to the daemon (it can run programs through the activator).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(socket_path(), fs::Permissions::from_mode(0o600)) {
+            warn!("Unable to restrict the IPC socket to this user: {}", e);
+        }
+    }
 
     info!("Bound IPC Socket @ {:?}", name);
     Ok(listener)
@@ -98,7 +121,7 @@ pub async fn spawn_ipc_server(
             }
             () = shutdown_signal.recv() => {
                 if !cfg!(windows) {
-                    let _ = fs::remove_file(SOCKET_PATH);
+                    let _ = fs::remove_file(socket_path());
                 }
                 return;
             }

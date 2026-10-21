@@ -3,7 +3,7 @@
 
 use crate::primary_worker::DeviceStateChange;
 use crate::{SettingsHandle, Shutdown};
-use goxlr_ipc::{HttpSettings, PathTypes};
+use goxlr_ipc::{GoXLRCommand, HttpSettings, PathTypes};
 use log::{debug, warn};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -25,6 +25,8 @@ pub enum EventTriggers {
     Activate,
     OpenUi,
     DevicesStopped,
+    // A command from the tray menu, for the first device
+    TrayCommand(GoXLRCommand),
 }
 
 #[derive(Clone)]
@@ -104,6 +106,9 @@ pub async fn spawn_event_handler(
                     }
                     EventTriggers::Wake(sender) => {
                         let _ = device_state_tx.send(DeviceStateChange::Wake(sender)).await;
+                    }
+                    EventTriggers::TrayCommand(command) => {
+                        let _ = device_state_tx.send(DeviceStateChange::Command(command)).await;
                     }
                     EventTriggers::Lock => {
                         debug!("Received Screen Lock Event..");

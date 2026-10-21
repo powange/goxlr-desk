@@ -8,13 +8,14 @@ use crate::cli::{
 };
 use crate::cli::{Cli, DeviceSettings};
 use crate::microphone::apply_microphone_controls;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use goxlr_ipc::GoXLRCommand;
 use goxlr_ipc::client::Client;
 use goxlr_ipc::clients::ipc::ipc_client::IPCClient;
 use goxlr_ipc::clients::ipc::ipc_socket::Socket;
 use goxlr_ipc::clients::web::web_client::WebClient;
+use goxlr_ipc::location::{NAMED_PIPE, socket_candidates};
 use goxlr_ipc::{DaemonRequest, DaemonResponse, MixerStatus, UsbProductInformation};
 use goxlr_types::{ChannelName, DeviceType, FaderName, InputDevice, MicrophoneType, OutputDevice};
 
@@ -22,9 +23,6 @@ use interprocess::local_socket::tokio::prelude::LocalSocketStream;
 use interprocess::local_socket::traits::tokio::Stream;
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use strum::IntoEnumIterator;
-
-static SOCKET_PATH: &str = "/tmp/goxlr.socket";
-static NAMED_PIPE: &str = "@goxlr.socket";
 
 pub async fn run_cli() -> Result<()> {
     let cli: Cli = Cli::parse();
@@ -34,22 +32,7 @@ pub async fn run_cli() -> Result<()> {
     if let Some(url) = cli.use_http {
         client = Box::new(WebClient::new(format!("{url}/api/command")));
     } else {
-        // Windows supports unix sockets now, but we want to maintain the historic behaviour
-        // so we'll force it to a NameSpace here..
-        let path = if cfg!(windows) {
-            NAMED_PIPE.to_ns_name::<GenericNamespaced>()
-        } else {
-            SOCKET_PATH.to_fs_name::<GenericFilePath>()
-        };
-
-        let path = match path {
-            Ok(path) => path,
-            Err(e) => {
-                bail!("Unable to Process Path {}", e);
-            }
-        };
-
-        let connection = LocalSocketStream::connect(path)
+        let connection = connect_daemon()
             .await
             .context("Unable to connect to the GoXLR daemon Process")?;
 
@@ -1179,4 +1162,24 @@ fn print_mixer_info(mixer: &MixerStatus) {
         println!();
     }
     println!("{}", "-".repeat(table_width));
+}
+
+/// Connects to the daemon: the named pipe on Windows (as before), otherwise this user's socket,
+/// then the legacy shared one.
+async fn connect_daemon() -> Result<LocalSocketStream> {
+    if cfg!(windows) {
+        let name = NAMED_PIPE.to_ns_name::<GenericNamespaced>()?;
+        return Ok(LocalSocketStream::connect(name).await?);
+    }
+    let mut last_error = anyhow!("No socket found");
+    for path in socket_candidates() {
+        match path.to_fs_name::<GenericFilePath>() {
+            Ok(name) => match LocalSocketStream::connect(name).await {
+                Ok(connection) => return Ok(connection),
+                Err(e) => last_error = e.into(),
+            },
+            Err(e) => last_error = e.into(),
+        }
+    }
+    Err(last_error)
 }

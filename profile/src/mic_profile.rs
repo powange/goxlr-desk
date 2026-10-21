@@ -143,6 +143,14 @@ impl MicProfileSettings {
         atomic_write(path, |file| self.write_to(file))
     }
 
+    /// A hash of what `save` would write, to tell whether the mic profile changed since it was
+    /// loaded or saved.
+    pub fn fingerprint(&self) -> Result<u64> {
+        let mut xml = Vec::new();
+        self.write_to(&mut xml)?;
+        crate::fingerprint::xml_fingerprint(&xml, &[])
+    }
+
     pub fn write_to<W: Write>(&self, sink: W) -> Result<()> {
         let mut writer = Writer::new_with_indent(sink, u8::try_from('\t')?, 1);
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("utf-8"), None)))?;

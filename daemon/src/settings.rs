@@ -8,7 +8,7 @@ use goxlr_types::VodMode;
 use goxlr_types::VodMode::Routable;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::fs::{File, create_dir_all};
@@ -24,6 +24,34 @@ static LOAD_WARNING: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn take_load_warning() -> Option<String> {
     LOAD_WARNING.lock().ok()?.take()
+}
+
+// The network access token, readable without the async settings lock (the HTTP server checks
+// it on every request from another machine).
+static NETWORK_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn network_token() -> Option<String> {
+    NETWORK_TOKEN.lock().ok()?.clone()
+}
+
+fn publish_token(token: &Option<String>) {
+    if let Ok(mut current) = NETWORK_TOKEN.lock() {
+        current.clone_from(token);
+    }
+}
+
+/// 32 random hex characters.
+fn new_token() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        // No randomness available: still unique, much weaker. Shouldn't happen.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes = nanos.to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 'settings.json' + 'bak' -> 'settings.json.bak'
@@ -80,6 +108,7 @@ impl SettingsHandle {
                 selected_locale: None,
                 tts_enabled: Some(false),
                 allow_network_access: Some(false),
+                network_token: None,
                 macos_handle_aggregates: None,
                 profile_directory: None,
                 mic_profile_directory: None,
@@ -173,6 +202,12 @@ impl SettingsHandle {
             settings.devices = Some(Default::default());
         }
 
+        // Network access needs a token for other machines.
+        if settings.allow_network_access == Some(true) && settings.network_token.is_none() {
+            settings.network_token = Some(new_token());
+        }
+        publish_token(&settings.network_token);
+
         let handle = SettingsHandle {
             path,
             data_dir: data_dir.to_path_buf(),
@@ -254,6 +289,23 @@ impl SettingsHandle {
     pub async fn set_allow_network_access(&self, enabled: bool) {
         let mut settings = self.settings.write().await;
         settings.allow_network_access = Some(enabled);
+        if enabled && settings.network_token.is_none() {
+            settings.network_token = Some(new_token());
+        }
+        publish_token(&settings.network_token);
+    }
+
+    pub async fn get_network_token(&self) -> Option<String> {
+        self.settings.read().await.network_token.clone()
+    }
+
+    /// Replaces the network access token: links given out before stop working.
+    pub async fn regenerate_network_token(&self) -> String {
+        let mut settings = self.settings.write().await;
+        let token = new_token();
+        settings.network_token = Some(token.clone());
+        publish_token(&settings.network_token);
+        token
     }
 
     pub async fn set_macos_handle_aggregates(&self, enabled: bool) {
@@ -578,6 +630,44 @@ impl SettingsHandle {
         mic_profile_name.clone_into(&mut entry.mic_profile);
     }
 
+    pub async fn get_device_scenes(
+        &self,
+        device_serial: &str,
+    ) -> BTreeMap<String, Vec<GoXLRCommand>> {
+        let settings = self.settings.read().await;
+        settings
+            .devices
+            .as_ref()
+            .unwrap()
+            .get(device_serial)
+            .map(|d| d.scenes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Stores a scene, or removes it with None.
+    pub async fn set_device_scene(
+        &self,
+        device_serial: &str,
+        name: &str,
+        commands: Option<Vec<GoXLRCommand>>,
+    ) {
+        let mut settings = self.settings.write().await;
+        let entry = settings
+            .devices
+            .as_mut()
+            .unwrap()
+            .entry(device_serial.to_owned())
+            .or_insert_with(DeviceSettings::default);
+        match commands {
+            Some(commands) => {
+                entry.scenes.insert(name.to_owned(), commands);
+            }
+            None => {
+                entry.scenes.remove(name);
+            }
+        }
+    }
+
     pub async fn set_device_shutdown_commands(
         &self,
         device_serial: &str,
@@ -735,6 +825,8 @@ pub struct Settings {
     selected_locale: Option<String>,
     tts_enabled: Option<bool>,
     allow_network_access: Option<bool>,
+    // Needed by other machines on the network to use the interface (see network_token())
+    network_token: Option<String>,
     macos_handle_aggregates: Option<bool>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,
@@ -795,7 +887,22 @@ impl Settings {
                     }
                 }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // A first start, or the file went missing (an antivirus, a cleaner..). Use the
+                // last known good copy if there is one, rather than starting from defaults.
+                let backup = Self::read_backup(path);
+                if backup.is_some() {
+                    let message = format!(
+                        "The settings at {} were missing, restored them from the backup copy.",
+                        path.to_string_lossy()
+                    );
+                    eprintln!("{message}");
+                    if let Ok(mut warning) = LOAD_WARNING.lock() {
+                        *warning = Some(message);
+                    }
+                }
+                Ok(backup)
+            }
             Err(error) => Err(error).context(format!(
                 "Could not open daemon settings file for reading at {}",
                 path.to_string_lossy()
@@ -864,6 +971,9 @@ struct DeviceSettings {
     shutdown_commands: Vec<GoXLRCommand>,
     sleep_commands: Vec<GoXLRCommand>,
     wake_commands: Vec<GoXLRCommand>,
+
+    // Named scenes, run on request
+    scenes: BTreeMap<String, Vec<GoXLRCommand>>,
 }
 
 impl Default for DeviceSettings {
@@ -885,6 +995,7 @@ impl Default for DeviceSettings {
             shutdown_commands: vec![],
             sleep_commands: vec![],
             wake_commands: vec![],
+            scenes: BTreeMap::new(),
         }
     }
 }
@@ -916,6 +1027,16 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .any(|entry| entry.file_name().to_string_lossy().contains(".failed-"));
         assert!(kept);
+
+        // A missing main file also falls back to the backup.
+        settings.write(&path).unwrap();
+        let _ = take_load_warning();
+        fs::remove_file(&path).unwrap();
+        let loaded = Settings::read(&path)
+            .unwrap()
+            .expect("backup should be loaded");
+        assert_eq!(loaded.tts_enabled, Some(true));
+        assert!(take_load_warning().is_some());
 
         // Without a usable backup, the defaults are used.
         fs::remove_file(with_suffix(&path, "bak")).unwrap();

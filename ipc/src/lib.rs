@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub mod client;
 pub mod clients;
 mod device;
+pub mod location;
 
 pub use device::*;
 use goxlr_types::{
@@ -33,6 +34,10 @@ pub enum DaemonRequest {
     // Which profiles use the sample file(s) at this path (a file, or a folder's content),
     // relative to the samples directory. Answered with SampleUsage.
     GetSampleUsage(String),
+
+    // The links other machines on the network use to reach the interface. Answered with
+    // NetworkAccess. Only from this computer.
+    GetNetworkAccess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +49,15 @@ pub enum DaemonResponse {
     Status(DaemonStatus),
     Patch(Patch),
     SampleUsage(SampleUsage),
+    NetworkAccess(NetworkAccess),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkAccess {
+    // Whether the interface is reachable from the network (the setting applies at start)
+    pub enabled: bool,
+    // Links with the access token, one per address of this machine
+    pub urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -129,6 +143,8 @@ pub enum DaemonCommand {
     OpenUi,
     Activate,
     StopDaemon,
+    // Stops, then starts again with the same arguments (to apply network access, for example)
+    RestartDaemon,
     OpenPath(PathTypes),
     SetLogLevel(LogLevel),
     SetFirmwareSource(FirmwareSource),
@@ -154,6 +170,12 @@ pub enum DaemonCommand {
     RestoreSampleTrash(String),
     // Deletes an item from the sample trash for good, or everything when None
     EmptySampleTrash(Option<String>),
+    // Puts a deleted profile or mic profile back, by trash id
+    RestoreProfileTrash(String),
+    // Deletes a profile from the trash for good (or everything with None)
+    EmptyProfileTrash(Option<String>),
+    // A new network access token, the links given out before stop working
+    RegenerateNetworkToken,
     // Copies a sample next to itself, with a free name such as 'name (2).wav'
     DuplicateSample(String),
     // Edits a sample and saves it as WAV, either replacing the file (the original goes to the
@@ -178,6 +200,11 @@ pub enum GoXLRCommand {
     SetShutdownCommands(Vec<GoXLRCommand>),
     SetSleepCommands(Vec<GoXLRCommand>),
     SetWakeCommands(Vec<GoXLRCommand>),
+
+    // Scenes: named lists of commands, run in one go (volumes, mutes, routing, effects..)
+    SaveScene(String, Vec<GoXLRCommand>),
+    RunScene(String),
+    DeleteScene(String),
     SetSamplerPreBufferDuration(u16),
 
     SetFader(FaderName, ChannelName),
@@ -317,6 +344,9 @@ pub enum GoXLRCommand {
     PlaySampleByIndex(SampleBank, SampleButtons, usize),
     PlayNextSample(SampleBank, SampleButtons),
     StopSamplePlayback(SampleBank, SampleButtons),
+    // Records into an empty button of the active bank, as holding it on the device does
+    StartSampleRecording(SampleBank, SampleButtons),
+    StopSampleRecording(SampleBank, SampleButtons),
 
     // Scribbles
     SetScribbleIcon(FaderName, Option<String>),
@@ -331,6 +361,9 @@ pub enum GoXLRCommand {
     SaveProfile(),
     SaveProfileAs(String),
     DeleteProfile(String),
+    // Renames or copies a profile file: (current name, new name)
+    RenameProfile(String, String),
+    DuplicateProfile(String, String),
     ReloadSettings(),
 
     NewMicProfile(String),
@@ -338,6 +371,8 @@ pub enum GoXLRCommand {
     SaveMicProfile(),
     SaveMicProfileAs(String),
     DeleteMicProfile(String),
+    RenameMicProfile(String, String),
+    DuplicateMicProfile(String, String),
 
     // General Settings
     SetMuteHoldDuration(u16),

@@ -40,6 +40,7 @@ use crate::shutdown::Shutdown;
 use crate::tts::spawn_tts_service;
 
 mod audio;
+mod backup;
 mod cli;
 mod device;
 mod events;
@@ -49,6 +50,7 @@ mod mic_profile;
 mod platform;
 mod primary_worker;
 mod profile;
+mod profile_trash;
 mod sample_trash;
 mod servers;
 mod settings;
@@ -283,7 +285,8 @@ async fn run_utility() -> Result<()> {
     let (global_tx, global_rx) = mpsc::channel(32);
 
     // Create the 'Patch' Sending Channel..
-    let (broadcast_tx, broadcast_rx) = broadcast::channel(16);
+    // Room for bursts (a profile load): a client that still falls behind resynchronises.
+    let (broadcast_tx, broadcast_rx) = broadcast::channel(256);
     drop(broadcast_rx);
 
     // Create the USB Event Channel..
@@ -442,7 +445,29 @@ async fn run_utility() -> Result<()> {
             platform_handle
         );
     }
+
+    if RESTART_REQUESTED.load(Ordering::SeqCst) {
+        restart();
+    }
     Ok(())
+}
+
+/// Set by RestartDaemon: once everything has stopped, a new daemon is started.
+pub static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Starts this program again with the same arguments, after the daemon has stopped.
+fn restart() {
+    let Ok(executable) = std::env::current_exe() else {
+        warn!("Unable to find the daemon's executable, not restarting");
+        return;
+    };
+    info!("Restarting the daemon");
+    if let Err(e) = std::process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .spawn()
+    {
+        warn!("Unable to restart the daemon: {}", e);
+    }
 }
 
 #[cfg(target_family = "unix")]

@@ -1,4 +1,4 @@
-use crate::files::{can_create_new_file, named_file_path};
+use crate::files::{can_create_new_file, named_file_path, new_named_file_path};
 use crate::profile::ProfileAdapter;
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
@@ -13,7 +13,7 @@ use goxlr_types::{
 use log::warn;
 use ritelinked::LinkedHashSet;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, remove_file};
+use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use strum::IntoEnumIterator;
@@ -68,13 +68,13 @@ impl MicProfileAdapter {
     }
 
     pub fn can_create_new_file(name: String, directory: &Path) -> Result<()> {
-        let path = named_file_path(directory, &name, "goxlrMicProfile")?;
+        let path = new_named_file_path(directory, &name, "goxlrMicProfile")?;
         can_create_new_file(path)
     }
 
     pub fn save_as(&mut self, name: String, directory: &Path, overwrite: bool) -> Result<()> {
         // Check the name before adopting it, so a refused name doesn't rename this profile.
-        named_file_path(directory, &name, "goxlrMicProfile")?;
+        new_named_file_path(directory, &name, "goxlrMicProfile")?;
         self.name = name;
         self.save(directory, overwrite)
     }
@@ -90,12 +90,13 @@ impl MicProfileAdapter {
         Ok(())
     }
 
-    pub fn delete_profile(&mut self, name: String, directory: &Path) -> Result<()> {
-        let path = named_file_path(directory, &name, "goxlrMicProfile")?;
-        if path.is_file() {
-            remove_file(path)?;
-        }
-        Ok(())
+    /// Tells whether the mic profile changed since it was loaded or saved (compare two values).
+    pub fn fingerprint(&self) -> u64 {
+        self.profile.fingerprint().unwrap_or_default()
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
     }
 
     pub fn name(&self) -> &str {

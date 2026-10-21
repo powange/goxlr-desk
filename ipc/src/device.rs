@@ -75,6 +75,8 @@ pub struct MixerStatus {
     pub shutdown_commands: Vec<GoXLRCommand>,
     pub sleep_commands: Vec<GoXLRCommand>,
     pub wake_commands: Vec<GoXLRCommand>,
+    #[serde(default)]
+    pub scenes: std::collections::BTreeMap<String, Vec<GoXLRCommand>>,
     pub fader_status: EnumMap<FaderName, FaderStatus>,
     pub mic_status: MicSettings,
     pub levels: Levels,
@@ -87,6 +89,11 @@ pub struct MixerStatus {
     pub button_down: EnumMap<Button, bool>,
     pub profile_name: String,
     pub mic_profile_name: String,
+    // Whether the profile / mic profile changed since it was loaded or saved
+    #[serde(default)]
+    pub profile_modified: bool,
+    #[serde(default)]
+    pub mic_profile_modified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,7 +448,20 @@ pub struct Files {
     // Deleted samples and folders, which can be restored.
     #[serde(default)]
     pub sample_trash: Vec<SampleTrashItem>,
+    // Deleted profiles and mic profiles, which can be restored.
+    #[serde(default)]
+    pub profile_trash: Vec<ProfileTrashItem>,
     pub icons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileTrashItem {
+    pub id: String,
+    pub name: String,
+    // A mic profile rather than a main profile
+    pub mic: bool,
+    // When it was deleted (seconds since the epoch)
+    pub deleted_at: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

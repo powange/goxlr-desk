@@ -20,8 +20,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 
 use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
-use glob::{Pattern, glob};
-use goxlr_audio::editor::DecodedAudio;
+use glob::{MatchOptions, Pattern, glob, glob_with};
+use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
 use goxlr_profile_loader::atomic::atomic_write;
@@ -231,6 +231,9 @@ impl FileManager {
     }
 }
 
+// How long the file watcher waits for things to settle before reporting a change.
+const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 pub async fn spawn_file_notification_service(
     paths: FilePaths,
     sender: Sender<PathTypes>,
@@ -262,12 +265,22 @@ pub async fn spawn_file_notification_service(
         warn!("Unable to Monitor the Samples Path: {:?}", error);
     }
 
+    // Changes come in bursts (an import, a folder moved, a file written then renamed), so they're
+    // gathered and sent once nothing changed for a short while, rather than once per event.
+    let mut pending: Vec<PathTypes> = Vec::new();
+    let mut deadline = tokio::time::Instant::now();
+
     // Wait for any changes..
     loop {
         tokio::select! {
             () = shutdown_signal.recv() => {
                 debug!("Shutdown Signal Received.");
                 break;
+            },
+            () = tokio::time::sleep_until(deadline), if !pending.is_empty() => {
+                for path_type in pending.drain(..) {
+                    let _ = sender.send(path_type).await;
+                }
             },
             result = rx.recv() => {
                 if let Some(result) = result {
@@ -289,30 +302,32 @@ pub async fn spawn_file_notification_service(
                                 EventKind::Modify(ModifyKind::Name(RenameMode::To)) |
                                 EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
 
-                                    let path = &event.paths[0];
-                                    if path.starts_with(&paths.profiles) {
-                                        let _ = sender.send(PathTypes::Profiles).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.mic_profiles) {
-                                        let _ = sender.send(PathTypes::MicProfiles).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.icons) {
-                                        let _ = sender.send(PathTypes::Icons).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.presets) {
-                                        let _ = sender.send(PathTypes::Presets).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.samples) {
-                                        let _ = sender.send(PathTypes::Samples).await;
-                                        continue;
+                                    for path in &event.paths {
+                                        // Hidden temporary files (.name.tmp, .name.import) come
+                                        // and go during writes, the final rename is what counts.
+                                        let hidden = path
+                                            .file_name()
+                                            .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+                                        if hidden {
+                                            continue;
+                                        }
+                                        let path_type = if path.starts_with(&paths.profiles) {
+                                            PathTypes::Profiles
+                                        } else if path.starts_with(&paths.mic_profiles) {
+                                            PathTypes::MicProfiles
+                                        } else if path.starts_with(&paths.icons) {
+                                            PathTypes::Icons
+                                        } else if path.starts_with(&paths.presets) {
+                                            PathTypes::Presets
+                                        } else if path.starts_with(&paths.samples) {
+                                            PathTypes::Samples
+                                        } else {
+                                            continue;
+                                        };
+                                        if !pending.contains(&path_type) {
+                                            pending.push(path_type);
+                                        }
+                                        deadline = tokio::time::Instant::now() + WATCH_DEBOUNCE;
                                     }
                                 },
 
@@ -354,9 +369,14 @@ pub(crate) fn recursive_file_list(
 
     // Escape the directory, so names like '[Bob]' aren't treated as patterns.
     let base = Pattern::escape(&path.to_string_lossy());
+    // 'Intro.WAV' is a sample too.
+    let options = MatchOptions {
+        case_sensitive: false,
+        ..MatchOptions::new()
+    };
     for extension in extensions {
         let format = format!("{base}/**/*.{extension}");
-        if let Ok(files) = glob(format.as_str()) {
+        if let Ok(files) = glob_with(format.as_str(), options) {
             // Skip entries that can't be read (eg. a folder without permission).
             paths.extend(files.filter_map(|file| file.ok()));
         }
@@ -392,20 +412,53 @@ fn collect_folders(base: &Path, directory: &Path, folders: &mut Vec<String>) {
     }
 }
 
+const WINDOWS_RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Names Windows can't store: reserved device names (with any extension), names ending with a
+/// dot or a space (silently dropped), and characters it refuses.
+fn invalid_on_windows(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    WINDOWS_RESERVED
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(stem))
+        || name.ends_with(['.', ' '])
+        || name.contains(['<', '>', ':', '"', '|', '?', '*'])
+}
+
+/// Checks one name (a file or a folder, no separators) given by a client. Names that existing
+/// files can have are accepted, Windows' rules only apply on Windows.
+fn check_name(name: &str, new: bool) -> Result<()> {
+    let invalid = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+        // Samples and profiles move between systems, so new names follow Windows' rules too.
+        || ((new || cfg!(windows)) && invalid_on_windows(name));
+    if invalid {
+        bail!("Invalid name: {:?}", name);
+    }
+    Ok(())
+}
+
+/// Checks a name for a new file or folder (profile, preset, sample, folder). It's refused when
+/// it can't be stored on every system the utility runs on.
+pub fn validate_file_name(name: &str) -> Result<&str> {
+    check_name(name, true)?;
+    Ok(name)
+}
+
 /// Turns a path relative to the samples directory (from a client, '/' or '\\' separated) into
 /// a full path, refusing anything that could point outside of the samples directory.
 pub(crate) fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = base.to_path_buf();
     let mut parts = 0;
     for part in relative.split(['/', '\\']).filter(|part| !part.is_empty()) {
-        let invalid = part == "."
-            || part == ".."
-            || part
-                .chars()
-                .any(|c| c.is_control() || (cfg!(windows) && c == ':'));
-        if invalid {
-            bail!("Invalid path: {:?}", relative);
-        }
+        check_name(part, false).map_err(|_| anyhow!("Invalid path: {:?}", relative))?;
         path.push(part);
         parts += 1;
     }
@@ -413,6 +466,52 @@ pub(crate) fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
         bail!("Invalid path: {:?}", relative);
     }
     Ok(path)
+}
+
+/// Like `sample_path`, for a path that's about to be created: its last part must be a valid
+/// new name.
+fn new_sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
+    let path = sample_path(base, relative)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    validate_file_name(&name).map_err(|_| anyhow!("Invalid name: {:?}", name))?;
+    Ok(path)
+}
+
+/// Whether a file or folder with exactly this name exists. `Path::exists` also matches other
+/// cases of the name on Windows and macOS, where `Intro.wav` and `intro.wav` are the same file.
+fn exists_exactly(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    fs::read_dir(parent).is_ok_and(|entries| entries.flatten().any(|e| e.file_name() == name))
+}
+
+/// Whether `target` only differs from `source` by the case of its name, and is the same file
+/// on this system (a case insensitive one).
+fn is_case_change(source: &Path, target: &Path) -> bool {
+    let (Some(a), Some(b)) = (source.file_name(), target.file_name()) else {
+        return false;
+    };
+    a != b
+        && source.parent() == target.parent()
+        && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        && target.exists()
+        && !exists_exactly(target)
+}
+
+/// Whether another sample (anywhere in the samples folder) already uses this name. Names are
+/// compared without case: on Windows and macOS two such files are the same one, and profiles
+/// moved there from Linux would play either. `except` is the file being renamed.
+fn sample_name_used(base: &Path, name: &str, except: Option<&Path>) -> bool {
+    let name = name.to_lowercase();
+    recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
+        .iter()
+        .any(|(relative, used)| {
+            used.to_lowercase() == name && except != Some(base.join(relative).as_path())
+        })
 }
 
 fn is_sample_file(path: &Path) -> bool {
@@ -427,7 +526,7 @@ fn is_sample_file(path: &Path) -> bool {
 
 /// Creates a folder in the samples directory, its parent folder must already exist.
 pub fn create_sample_folder(base: &Path, relative: &str) -> Result<()> {
-    let path = sample_path(base, relative)?;
+    let path = new_sample_path(base, relative)?;
     if path.exists() {
         bail!("{} already exists", relative);
     }
@@ -448,13 +547,17 @@ pub struct RenamedSample {
 /// a sample's file name (it's then searched for in every folder), so a file keeps an audio
 /// extension, and a new file name must not already be used by another sample.
 pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<RenamedSample>> {
+    if crate::sample_trash::is_recorded_folder(from) {
+        bail!("The Recorded folder is where recordings go, it can't be moved or renamed");
+    }
     let source = sample_path(base, from)?;
-    let target = sample_path(base, to)?;
+    let target = new_sample_path(base, to)?;
 
     if !source.exists() {
         bail!("{} doesn't exist", from);
     }
-    if target.exists() {
+    let case_change = is_case_change(&source, &target);
+    if target.exists() && !case_change {
         bail!("{} already exists", to);
     }
     if !target.parent().is_some_and(|parent| parent.is_dir()) {
@@ -479,21 +582,65 @@ pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<Rena
         if let (Some(old_name), Some(new_name)) = (old_name, new_name)
             && old_name != new_name
         {
-            let in_use = recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
-                .values()
-                .any(|name| name == &new_name);
-            if in_use {
+            if sample_name_used(base, &new_name, Some(&source)) {
                 bail!("A sample named {} already exists", new_name);
             }
             renamed = Some(RenamedSample { old_name, new_name });
         }
     }
 
-    fs::rename(&source, &target).context(format!("Unable to move {} to {}", from, to))?;
+    let moved = if case_change {
+        rename_case(&source, &target)
+    } else {
+        fs::rename(&source, &target).map_err(Into::into)
+    };
+    moved.context(format!("Unable to move {} to {}", from, to))?;
     Ok(renamed)
 }
 
+/// Changes only the case of a name. Some systems ignore such a rename, so it goes through a
+/// temporary name.
+fn rename_case(source: &Path, target: &Path) -> Result<()> {
+    let name = source.file_name().unwrap_or_default().to_string_lossy();
+    let temp = source.with_file_name(format!(".{}.{}.rename", name, std::process::id()));
+    fs::rename(source, &temp)?;
+    if let Err(e) = fs::rename(&temp, target) {
+        let _ = fs::rename(&temp, source);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// The names of the sample files at a path: the file itself, or every sample inside a folder.
+/// Removes the hidden '.<name>.<id>.import' files an interrupted import leaves behind. Links
+/// aren't followed.
+pub fn remove_stale_imports(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            remove_stale_imports(&path);
+        } else if kind.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                && name.ends_with(".import")
+                && let Err(e) = fs::remove_file(&path)
+            {
+                warn!(
+                    "Unable to remove the leftover import {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
 pub fn sample_names_at(base: &Path, relative: &str) -> Result<Vec<String>> {
     let path = sample_path(base, relative)?;
     if path.is_dir() {
@@ -530,16 +677,7 @@ pub fn edit_sample_file(
 
     let target = match save_as {
         Some(name) => {
-            let name = name.trim();
-            let invalid = name.is_empty()
-                || name == "."
-                || name == ".."
-                || name.chars().any(|c| {
-                    c.is_control() || c == '/' || c == '\\' || (cfg!(windows) && c == ':')
-                });
-            if invalid {
-                bail!("Invalid name: {:?}", name);
-            }
+            let name = validate_file_name(name.trim())?;
             let file_name = if name.to_ascii_lowercase().ends_with(".wav") {
                 name.to_string()
             } else {
@@ -554,18 +692,26 @@ pub fn edit_sample_file(
     let (Some(old_name), Some(new_name)) = (name_of(&source), name_of(&target)) else {
         bail!("Invalid file name");
     };
-    if target != source {
+    // Replacing 'X.WAV' writes 'X.wav', the same file on Windows and macOS.
+    let same_file = save_as.is_none() && is_case_change(&source, &target);
+    if target != source && !same_file {
         if target.exists() {
             bail!("{} already exists", new_name);
         }
-        let in_use = recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
-            .values()
-            .any(|name| name == &new_name);
-        if in_use {
+        let except = save_as.is_none().then_some(source.as_path());
+        if sample_name_used(base, &new_name, except) {
             bail!("A sample named {} already exists", new_name);
         }
     }
 
+    // Refuse long files before decoding them all into memory.
+    if probe_duration(&source).is_some_and(|seconds| seconds > MAX_EDIT_SECONDS as f64) {
+        bail!(
+            "{} is longer than {} minutes, which is too long to edit",
+            relative,
+            MAX_EDIT_SECONDS / 60
+        );
+    }
     let mut audio =
         DecodedAudio::decode(&source).context(format!("Unable to read {}", relative))?;
     audio.remove_ranges(&edit.remove)?;
@@ -576,7 +722,7 @@ pub fn edit_sample_file(
     // Keep the original in the trash when replacing it, the edit can then be undone.
     let replacing = save_as.is_none();
     if replacing {
-        trash_sample_path(base, backups, relative)?;
+        trash_sample_path(base, backups, relative, vec![])?;
     }
 
     let written = atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)));
@@ -614,8 +760,9 @@ pub fn free_sample_name(base: &Path, name: &str) -> String {
     let used: std::collections::HashSet<String> =
         recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
             .into_values()
+            .map(|name| name.to_lowercase())
             .collect();
-    if !used.contains(name) {
+    if !used.contains(&name.to_lowercase()) {
         return name.to_string();
     }
     let (stem, extension) = match name.rfind('.') {
@@ -624,7 +771,7 @@ pub fn free_sample_name(base: &Path, name: &str) -> String {
     };
     (2..)
         .map(|count| format!("{stem} ({count}){extension}"))
-        .find(|candidate| !used.contains(candidate))
+        .find(|candidate| !used.contains(&candidate.to_lowercase()))
         .expect("an unused name")
 }
 
@@ -653,16 +800,14 @@ pub fn duplicate_sample(base: &Path, relative: &str) -> Result<String> {
 /// Where an imported sample file goes: `folder` (relative to the samples directory, empty for
 /// the top), under a free name. Only audio files are accepted.
 pub fn import_sample_target(base: &Path, folder: &str, file_name: &str) -> Result<PathBuf> {
-    // Only keep the file name the client sent, never a path.
-    let name = Path::new(file_name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let invalid = name.is_empty()
-        || name
-            .chars()
-            .any(|c| c.is_control() || (cfg!(windows) && c == ':'));
-    if invalid || !is_sample_file(Path::new(&name)) {
+    // Only keep the file name the client sent, never a path. Browsers may send a Windows path
+    // ('C:\\fakepath\\new.mp3'), whatever system the daemon runs on.
+    let name = file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if validate_file_name(name).is_err() || !is_sample_file(Path::new(name)) {
         bail!(
             "{} isn't a supported audio file ({})",
             file_name,
@@ -678,7 +823,7 @@ pub fn import_sample_target(base: &Path, folder: &str, file_name: &str) -> Resul
     if !directory.is_dir() {
         bail!("The folder {} doesn't exist", folder);
     }
-    Ok(directory.join(free_sample_name(base, &name)))
+    Ok(directory.join(free_sample_name(base, name)))
 }
 
 pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
@@ -718,16 +863,46 @@ pub fn create_path(path: &Path) -> Result<()> {
 /// Builds the path of a named file (profile, preset..) in a directory. Names come from clients,
 /// so refuse any that could point outside of that directory.
 pub fn named_file_path(directory: &Path, name: &str, extension: &str) -> Result<PathBuf> {
-    let invalid = name.is_empty()
-        || name == "."
-        || name == ".."
-        || name
-            .chars()
-            .any(|c| c.is_control() || c == '/' || c == '\\' || (cfg!(windows) && c == ':'));
-    if invalid {
-        bail!("Invalid name: {:?}", name);
-    }
+    check_name(name, false)?;
     Ok(directory.join(format!("{name}.{extension}")))
+}
+
+/// Like `named_file_path`, for a file about to be created under a new name.
+pub fn new_named_file_path(directory: &Path, name: &str, extension: &str) -> Result<PathBuf> {
+    validate_file_name(name)?;
+    named_file_path(directory, name, extension)
+}
+
+/// Renames a named file (profile, mic profile) in its directory. Changing only the case works on
+/// case insensitive systems too.
+pub fn rename_named_file(directory: &Path, from: &str, to: &str, extension: &str) -> Result<()> {
+    let source = named_file_path(directory, from, extension)?;
+    let target = new_named_file_path(directory, to, extension)?;
+    if !source.is_file() {
+        bail!("{} doesn't exist", from);
+    }
+    if is_case_change(&source, &target) {
+        return rename_case(&source, &target);
+    }
+    if target.exists() {
+        bail!("{} already exists", to);
+    }
+    fs::rename(&source, &target).context(format!("Unable to rename {} to {}", from, to))?;
+    Ok(())
+}
+
+/// Copies a named file (profile, mic profile) under a new name in the same directory.
+pub fn duplicate_named_file(directory: &Path, from: &str, to: &str, extension: &str) -> Result<()> {
+    let source = named_file_path(directory, from, extension)?;
+    let target = new_named_file_path(directory, to, extension)?;
+    if !source.is_file() {
+        bail!("{} doesn't exist", from);
+    }
+    if target.exists() {
+        bail!("{} already exists", to);
+    }
+    fs::copy(&source, &target).context(format!("Unable to copy {} to {}", from, to))?;
+    Ok(())
 }
 
 pub fn can_create_new_file(path: PathBuf) -> Result<()> {
@@ -839,8 +1014,8 @@ mod sample_management_tests {
 
     #[test]
     fn create_rename_and_move() {
-        let base = std::env::temp_dir().join(format!("goxlr-test-manage-{}", std::process::id()));
-        fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
         fs::write(base.join("intro.wav"), b"").unwrap();
         fs::write(base.join("outro.mp3"), b"").unwrap();
 
@@ -889,8 +1064,6 @@ mod sample_management_tests {
             folders,
             vec!["Stingers".to_string(), format!("Stingers{separator}Old")]
         );
-
-        fs::remove_dir_all(&base).unwrap();
     }
 }
 
@@ -919,7 +1092,8 @@ mod sample_edit_tests {
 
     #[test]
     fn edit_duplicate_and_import() {
-        let root = std::env::temp_dir().join(format!("goxlr-test-edit-{}", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let base = root.join("samples");
         let backups = root.join("backups");
         fs::create_dir_all(base.join("Jingles/Old")).unwrap();
@@ -977,12 +1151,10 @@ mod sample_edit_tests {
         let target = import_sample_target(&base, "Jingles/Old", "b.wav").unwrap();
         assert_eq!(target, base.join("Jingles/Old/b (2).wav"));
         let target = import_sample_target(&base, "", "C:\\fakepath\\new.mp3").unwrap();
-        assert!(target.ends_with("new.mp3") || target.ends_with("C:\\fakepath\\new.mp3"));
+        assert_eq!(target, base.join("new.mp3"));
         assert!(import_sample_target(&base, "", "virus.exe").is_err());
         assert!(import_sample_target(&base, "Missing", "new.wav").is_err());
         assert!(import_sample_target(&base, "../..", "new.wav").is_err());
-
-        fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -992,8 +1164,11 @@ mod lookup_tests {
 
     #[test]
     fn finds_files_with_pattern_characters() {
-        let base =
-            std::env::temp_dir().join(format!("goxlr-test-[samples]-{}", std::process::id()));
+        let dir = tempfile::Builder::new()
+            .prefix("goxlr-test-[samples]")
+            .tempdir()
+            .unwrap();
+        let base = dir.path().to_path_buf();
         let sub = base.join("Recorded [Live]");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("Song [Live].wav"), b"").unwrap();
@@ -1013,7 +1188,143 @@ mod lookup_tests {
             Some(&String::from("Song [Live].wav"))
         );
         assert_eq!(manager_list.len(), 2);
+    }
+}
 
-        fs::remove_dir_all(&base).unwrap();
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
+
+    #[test]
+    fn names_follow_every_systems_rules() {
+        for good in [
+            "intro.wav",
+            "My Profile",
+            "v1.2 (stream)",
+            "Ça va.mp3",
+            "CONSOLE.wav",
+        ] {
+            assert!(validate_file_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "bad\nname",
+            "CON",
+            "nul.wav",
+            "Com1.mp3",
+            "Jingles.",
+            "trailing ",
+            "what?.wav",
+            "a:b.wav",
+            "<x>",
+        ] {
+            assert!(validate_file_name(bad).is_err(), "{bad:?}");
+        }
+
+        // Existing names are still found on Linux, new ones must be portable
+        let dir = Path::new("/samples");
+        let lookup = sample_path(dir, "Live: 2024/a.wav");
+        assert_eq!(lookup.is_ok(), !cfg!(windows));
+        assert!(new_sample_path(dir, "Folder/CON").is_err());
+        assert!(named_file_path(dir, "Stream: Main", "goxlr").is_ok() != cfg!(windows));
+        assert!(new_named_file_path(dir, "Stream: Main", "goxlr").is_err());
+    }
+
+    #[test]
+    fn uppercase_extensions_are_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::create_dir_all(base.join("Jingles")).unwrap();
+        fs::write(base.join("Jingles/Intro.WAV"), b"").unwrap();
+        fs::write(base.join("outro.Mp3"), b"").unwrap();
+
+        let mut names: Vec<String> =
+            recursive_file_list(base.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
+                .into_values()
+                .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["Intro.WAV".to_string(), "outro.Mp3".to_string()]
+        );
+
+        // Names are unique without case, so they can't collide on Windows and macOS
+        assert_eq!(free_sample_name(base, "intro.wav"), "intro (2).wav");
+        assert!(
+            import_sample_target(base, "", "INTRO.wav")
+                .unwrap()
+                .ends_with("INTRO (2).wav")
+        );
+        assert!(move_sample_path(base, "outro.Mp3", "Jingles/intro.wav").is_err());
+    }
+
+    #[test]
+    fn case_only_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::write(base.join("intro.wav"), b"intro").unwrap();
+
+        let renamed = move_sample_path(base, "intro.wav", "Intro.wav")
+            .unwrap()
+            .expect("name changed");
+        assert_eq!(renamed.new_name, "Intro.wav");
+        assert!(exists_exactly(&base.join("Intro.wav")));
+        assert!(!exists_exactly(&base.join("intro.wav")));
+        assert_eq!(fs::read(base.join("Intro.wav")).unwrap(), b"intro");
+    }
+
+    #[test]
+    fn rename_and_duplicate_named_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::write(base.join("Stream.goxlr"), b"stream").unwrap();
+        fs::write(base.join("Music.goxlr"), b"music").unwrap();
+
+        duplicate_named_file(base, "Stream", "Stream copy", "goxlr").unwrap();
+        assert_eq!(fs::read(base.join("Stream copy.goxlr")).unwrap(), b"stream");
+        assert!(duplicate_named_file(base, "Stream", "Music", "goxlr").is_err());
+        assert!(duplicate_named_file(base, "Missing", "Other", "goxlr").is_err());
+
+        rename_named_file(base, "Stream copy", "Late night", "goxlr").unwrap();
+        assert!(!base.join("Stream copy.goxlr").exists());
+        assert!(rename_named_file(base, "Late night", "Music", "goxlr").is_err());
+        assert!(rename_named_file(base, "Late night", "CON", "goxlr").is_err());
+        rename_named_file(base, "Late night", "LATE night", "goxlr").unwrap();
+        assert!(exists_exactly(&base.join("LATE night.goxlr")));
+    }
+
+    #[test]
+    fn restore_keeps_names_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(base.join("Jingles")).unwrap();
+        fs::write(base.join("intro.wav"), b"old").unwrap();
+        trash_sample_path(&base, &backups, "intro.wav", vec![]).unwrap();
+
+        // Another intro.wav arrived in a different folder meanwhile
+        fs::write(base.join("Jingles/Intro.wav"), b"new").unwrap();
+        let id = list_trash(&backups)[0].id.clone();
+        assert!(restore_trash_item(&base, &backups, &id).is_err());
+        fs::remove_file(base.join("Jingles/Intro.wav")).unwrap();
+        assert!(restore_trash_item(&base, &backups, &id).is_ok());
+    }
+
+    #[test]
+    fn failed_edit_restores_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("intro.wav"), b"original").unwrap();
+        trash_sample_path(&base, &backups, "intro.wav", vec![]).unwrap();
+        assert!(!base.join("intro.wav").exists());
+
+        restore_latest_trash_of(&base, &backups, "intro.wav");
+        assert_eq!(fs::read(base.join("intro.wav")).unwrap(), b"original");
+        assert!(list_trash(&backups).is_empty());
     }
 }
