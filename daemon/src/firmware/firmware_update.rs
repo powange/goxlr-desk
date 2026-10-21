@@ -153,10 +153,15 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
     reboot_goxlr(&device.serial, sender.clone()).await;
 }
 
-async fn get_firmware_file(
-    device: &FirmwareUpdateDevice,
-    sender: Sender,
-) -> Result<(String, VersionNumber)> {
+/// What the manifest says to download: the file, its version, and its SHA-256 when the
+/// manifest gives one.
+struct ManifestEntry {
+    file: String,
+    version: VersionNumber,
+    sha256: Option<String>,
+}
+
+async fn get_firmware_file(device: &FirmwareUpdateDevice, sender: Sender) -> Result<ManifestEntry> {
     set_update_state(&device.serial, sender.clone(), UpdateState::Manifest).await?;
 
     // Firstly, grab some variables depending on device..
@@ -169,6 +174,11 @@ async fn get_firmware_file(
         DeviceType::Unknown => bail!("Unknown Device Type"),
         DeviceType::Full => "version",
         DeviceType::Mini => "miniVersion",
+    };
+    let sha_key = match device.device_type {
+        DeviceType::Unknown => bail!("Unknown Device Type"),
+        DeviceType::Full => "fwFullSha256",
+        DeviceType::Mini => "fwMiniSha256",
     };
     let fail_back_path = match device.device_type {
         DeviceType::Unknown => bail!("Unknown Device Type"),
@@ -199,24 +209,33 @@ async fn get_firmware_file(
             bail!("Unable to obtain Firmware Version");
         };
 
-        return if root.attributes.contains_key(file_key) {
-            Ok((root.attributes[file_key].clone(), version))
-        } else {
-            Ok((String::from(fail_back_path), version))
-        };
+        let file = root
+            .attributes
+            .get(file_key)
+            .cloned()
+            .unwrap_or_else(|| String::from(fail_back_path));
+        let sha256 = root
+            .attributes
+            .get(sha_key)
+            .map(|sha| sha.trim().to_lowercase());
+        return Ok(ManifestEntry {
+            file,
+            version,
+            sha256,
+        });
     }
     bail!("Error Downloading Manifest from TC-Helicon Servers");
 }
 
 async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Result<FirmwareInfo> {
     // First thing we're going to do, is determine which file to download
-    let file_name = get_firmware_file(device, sender.clone()).await?;
+    let entry = get_firmware_file(device, sender.clone()).await?;
 
     // Now we'll grab and process that file
     set_update_state(&device.serial, sender.clone(), UpdateState::Download).await?;
     // The name comes from the server's manifest: only its last part is used on disk, and a
     // path leaving the firmware folder on the server is refused.
-    let remote = file_name.0.replace('\\', "/");
+    let remote = entry.file.replace('\\', "/");
     if remote.starts_with('/')
         || remote
             .split('/')
@@ -224,13 +243,13 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
     {
         bail!(
             "Unexpected firmware file name in the manifest: {}",
-            file_name.0
+            entry.file
         );
     }
     let Some(local_name) = remote.rsplit('/').next().filter(|name| !name.is_empty()) else {
         bail!(
             "Unexpected firmware file name in the manifest: {}",
-            file_name.0
+            entry.file
         );
     };
     let url = format!("{}{}", FIRMWARE_PATHS[device.source], remote);
@@ -238,7 +257,7 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
 
     info!(
         "Downloading Firmware, URL: {}, Expected Version: {}",
-        url, file_name.1
+        url, entry.version
     );
 
     if output_path.exists() && fs::remove_file(&output_path).is_err() {
@@ -272,12 +291,25 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
             }
         }
 
+        // A download cut short (the server closed early) is never used
+        file.flush()?;
+        if downloaded != size {
+            bail!("Firmware download incomplete ({downloaded} of {size} bytes)");
+        }
+        if let Some(expected) = &entry.sha256 {
+            let actual = sha256_of(&output_path)?;
+            if &actual != expected {
+                bail!("Downloaded Firmware doesn't match the manifest (SHA-256 {actual})");
+            }
+            info!("Firmware SHA-256 matches the manifest");
+        }
+
         let firmware_info = check_firmware(&output_path)?;
-        if firmware_info.version != file_name.1 {
+        if firmware_info.version != entry.version {
             bail!(
                 "Downloaded Firmware version does not match expected firmware (Received: {}, Expected: {})",
                 firmware_info.version,
-                file_name.1
+                entry.version
             );
         }
 
@@ -654,4 +686,33 @@ pub enum FirmwareMessages {
     PollHardwareWrite(OneShot<Result<HardwareProgressResponse>>),
 
     RebootGoXLR(OneShot<Result<()>>),
+}
+
+/// The SHA-256 of a file, in lower case hexadecimal.
+fn sha256_of(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = File::open(path)?;
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_of_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firmware.bin");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_of(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

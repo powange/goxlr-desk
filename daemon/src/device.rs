@@ -83,6 +83,9 @@ pub struct Device<'a> {
     goxlr: Box<dyn FullGoXLRDevice>,
     hardware: HardwareStatus,
     last_buttons: EnumSet<Buttons>,
+    // When something last moved on the device, and whether polling was told it's idle
+    last_input: Instant,
+    inputs_idle: bool,
     button_states: EnumMap<Buttons, ButtonState>,
     encoder_states: EnumMap<EncoderName, i8>,
     fader_last_seen: EnumMap<FaderName, u8>,
@@ -115,6 +118,8 @@ struct CachedSettings {
     monitor_with_fx: bool,
 }
 
+// Nothing moved on the device for this long: it's polled less often
+const INPUTS_IDLE_AFTER: Duration = Duration::from_secs(30);
 const CHANGES_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -232,6 +237,8 @@ impl<'a> Device<'a> {
             hold_time: Duration::from_millis(hold_time.into()),
             vc_mute_also_mute_cm,
             last_buttons: EnumSet::empty(),
+            last_input: Instant::now(),
+            inputs_idle: false,
             button_states: EnumMap::default(),
             encoder_states: EnumMap::default(),
             fader_last_seen: EnumMap::default(),
@@ -591,7 +598,23 @@ impl<'a> Device<'a> {
         }
 
         self.last_buttons = state.pressed;
+        self.note_input_activity(changed || !self.last_buttons.is_empty());
         Ok(changed)
+    }
+
+    /// Lets the polling slow down once nothing has moved for a while, and speed up again on
+    /// the first move.
+    fn note_input_activity(&mut self, active: bool) {
+        if active {
+            self.last_input = Instant::now();
+            if self.inputs_idle {
+                self.inputs_idle = false;
+                self.goxlr.set_idle(false);
+            }
+        } else if !self.inputs_idle && self.last_input.elapsed() > INPUTS_IDLE_AFTER {
+            self.inputs_idle = true;
+            self.goxlr.set_idle(true);
+        }
     }
 
     async fn on_button_down(&mut self, button: Buttons) -> Result<()> {

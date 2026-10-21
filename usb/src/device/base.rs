@@ -34,6 +34,10 @@ pub trait AttachGoXLR {
     fn set_unique_identifier(&mut self, identifier: String);
     fn is_connected(&mut self) -> bool;
     fn set_is_polling(&mut self, polling: bool);
+
+    /// Nothing has moved on the device for a while (or something just did): a polling backend
+    /// can check less often meanwhile. Event driven backends ignore it.
+    fn set_idle(&mut self, _idle: bool) {}
 }
 
 /// The largest request body the GoXLR takes.
@@ -51,6 +55,46 @@ pub fn encode_request(command: Command, index: u16, body: &[u8]) -> Result<Vec<u
     LittleEndian::write_u16(&mut request[6..8], index);
     request.extend(body);
     Ok(request)
+}
+
+/// A response, read by either backend.
+#[derive(Debug, PartialEq)]
+pub enum Response {
+    /// The body of the response to the request just sent
+    Body(Vec<u8>),
+    /// The response to another request (the indexes are out of step, resync and retry)
+    OtherIndex(u16),
+}
+
+/// Why a response can't be used.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum ResponseError {
+    #[error("Invalid Response received from the GoXLR, Expected: 16, Received: {0}")]
+    ShortHeader(usize),
+    #[error("Response too short, expected {expected} bytes, received {received}")]
+    ShortBody { expected: usize, received: usize },
+}
+
+/// Reads a response for either backend: the 16 byte header (body length, command index), then
+/// the body, cut to the length the header gives (never a short or padded body).
+pub fn decode_response(mut raw: Vec<u8>, index: u16) -> Result<Response, ResponseError> {
+    if raw.len() < 16 {
+        return Err(ResponseError::ShortHeader(raw.len()));
+    }
+    let mut body = raw.split_off(16);
+    let length = LittleEndian::read_u16(&raw[4..6]) as usize;
+    let response_index = LittleEndian::read_u16(&raw[6..8]);
+    if response_index != index {
+        return Ok(Response::OtherIndex(response_index));
+    }
+    if body.len() < length {
+        return Err(ResponseError::ShortBody {
+            expected: length,
+            received: body.len(),
+        });
+    }
+    body.truncate(length);
+    Ok(Response::Body(body))
 }
 
 pub trait ExecutableGoXLR {
@@ -632,6 +676,38 @@ impl UsbData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(length: u16, index: u16, body: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0; 16];
+        LittleEndian::write_u16(&mut raw[4..6], length);
+        LittleEndian::write_u16(&mut raw[6..8], index);
+        raw.extend(body);
+        raw
+    }
+
+    #[test]
+    fn responses_are_decoded_the_same_way_for_both_backends() {
+        // The body is cut to the length in the header (the driver pads it)
+        assert_eq!(
+            decode_response(raw(2, 7, &[1, 2, 0, 0]), 7),
+            Ok(Response::Body(vec![1, 2]))
+        );
+        assert_eq!(
+            decode_response(raw(2, 8, &[1, 2]), 7),
+            Ok(Response::OtherIndex(8))
+        );
+        assert_eq!(
+            decode_response(raw(4, 7, &[1, 2]), 7),
+            Err(ResponseError::ShortBody {
+                expected: 4,
+                received: 2
+            })
+        );
+        assert_eq!(
+            decode_response(vec![0; 10], 7),
+            Err(ResponseError::ShortHeader(10))
+        );
+    }
 
     #[test]
     fn requests_are_encoded_and_never_truncated() {

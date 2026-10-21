@@ -1,16 +1,15 @@
 use crate::commands::Command;
 use crate::device::base::{
-    AttachGoXLR, ExecutableGoXLR, FullGoXLRDevice, GoXLRCommands, GoXLRDevice, UsbData,
-    encode_request,
+    AttachGoXLR, ExecutableGoXLR, FullGoXLRDevice, GoXLRCommands, GoXLRDevice, Response, UsbData,
+    decode_response, encode_request,
 };
 use crate::device::tusb::tusbaudio::{
-    DeviceHandle, EventChannelReceiver, EventChannelSender, TUSB_INTERFACE, get_devices,
-    get_version, is_invalid_handle,
+    DeviceHandle, EventChannelReceiver, EventChannelSender, get_devices, get_version,
+    is_invalid_handle, tusb_interface,
 };
 use anyhow::{Result, bail};
-use byteorder::{ByteOrder, LittleEndian};
 use goxlr_types::{DriverInterface, VersionNumber};
-use log::{debug, error, warn};
+use log::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -168,8 +167,12 @@ impl AttachGoXLR for TUSBAudioGoXLR {
                     input_changed: thread_event_sender,
                 };
 
-                // Spawn the Event Loop..
-                let _ = TUSB_INTERFACE.event_loop(
+                // Spawn the Event Loop (without the driver, the ready signal never comes and
+                // attaching fails)..
+                let Ok(tusb) = tusb_interface() else {
+                    return;
+                };
+                let _ = tusb.event_loop(
                     thread_device_identifier.clone(),
                     thread_daemon_identifier,
                     sender,
@@ -311,53 +314,27 @@ impl ExecutableGoXLR for TUSBAudioGoXLR {
             }
         }
 
-        let mut response_header = response_value?;
-        if response_header.len() < 16 {
-            error!(
-                "Invalid Response received from the GoXLR, Expected: 16, Received: {}",
-                response_header.len()
-            );
-            bail!("Invalid Response");
+        match decode_response(response_value?, command_index)? {
+            Response::Body(body) => Ok(body),
+            Response::OtherIndex(received) => {
+                debug!(
+                    "Mismatched Command Indexes, expected {}, received: {}",
+                    command_index, received
+                );
+                debug!("Full Request: {:?}", full_request);
+                if !retry {
+                    debug!("Attempting Resync and Retry");
+                    self.perform_request(Command::ResetCommandIndex, &[], true)?;
+
+                    debug!("Resync complete, retrying Command..");
+                    self.perform_request(command, body, true)
+                } else {
+                    debug!("Resync Failed, Throwing Error..");
+                    self.trigger_disconnect();
+                    bail!("Invalid Response received from GoXLR, disconnecting!");
+                }
+            }
         }
-
-        let mut response = response_header.split_off(16);
-        let response_length = LittleEndian::read_u16(&response_header[4..6]);
-        let response_command_index = LittleEndian::read_u16(&response_header[6..8]);
-
-        if response_command_index != command_index {
-            debug!("Mismatched Command Indexes..");
-            debug!(
-                "Expected {}, received: {}",
-                command_index, response_command_index
-            );
-            debug!("Full Request: {:?}", full_request);
-            debug!("Response Header: {:?}", response_header);
-            debug!("Response Body: {:?}", response);
-
-            return if !retry {
-                debug!("Attempting Resync and Retry");
-                self.perform_request(Command::ResetCommandIndex, &[], true)?;
-
-                debug!("Resync complete, retrying Command..");
-                self.perform_request(command, body, true)
-            } else {
-                debug!("Resync Failed, Throwing Error..");
-                self.trigger_disconnect();
-                bail!("Invalid Response received from GoXLR, disconnecting!");
-            };
-        }
-
-        // The header says how long the body is, never hand back a short or padded body.
-        let response_length = response_length as usize;
-        if response.len() < response_length {
-            bail!(
-                "Response too short, expected {} bytes, received {}",
-                response_length,
-                response.len()
-            );
-        }
-        response.truncate(response_length);
-        Ok(response)
     }
 
     fn get_descriptor(&self) -> Result<UsbData> {

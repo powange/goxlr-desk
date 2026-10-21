@@ -16,6 +16,7 @@ tts = ["dep:tts"]
 [dependencies]
 goxlr-usb = { path = "../usb" }
 goxlr-ipc = { path = "../ipc" }
+sha2 = "0.10.9"
 schemars = { workspace = true }
 goxlr-types = { path = "../types" }
 goxlr-audio = { path = "../audio" }
