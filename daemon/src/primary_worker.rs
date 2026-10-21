@@ -1,4 +1,5 @@
 use crate::device::Device;
+use crate::device_actor::{DeviceActor, DeviceUpdate, Reply};
 use crate::events::EventTriggers;
 use crate::files::{
     RenamedSample, create_sample_folder, duplicate_sample, edit_sample_file, extract_defaults,
@@ -25,8 +26,8 @@ use goxlr_audio::editor::probe_duration;
 use goxlr_ipc::{
     Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
     FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
-    NetworkAccess, PathTypes, Paths, ProfileTrashItem, SampleFile, SampleTrashItem, SampleUsage,
-    UpdateState, UsbProductInformation,
+    MixerStatus, NetworkAccess, PathTypes, Paths, ProfileTrashItem, SampleFile, SampleTrashItem,
+    SampleUsage, UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::{FullGoXLRDevice, GoXLRDevice};
@@ -162,7 +163,10 @@ pub async fn spawn_usb_handler(
     let mut driver_interface = DriverDetails { interface, version };
 
     // Create the Primary Device List, and 'Ignore' list..
-    let mut devices: HashMap<String, Device> = HashMap::new();
+    // Each device runs in its own task (see device_actor), and sends its status back here
+    let mut devices: HashMap<String, DeviceActor> = HashMap::new();
+    let mut mixers: HashMap<String, MixerStatus> = HashMap::new();
+    let (update_tx, mut update_rx) = mpsc::channel::<DeviceUpdate>(32);
     let mut devices_firmware: HashMap<String, FirmwareUpdateState> = HashMap::new();
     let mut ignore_list: HashMap<DeviceKey, (Instant, u32)> = HashMap::new();
 
@@ -178,7 +182,7 @@ pub async fn spawn_usb_handler(
 
     let mut files = get_files(&mut file_manager, &settings).await;
     let mut daemon_status = get_daemon_status(
-        &devices,
+        &mixers,
         &settings,
         &http_settings,
         &driver_interface,
@@ -200,6 +204,7 @@ pub async fn spawn_usb_handler(
         // inputs moved (only its part is: that's most changes, while faders move)
         let mut change_found = false;
         let mut device_changed: Option<String> = None;
+        let mut pending_reply: Option<Reply> = None;
         tokio::select! {
             Some(version) = firmware_receiver.recv() => {
                 firmware_version = Some(version);
@@ -236,10 +241,12 @@ pub async fn spawn_usb_handler(
                         }
                     }
                     FirmwareRequest::FirmwareMessage(serial,message) => {
-                        if let Some(device) = devices.get_mut(&serial) {
+                        if let Some(device) = devices.get(&serial) {
                             // Pass this to the device to manage
-                            device.handle_firmware_message(message).await;
-                            change_found = true;
+                            device.send(move |d| Box::pin(async move {
+                                d.handle_firmware_message(message).await;
+                                true
+                            }));
                         } else {
                             // We need to locate the sender, and inform it that the device is gone, these
                             // will pop back a SetError.
@@ -324,7 +331,8 @@ pub async fn spawn_usb_handler(
                     Ok(device) => {
                         let serial = String::from(device.serial());
 
-                        devices.insert(serial.clone(), device);
+                        mixers.insert(serial.clone(), device.status().await);
+                        devices.insert(serial.clone(), DeviceActor::spawn(device, update_tx.clone()));
                         ignore_list.remove(&key);
                         change_found = true;
 
@@ -350,16 +358,8 @@ pub async fn spawn_usb_handler(
                 }
             },
             () = &mut update_sleep => {
-                for device in devices.values_mut() {
-                    let updated = device.update_state().await;
-
-                    if let Ok(result) = updated {
-                        change_found |= result;
-                    }
-
-                    if let Err(error) = updated {
-                        warn!("Error Received from {} while updating state: {}", device.serial(), error);
-                    }
+                for device in devices.values() {
+                    device.tick();
                 }
                 update_sleep.as_mut().reset(tokio::time::Instant::now() + update_duration);
             },
@@ -380,6 +380,7 @@ pub async fn spawn_usb_handler(
             Some(serial) = disconnect_receiver.recv() => {
                 info!("[{}] Device Disconnected", serial);
                 devices.remove(&serial);
+                mixers.remove(&serial);
 
                 // If this device was actively doing a firmware update that's not complete, we should scream
                 // INCREDIBLY loudly (in the logs).. We will keep this device around though, the error will
@@ -394,18 +395,20 @@ pub async fn spawn_usb_handler(
                 change_found = true;
             },
             Some(serial) = event_receiver.recv() => {
-                if let Some(device) = devices.get_mut(&serial) {
-                    let result = device.monitor_inputs().await;
-                    if let Ok(true) = result {
-                        device_changed = Some(serial.clone());
-                    }
-
-                    if let Err(error) = result {
-                        warn!("Error Received from {}: {}", device.serial(), error);
-                    }
+                if let Some(device) = devices.get(&serial) {
+                    device.input_event();
                 } else {
                     warn!("Cannot find registered device with serial: {}", serial);
                 }
+            }
+            Some(update) = update_rx.recv() => {
+                // A device that was removed meanwhile is gone from the status
+                if devices.contains_key(&update.serial) {
+                    mixers.insert(update.serial.clone(), update.status);
+                    device_changed = Some(update.serial);
+                }
+                // Answered once the status below is up to date
+                pending_reply = update.reply;
             }
             Some(event) = device_state_rx.recv() => {
                 match event {
@@ -417,8 +420,8 @@ pub async fn spawn_usb_handler(
                         shutdown_triggered = true;
 
                         // Flip through all the devices, send a shutdown signal..
-                        for device in devices.values_mut() {
-                            device.shutdown(avoid_write).await;
+                        for device in devices.values() {
+                            let _ = device.run(move |d| Box::pin(d.shutdown(avoid_write))).await;
                         }
 
                         // Send a notification that we're done here..
@@ -426,25 +429,27 @@ pub async fn spawn_usb_handler(
                     },
                     DeviceStateChange::Sleep(sender) => {
                         debug!("Received Sleep Notification");
-                        for device in devices.values_mut() {
-                            device.sleep().await;
+                        for device in devices.values() {
+                            let _ = device.run(|d| Box::pin(d.sleep())).await;
                         }
                         let _ = sender.send(());
                     },
                     DeviceStateChange::Command(command) => {
                         let mut serials: Vec<String> = devices.keys().cloned().collect();
                         serials.sort();
-                        if let Some(device) = serials.first().and_then(|s| devices.get_mut(s)) {
-                            if let Err(e) = device.perform_command(command).await {
-                                warn!("Unable to run the tray's command: {}", e);
-                            }
-                            change_found = true;
+                        if let Some(device) = serials.first().and_then(|s| devices.get(s)) {
+                            device.send(move |d| Box::pin(async move {
+                                if let Err(e) = d.perform_command(command).await {
+                                    warn!("Unable to run the tray's command: {}", e);
+                                }
+                                true
+                            }));
                         }
                     }
                     DeviceStateChange::Wake(sender) => {
                         debug!("Received Wake Notification");
-                        for device in devices.values_mut() {
-                            device.wake().await;
+                        for device in devices.values() {
+                            let _ = device.run(|d| Box::pin(d.wake())).await;
                         }
                         let _ = sender.send(());
 
@@ -604,10 +609,13 @@ pub async fn spawn_usb_handler(
                                 // them: they're put back if the file is restored.
                                 let names: HashSet<String> =
                                     sample_names_at(&base, &path).unwrap_or_default().into_iter().collect();
-                                let tracks: Vec<_> = devices
-                                    .values_mut()
-                                    .flat_map(|device| device.trashed_tracks(&names))
-                                    .collect();
+                                let mut tracks = Vec::new();
+                                for device in devices.values() {
+                                    let names = names.clone();
+                                    if let Ok(found) = device.run(move |d| Box::pin(async move { d.trashed_tracks(&names) })).await {
+                                        tracks.extend(found);
+                                    }
+                                }
                                 // Kept in the trash (with its gain setting), so it can be restored.
                                 // A move to another drive copies files, so it's done in the background.
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
@@ -736,18 +744,16 @@ pub async fn spawn_usb_handler(
                     },
 
                     DeviceCommand::RunDeviceCommand(serial, command, sender) => {
-                        if let Some(device) = devices.get_mut(&serial) {
-                            let result = match device.perform_command(command.clone()).await {
-                                Ok(result) => {
-                                    Ok(result)
-                                }
-                                Err(error) => {
+                        if let Some(device) = devices.get(&serial) {
+                            // Run by the device's task, the answer comes once the status is
+                            // up to date
+                            device.send_reply(true, sender, move |d| Box::pin(async move {
+                                let result = d.perform_command(command.clone()).await;
+                                if let Err(error) = &result {
                                     warn!("Error Executing: {:?}, {}", command, error);
-                                    Err(error)
                                 }
-                            };
-                            let _ = sender.send(result);
-                            change_found = true;
+                                result
+                            }));
                         } else {
                             let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
                         }
@@ -766,11 +772,16 @@ pub async fn spawn_usb_handler(
                             Ok(names) => {
                                 let names: HashSet<String> = names.into_iter().collect();
                                 // The loaded profiles may have changes that aren't saved yet.
-                                let loaded: BTreeSet<String> = devices
-                                    .values()
-                                    .filter(|device| device.profile().uses_sample_file(&names))
-                                    .map(|device| device.profile().name().to_string())
-                                    .collect();
+                                let mut loaded: BTreeSet<String> = BTreeSet::new();
+                                for device in devices.values() {
+                                    let check = names.clone();
+                                    let used = device.run(move |d| Box::pin(async move {
+                                        d.profile().uses_sample_file(&check).then(|| d.profile().name().to_string())
+                                    })).await;
+                                    if let Ok(Some(name)) = used {
+                                        loaded.insert(name);
+                                    }
+                                }
                                 // Reading every saved profile is slow, so it's done in the background.
                                 tokio::spawn(async move {
                                     let result = tokio::task::spawn_blocking(move || {
@@ -789,8 +800,8 @@ pub async fn spawn_usb_handler(
                         }
                     }
                     DeviceCommand::GetDeviceMicLevel(serial, sender) => {
-                        if let Some(device) = devices.get_mut(&serial) {
-                            let _ = sender.send(device.get_mic_level().await);
+                        if let Some(device) = devices.get(&serial) {
+                            device.send_reply(false, sender, |d| Box::pin(d.get_mic_level()));
                         } else {
                             let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
                         }
@@ -798,7 +809,7 @@ pub async fn spawn_usb_handler(
 
                     DeviceCommand::RunFirmwareUpdate(serial, file, force, sender) => {
                         let mut start_update = true;
-                        if let Some(device) = devices.get_mut(&serial) {
+                        if let Some(device) = devices.get(&serial) {
                             if let Some(state) = devices_firmware.get(&serial) {
                                 match state.status.state {
                                     UpdateState::Failed | UpdateState::Complete | UpdateState::Pause(_) => {
@@ -811,8 +822,13 @@ pub async fn spawn_usb_handler(
                             }
 
                             if start_update {
-                                let device_type = device.get_hardware_type();
-                                let current_firmware = device.get_firmware_version();
+                                let Ok((device_type, current_firmware)) = device
+                                    .run(|d| Box::pin(async move { (d.get_hardware_type(), d.get_firmware_version()) }))
+                                    .await
+                                else {
+                                    let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
+                                    continue;
+                                };
 
                                 // Create and run a firmware updater for this device
                                 let update_settings = FirmwareUpdateSettings {
@@ -896,8 +912,11 @@ pub async fn spawn_usb_handler(
                 let result = match done.result {
                     Ok(output) => {
                         if let Some(renamed) = &output.renamed {
-                            for device in devices.values_mut() {
-                                device.rename_sample_file(&renamed.old_name, &renamed.new_name);
+                            for device in devices.values() {
+                                let (old, new) = (renamed.old_name.clone(), renamed.new_name.clone());
+                                let _ = device.run(move |d| Box::pin(async move {
+                                    d.rename_sample_file(&old, &new);
+                                })).await;
                             }
                             settings.rename_sample_gain(&renamed.old_name, &renamed.new_name).await;
                             settings.save().await;
@@ -907,10 +926,14 @@ pub async fn spawn_usb_handler(
                             settings.set_sample_gain_percent(copy.clone(), gain).await;
                             settings.save().await;
                         }
-                        for device in devices.values_mut() {
-                            if let Err(e) = device.restore_trashed_tracks(&output.tracks).await {
-                                warn!("Unable to put the restored sample back on the sampler: {}", e);
-                            }
+                        for device in devices.values() {
+                            let tracks = output.tracks.clone();
+                            device.send(move |d| Box::pin(async move {
+                                if let Err(e) = d.restore_trashed_tracks(&tracks).await {
+                                    warn!("Unable to put the restored sample back on the sampler: {}", e);
+                                }
+                                true
+                            }));
                         }
                         files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
                         change_found = true;
@@ -923,8 +946,11 @@ pub async fn spawn_usb_handler(
             Some(path) = file_rx.recv() => {
                 // Notify devices if Samples have changed..
                 if path == PathTypes::Samples {
-                    for device in devices.values_mut() {
-                        let _ = device.validate_sampler().await;
+                    for device in devices.values() {
+                        device.send(|d| Box::pin(async move {
+                            let _ = d.validate_sampler().await;
+                            true
+                        }));
                     }
                 }
 
@@ -935,7 +961,7 @@ pub async fn spawn_usb_handler(
 
         if change_found {
             let new_status = get_daemon_status(
-                &devices,
+                &mixers,
                 &settings,
                 &http_settings,
                 &driver_interface,
@@ -952,10 +978,10 @@ pub async fn spawn_usb_handler(
                 &broadcast_tx,
             );
         } else if let Some(serial) = device_changed
-            && let Some(device) = devices.get(&serial)
+            && let Some(status) = mixers.get(&serial)
         {
             let mut new_status = daemon_status.clone();
-            new_status.mixers.insert(serial, device.status().await);
+            new_status.mixers.insert(serial, status.clone());
             crate::tray::update_tray_state(&new_status);
             publish_status(
                 new_status,
@@ -963,6 +989,9 @@ pub async fn spawn_usb_handler(
                 &mut status_json,
                 &broadcast_tx,
             );
+        }
+        if let Some(reply) = pending_reply {
+            reply();
         }
     }
 }
@@ -1014,7 +1043,7 @@ fn forget_autostart() {
 // Dis getting big..
 #[allow(clippy::too_many_arguments)]
 async fn get_daemon_status(
-    devices: &HashMap<String, Device<'_>>,
+    mixers: &HashMap<String, MixerStatus>,
     settings: &SettingsHandle,
     http_settings: &HttpSettings,
     driver_details: &DriverDetails,
@@ -1065,10 +1094,8 @@ async fn get_daemon_status(
             .insert(serial.to_owned(), state.status.clone());
     }
 
-    for (serial, device) in devices {
-        status
-            .mixers
-            .insert(serial.to_owned(), device.status().await.clone());
+    for (serial, mixer) in mixers {
+        status.mixers.insert(serial.to_owned(), mixer.clone());
     }
 
     crate::tray::update_tray_state(&status);
@@ -1358,7 +1385,7 @@ fn find_new_device(
     })
 }
 
-fn get_all_serials(existing_devices: &HashMap<String, Device>) -> Vec<String> {
+fn get_all_serials<T>(existing_devices: &HashMap<String, T>) -> Vec<String> {
     let mut serials: Vec<String> = vec![];
 
     for device in existing_devices {
@@ -1437,7 +1464,7 @@ async fn load_device(
     hardware: HardwareStatus,
     global_events: Sender<EventTriggers>,
     settings: &SettingsHandle,
-) -> Result<Device<'_>> {
+) -> Result<Device> {
     let serial_number = hardware.serial_number.clone();
     let device = Device::new(handled_device, hardware, settings, global_events).await?;
     settings

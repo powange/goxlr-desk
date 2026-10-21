@@ -43,6 +43,7 @@ mod audio;
 mod backup;
 mod cli;
 mod device;
+mod device_actor;
 mod events;
 mod files;
 mod firmware;

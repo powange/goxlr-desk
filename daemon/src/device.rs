@@ -79,7 +79,7 @@ macro_rules! set_effect {
     }};
 }
 
-pub struct Device<'a> {
+pub struct Device {
     goxlr: Box<dyn FullGoXLRDevice>,
     hardware: HardwareStatus,
     last_buttons: EnumSet<Buttons>,
@@ -95,7 +95,7 @@ pub struct Device<'a> {
     audio_handler: Option<AudioHandler>,
     hold_time: Duration,
     vc_mute_also_mute_cm: bool,
-    settings: &'a SettingsHandle,
+    settings: SettingsHandle,
     global_events: Sender<EventTriggers>,
 
     last_sample_error: Option<String>,
@@ -152,13 +152,13 @@ pub(crate) struct CurrentState {
     pub(crate) volumes: EnumMap<ChannelName, u8>,
 }
 
-impl<'a> Device<'a> {
+impl Device {
     pub async fn new(
         goxlr: Box<dyn FullGoXLRDevice>,
         hardware: HardwareStatus,
-        settings_handle: &'a SettingsHandle,
+        settings_handle: &SettingsHandle,
         global_events: Sender<EventTriggers>,
-    ) -> Result<Device<'a>> {
+    ) -> Result<Device> {
         debug!("New Device Loading..");
 
         let mut device_type = "";
@@ -244,7 +244,7 @@ impl<'a> Device<'a> {
             fader_last_seen: EnumMap::default(),
             fader_pause_until: EnumMap::default(),
             audio_handler,
-            settings: settings_handle,
+            settings: settings_handle.clone(),
             global_events,
 
             last_sample_error: None,
