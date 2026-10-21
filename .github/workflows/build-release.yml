@@ -52,6 +52,17 @@ jobs:
           ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
+      # Tauri replaces WebView2's drag and drop handler unless this is off, which stops drag and
+      # drop inside the web UI on Windows (moving samples, dropping them on sampler buttons).
+      # The wrapper doesn't use Tauri's own file drop events.
+      - name: "Allow drag and drop in the UI window"
+        shell: bash
+        run: |
+          conf=goxlr-utility-ui/src-tauri/tauri.conf.json
+          jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp"
+          mv "$conf.tmp" "$conf"
+          jq '.app.windows[0]' "$conf"
+
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -221,6 +232,17 @@ jobs:
           # Pinned so a release always builds the same UI, update this to ship a newer UI.
           ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
+
+      # Tauri replaces WebView2's drag and drop handler unless this is off, which stops drag and
+      # drop inside the web UI on Windows (moving samples, dropping them on sampler buttons).
+      # The wrapper doesn't use Tauri's own file drop events.
+      - name: "Allow drag and drop in the UI window"
+        shell: bash
+        run: |
+          conf=goxlr-utility-ui/src-tauri/tauri.conf.json
+          jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp"
+          mv "$conf.tmp" "$conf"
+          jq '.app.windows[0]' "$conf"
 
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
