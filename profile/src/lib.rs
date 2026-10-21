@@ -4,6 +4,7 @@ use strum::{Display, EnumIter, EnumProperty};
 pub mod atomic;
 pub mod components;
 pub mod error;
+pub mod fingerprint;
 pub mod mic_profile;
 pub mod microphone;
 pub mod profile;

@@ -106,6 +106,15 @@ impl Profile {
         })
     }
 
+    /// A hash of what `save` would write, to tell whether the profile changed since it was
+    /// loaded or saved.
+    pub fn fingerprint(&mut self) -> Result<u64> {
+        let mut xml = Vec::new();
+        self.settings.write_to(&mut xml)?;
+        let scribbles: Vec<&[u8]> = self.scribbles.iter().map(|s| s.as_slice()).collect();
+        crate::fingerprint::xml_fingerprint(&xml, &scribbles)
+    }
+
     pub fn save_preset(&self, path: impl AsRef<Path>) -> Result<()> {
         self.settings.write_preset(path)?;
         Ok(())

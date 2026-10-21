@@ -873,6 +873,38 @@ pub fn new_named_file_path(directory: &Path, name: &str, extension: &str) -> Res
     named_file_path(directory, name, extension)
 }
 
+/// Renames a named file (profile, mic profile) in its directory. Changing only the case works on
+/// case insensitive systems too.
+pub fn rename_named_file(directory: &Path, from: &str, to: &str, extension: &str) -> Result<()> {
+    let source = named_file_path(directory, from, extension)?;
+    let target = new_named_file_path(directory, to, extension)?;
+    if !source.is_file() {
+        bail!("{} doesn't exist", from);
+    }
+    if is_case_change(&source, &target) {
+        return rename_case(&source, &target);
+    }
+    if target.exists() {
+        bail!("{} already exists", to);
+    }
+    fs::rename(&source, &target).context(format!("Unable to rename {} to {}", from, to))?;
+    Ok(())
+}
+
+/// Copies a named file (profile, mic profile) under a new name in the same directory.
+pub fn duplicate_named_file(directory: &Path, from: &str, to: &str, extension: &str) -> Result<()> {
+    let source = named_file_path(directory, from, extension)?;
+    let target = new_named_file_path(directory, to, extension)?;
+    if !source.is_file() {
+        bail!("{} doesn't exist", from);
+    }
+    if target.exists() {
+        bail!("{} already exists", to);
+    }
+    fs::copy(&source, &target).context(format!("Unable to copy {} to {}", from, to))?;
+    Ok(())
+}
+
 pub fn can_create_new_file(path: PathBuf) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.exists()
@@ -1244,6 +1276,26 @@ mod name_tests {
         assert!(exists_exactly(&base.join("Intro.wav")));
         assert!(!exists_exactly(&base.join("intro.wav")));
         assert_eq!(fs::read(base.join("Intro.wav")).unwrap(), b"intro");
+    }
+
+    #[test]
+    fn rename_and_duplicate_named_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::write(base.join("Stream.goxlr"), b"stream").unwrap();
+        fs::write(base.join("Music.goxlr"), b"music").unwrap();
+
+        duplicate_named_file(base, "Stream", "Stream copy", "goxlr").unwrap();
+        assert_eq!(fs::read(base.join("Stream copy.goxlr")).unwrap(), b"stream");
+        assert!(duplicate_named_file(base, "Stream", "Music", "goxlr").is_err());
+        assert!(duplicate_named_file(base, "Missing", "Other", "goxlr").is_err());
+
+        rename_named_file(base, "Stream copy", "Late night", "goxlr").unwrap();
+        assert!(!base.join("Stream copy.goxlr").exists());
+        assert!(rename_named_file(base, "Late night", "Music", "goxlr").is_err());
+        assert!(rename_named_file(base, "Late night", "CON", "goxlr").is_err());
+        rename_named_file(base, "Late night", "LATE night", "goxlr").unwrap();
+        assert!(exists_exactly(&base.join("LATE night.goxlr")));
     }
 
     #[test]

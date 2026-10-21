@@ -87,6 +87,11 @@ pub struct MixerStatus {
     pub button_down: EnumMap<Button, bool>,
     pub profile_name: String,
     pub mic_profile_name: String,
+    // Whether the profile / mic profile changed since it was loaded or saved
+    #[serde(default)]
+    pub profile_modified: bool,
+    #[serde(default)]
+    pub mic_profile_modified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

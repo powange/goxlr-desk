@@ -350,6 +350,9 @@ pub enum GoXLRCommand {
     SaveProfile(),
     SaveProfileAs(String),
     DeleteProfile(String),
+    // Renames or copies a profile file: (current name, new name)
+    RenameProfile(String, String),
+    DuplicateProfile(String, String),
     ReloadSettings(),
 
     NewMicProfile(String),
@@ -357,6 +360,8 @@ pub enum GoXLRCommand {
     SaveMicProfile(),
     SaveMicProfileAs(String),
     DeleteMicProfile(String),
+    RenameMicProfile(String, String),
+    DuplicateMicProfile(String, String),
 
     // General Settings
     SetMuteHoldDuration(u16),

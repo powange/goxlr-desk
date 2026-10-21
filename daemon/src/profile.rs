@@ -190,6 +190,15 @@ impl ProfileAdapter {
         self.profile.settings_mut().rename_sample_file(old, new) > 0
     }
 
+    /// Tells whether the profile changed since it was loaded or saved (compare two values).
+    pub fn fingerprint(&mut self) -> u64 {
+        self.profile.fingerprint().unwrap_or_default()
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -3494,5 +3503,34 @@ mod tests {
         assert!(!reloaded.rename_sample_file("intro.wav", "check.wav"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use crate::mic_profile::MicProfileAdapter;
+
+    #[test]
+    fn fingerprints_are_stable_and_follow_changes() {
+        let mut profile = ProfileAdapter::default();
+        let first = profile.fingerprint();
+        assert_eq!(first, profile.fingerprint());
+        assert_eq!(ProfileAdapter::default().fingerprint(), first);
+
+        // Saved and loaded back, it's the same profile
+        let dir = tempfile::tempdir().unwrap();
+        profile.save_as("Copy".into(), dir.path(), false).unwrap();
+        let mut loaded = ProfileAdapter::from_named("Copy".into(), dir.path()).unwrap();
+        assert_eq!(loaded.fingerprint(), first);
+
+        profile.set_scribble_text(FaderName::A, "changed".into());
+        assert_ne!(profile.fingerprint(), first);
+
+        let mic = MicProfileAdapter::default();
+        assert_eq!(
+            mic.fingerprint(),
+            MicProfileAdapter::default().fingerprint()
+        );
     }
 }

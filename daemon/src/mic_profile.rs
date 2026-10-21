@@ -90,6 +90,15 @@ impl MicProfileAdapter {
         Ok(())
     }
 
+    /// Tells whether the mic profile changed since it was loaded or saved (compare two values).
+    pub fn fingerprint(&self) -> u64 {
+        self.profile.fingerprint().unwrap_or_default()
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
