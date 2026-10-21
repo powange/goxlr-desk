@@ -24,7 +24,7 @@ use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
 use goxlr_profile_loader::atomic::atomic_write;
-use notify::event::ModifyKind;
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::io::BufWriter;
 use tokio::sync::mpsc;
@@ -293,9 +293,23 @@ pub async fn spawn_file_notification_service(
 
                                 // Triggered on Rename / Move of a file (FSEvents reports these
                                 // as RenameMode::Any)
-                                EventKind::Modify(ModifyKind::Name(_)) => {
+                                EventKind::Modify(ModifyKind::Name(_)) |
+
+                                // A file written in place: only samples, whose size and length
+                                // are listed (a recording is created empty, then written until
+                                // it stops; the list is read again once the writes settle)
+                                EventKind::Modify(ModifyKind::Data(_)) |
+                                EventKind::Modify(ModifyKind::Any) |
+                                EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+                                    let written = !matches!(
+                                        event.kind,
+                                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+                                    );
 
                                     for path in &event.paths {
+                                        if written && !path.starts_with(&paths.samples) {
+                                            continue;
+                                        }
                                         // Hidden temporary files (.name.tmp, .name.import) come
                                         // and go during writes, the final rename is what counts.
                                         let hidden = path
@@ -1432,5 +1446,57 @@ mod name_tests {
         restore_latest_trash_of(&base, &backups, "intro.wav");
         assert_eq!(fs::read(base.join("intro.wav")).unwrap(), b"original");
         assert!(list_trash(&backups).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, timeout};
+
+    /// A recording is created empty, then written: the samples are listed again after the
+    /// writes, so its size and length show up.
+    #[tokio::test]
+    async fn written_samples_are_listed_again() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = FilePaths {
+            profiles: root.path().join("profiles"),
+            mic_profiles: root.path().join("mic"),
+            presets: root.path().join("presets"),
+            icons: root.path().join("icons"),
+            samples: root.path().join("samples"),
+            backups: root.path().join("backups"),
+        };
+        for dir in [
+            &paths.profiles,
+            &paths.mic_profiles,
+            &paths.presets,
+            &paths.icons,
+            &paths.samples,
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        let shutdown = crate::shutdown::Shutdown::new();
+        tokio::spawn(spawn_file_notification_service(
+            paths.clone(),
+            tx,
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let path = paths.samples.join("Recording.wav");
+        let mut file = File::create(&path).unwrap();
+        let created = timeout(Duration::from_secs(3), rx.recv()).await.unwrap();
+        assert_eq!(created, Some(PathTypes::Samples));
+
+        file.write_all(&[0; 4096]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let written = timeout(Duration::from_secs(3), rx.recv()).await;
+        assert_eq!(written.ok().flatten(), Some(PathTypes::Samples));
+        shutdown.trigger();
     }
 }
