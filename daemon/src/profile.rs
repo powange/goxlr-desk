@@ -84,8 +84,33 @@ pub fn rename_sample_in_saved_profiles(
     old: &str,
     new: &str,
 ) -> Vec<String> {
+    update_saved_profiles(directory, backups, old, |profile| {
+        profile.rename_sample_file(old, new)
+    })
+}
+
+/// Points the saved profiles' tracks of a sample edited in place at the whole file, at its new
+/// gain (see `reset_sample_file`).
+pub fn reset_sample_in_saved_profiles(
+    directory: &Path,
+    backups: &Path,
+    name: &str,
+    gain: f64,
+) -> Vec<String> {
+    update_saved_profiles(directory, backups, name, |profile| {
+        profile.reset_sample_file(name, gain)
+    })
+}
+
+/// Applies `change` to every saved profile, saving those it changed (after a copy kept in the
+/// backups: the user never opened most of them). `sample` names the file, for the logs.
+fn update_saved_profiles(
+    directory: &Path,
+    backups: &Path,
+    sample: &str,
+    change: impl Fn(&mut ProfileAdapter) -> bool,
+) -> Vec<String> {
     let mut changed = Vec::new();
-    // Each rewritten profile is copied here first: the user never opened most of them
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -104,26 +129,29 @@ pub fn rename_sample_in_saved_profiles(
         };
         match ProfileAdapter::from_named(name.to_string(), directory) {
             Ok(mut profile) => {
-                if profile.rename_sample_file(old, new) {
+                if change(&mut profile) {
                     let copied = std::fs::create_dir_all(&kept)
                         .and_then(|_| std::fs::copy(&path, kept.join(entry.file_name())));
                     if let Err(e) = copied {
                         warn!(
-                            "Not renaming {} in {}, unable to keep a copy: {}",
-                            old, name, e
+                            "Not updating {} in {}, unable to keep a copy: {}",
+                            sample, name, e
                         );
                         continue;
                     }
                     match profile.save(directory, true) {
                         Ok(()) => changed.push(name.to_string()),
                         Err(e) => warn!(
-                            "Unable to save profile {} after renaming {}: {}",
-                            name, old, e
+                            "Unable to save profile {} after updating {}: {}",
+                            name, sample, e
                         ),
                     }
                 }
             }
-            Err(e) => warn!("Unable to check profile {} for sample {}: {}", name, old, e),
+            Err(e) => warn!(
+                "Unable to check profile {} for sample {}: {}",
+                name, sample, e
+            ),
         }
     }
     changed
@@ -208,6 +236,10 @@ impl ProfileAdapter {
     /// Returns whether anything changed.
     pub fn rename_sample_file(&mut self, old: &str, new: &str) -> bool {
         self.profile.settings_mut().rename_sample_file(old, new) > 0
+    }
+
+    pub fn reset_sample_file(&mut self, name: &str, gain: f64) -> bool {
+        self.profile.settings_mut().reset_sample_file(name, gain) > 0
     }
 
     /// Tells whether the profile changed since it was loaded or saved (compare two values).

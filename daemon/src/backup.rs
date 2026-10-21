@@ -2,8 +2,10 @@
 //! optionally the samples), to move to another computer or keep aside, and restoring from one.
 
 use crate::files::FilePaths;
+use crate::files::SAMPLE_EXTENSIONS;
 use anyhow::{Context, Result, bail};
 use log::warn;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -120,6 +122,14 @@ pub fn restore_backup<R: Read + Seek>(
         .unwrap_or_default();
     let set_aside = paths.backups.join(format!("restore-{stamp}"));
 
+    // Profiles find a sample by its file name alone: one restored into another folder than a
+    // sample of the same name already here would make two of them.
+    let existing_samples: HashMap<String, PathBuf> =
+        crate::files::recursive_file_list(paths.samples.clone(), SAMPLE_EXTENSIONS.to_vec())
+            .into_iter()
+            .map(|(relative, name)| (name.to_lowercase(), PathBuf::from(relative)))
+            .collect();
+
     // Check everything first: an archive that isn't one of ours changes nothing.
     let mut plan = Vec::new();
     let mut settings = None;
@@ -163,6 +173,17 @@ pub fn restore_backup<R: Read + Seek>(
         let relative: PathBuf = parts.collect();
         if relative.as_os_str().is_empty() {
             continue;
+        }
+        if *section == "samples"
+            && let Some(name) = relative.file_name()
+            && let Some(here) = existing_samples.get(&name.to_string_lossy().to_lowercase())
+            && here != &relative
+        {
+            bail!(
+                "A sample named {} is already in {}, rename or move it first",
+                name.to_string_lossy(),
+                here.display()
+            );
         }
         total += entry.size();
         if total > MAX_RESTORE_TOTAL {
@@ -303,6 +324,24 @@ mod tests {
                 settings: false,
             }
         );
+    }
+
+    #[test]
+    fn refuses_a_sample_name_already_used_elsewhere() {
+        let source = tempfile::tempdir().unwrap();
+        let from = paths(source.path());
+        fs::create_dir_all(from.samples.join("Jingles")).unwrap();
+        fs::write(from.samples.join("Jingles/intro.wav"), b"intro").unwrap();
+        let mut zip = Cursor::new(Vec::new());
+        write_backup(&from, true, None, &mut zip).unwrap();
+
+        // Here, an intro.wav lives in another folder
+        let target = tempfile::tempdir().unwrap();
+        let to = paths(target.path());
+        fs::write(to.samples.join("intro.wav"), b"mine").unwrap();
+        zip.set_position(0);
+        assert!(restore_backup(&to, &mut zip).is_err());
+        assert!(!to.samples.join("Jingles/intro.wav").exists());
     }
 
     #[test]

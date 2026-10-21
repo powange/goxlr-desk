@@ -462,6 +462,11 @@ impl Device {
     }
 
     /// A sample file was renamed, point the loaded profile's sampler tracks at the new name.
+    /// A sample edited in place: its tracks play the whole new file, at its new gain.
+    pub fn sample_file_edited(&mut self, name: &str, gain: f64) -> bool {
+        self.profile.reset_sample_file(name, gain)
+    }
+
     pub fn rename_sample_file(&mut self, old: &str, new: &str) -> bool {
         self.profile.rename_sample_file(old, new)
     }
@@ -1357,8 +1362,11 @@ impl Device {
         let sample_bank = self.profile.get_active_sample_bank();
 
         if !self.profile.current_sample_bank_has_samples(button) {
+            // A name nothing else has (two buttons recorded in the same second, a sample
+            // imported under that name..), the recorder creates the file exclusively
             let file_date = Local::now().format("%Y-%m-%dT%H%M%S").to_string();
-            let full_name = format!("Recording_{file_date}.wav");
+            let samples = self.settings.get_samples_directory().await;
+            let full_name = free_recording_name(&samples, &file_date);
 
             self.record_audio_file(button, full_name).await?;
             return Ok(());
@@ -4560,5 +4568,22 @@ fn effect_bank_for(button: Buttons) -> Option<EffectBankPresets> {
         Buttons::EffectSelect5 => Some(EffectBankPresets::Preset5),
         Buttons::EffectSelect6 => Some(EffectBankPresets::Preset6),
         _ => None,
+    }
+}
+
+/// "Recording_<date>.wav", or with "-2", "-3".. when a sample already has that name (anywhere
+/// in the samples: profiles find samples by name).
+fn free_recording_name(samples: &std::path::Path, date: &str) -> String {
+    let mut index = 1;
+    loop {
+        let name = if index == 1 {
+            format!("Recording_{date}.wav")
+        } else {
+            format!("Recording_{date}-{index}.wav")
+        };
+        if find_file_in_path(samples.to_path_buf(), PathBuf::from(&name)).is_none() {
+            return name;
+        }
+        index += 1;
     }
 }

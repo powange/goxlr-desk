@@ -938,6 +938,13 @@ impl ProfileSettings {
 
     /// Points every sampler track using the sample file `old` at `new` instead (a sample file
     /// was renamed). Returns how many tracks were changed.
+    pub fn reset_sample_file(&mut self, name: &str, gain: f64) -> usize {
+        self.sampler_map
+            .values_mut()
+            .map(|button| button.reset_track_file(name, gain))
+            .sum()
+    }
+
     pub fn rename_sample_file(&mut self, old: &str, new: &str) -> usize {
         self.sampler_map
             .values_mut()
@@ -1350,6 +1357,32 @@ mod tests {
                 .track,
             "renamed.wav"
         );
+    }
+
+    #[test]
+    fn edited_samples_play_whole_at_their_new_gain() {
+        let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let name = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(crate::components::sample::SampleBank::A)
+            .get_tracks()[0]
+            .track
+            .clone();
+        assert!(settings.reset_sample_file(&name, 0.5) >= 1);
+        let track = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(crate::components::sample::SampleBank::A)
+            .get_tracks()[0]
+            .clone();
+        assert_eq!(
+            (
+                track.start_position,
+                track.end_position,
+                track.normalized_gain
+            ),
+            (0.0, 100.0, 0.5)
+        );
+        assert_eq!(settings.reset_sample_file("not-used.wav", 0.5), 0);
     }
 
     #[test]

@@ -10,7 +10,9 @@ use crate::firmware::firmware_update::{
     do_firmware_update, start_firmware_update,
 };
 use crate::platform::{get_ui_app_path, has_autostart, set_autostart};
-use crate::profile::{rename_sample_in_saved_profiles, saved_profiles_using_samples};
+use crate::profile::{
+    rename_sample_in_saved_profiles, reset_sample_in_saved_profiles, saved_profiles_using_samples,
+};
 use crate::profile_trash::{
     empty_profile_trash, list_profile_trash, purge_profile_trash, restore_profile,
 };
@@ -180,6 +182,11 @@ pub async fn spawn_usb_handler(
 
     // Slow sample operations run in the background and report back here.
     let (sample_job_tx, mut sample_job_rx) = mpsc::channel::<SampleJobDone>(16);
+    // Sample jobs still running. While one renames or replaces a file, the profiles loaded on
+    // the devices aren't checked against the files (validate_sampler would drop the track whose
+    // file is about to get its new name): the check waits for the jobs to end.
+    let mut sample_jobs_running = 0usize;
+    let mut validate_pending = false;
     // Samples being edited, so the same file isn't edited twice at once.
     let mut busy_samples: HashSet<String> = HashSet::new();
     let mut attaching = false;
@@ -610,6 +617,7 @@ pub async fn spawn_usb_handler(
                                 let backups = settings.get_backup_directory().await;
                                 // Renaming rewrites the saved profiles, which is slow: done in the
                                 // background, the result comes back through sample_job_rx.
+                                sample_jobs_running += 1;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
                                     let renamed = move_sample_path(&base, &from, &to)?;
                                     if let Some(renamed) = &renamed {
@@ -634,6 +642,7 @@ pub async fn spawn_usb_handler(
                                 }
                                 // Kept in the trash (with its gain setting), so it can be restored.
                                 // A move to another drive copies files, so it's done in the background.
+                                sample_jobs_running += 1;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
                                     trash_sample_path(&base, &backups, &path, tracks)?;
                                     info!("Moved sample path {} to the trash", path);
@@ -644,6 +653,7 @@ pub async fn spawn_usb_handler(
                                 let base = settings.get_samples_directory().await;
                                 let backups = settings.get_backup_directory().await;
                                 let profiles = settings.get_profile_directory().await;
+                                sample_jobs_running += 1;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
                                     let restored = restore_trash_item(&base, &backups, &id)?;
                                     info!("Restored sample path {} from the trash", restored.path);
@@ -713,11 +723,27 @@ pub async fn spawn_usb_handler(
                                     let backups = settings.get_backup_directory().await;
                                     let profiles = settings.get_profile_directory().await;
                                     // Decoding and writing audio takes a while: done in the background.
+                                    sample_jobs_running += 1;
                                     spawn_sample_job(sample_job_tx.clone(), Some(path.clone()), sender, move || {
                                         let renamed = edit_sample_file(&base, &backups, &path, &edit, save_as.as_deref())?;
                                         if let Some(renamed) = &renamed {
                                             rename_in_saved_profiles(&profiles, &backups, renamed);
                                         }
+                                        // Replaced: the tracks playing it measured the old audio,
+                                        // they play the whole new file at its new gain
+                                        let edited = save_as.is_none().then(|| {
+                                            let name = match &renamed {
+                                                Some(renamed) => renamed.new_name.clone(),
+                                                None => path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string(),
+                                            };
+                                            let file = match &renamed {
+                                                Some(renamed) => base.join(Path::new(&path).with_file_name(&renamed.new_name)),
+                                                None => base.join(&path),
+                                            };
+                                            let gain = measure_gain(&file).unwrap_or(1.0);
+                                            reset_sample_in_saved_profiles(&profiles, &backups, &name, gain);
+                                            (name, gain)
+                                        });
                                         info!("Edited sample {} ({} part(s) removed, normalized: {})", path, edit.remove.len(), edit.normalize);
                                         // A copy saved under a new name keeps the original's gain
                                         let copied_gain = save_as.as_deref().map(|name| {
@@ -725,7 +751,7 @@ pub async fn spawn_usb_handler(
                                             let new_name = if name.to_ascii_lowercase().ends_with(".wav") { name.to_string() } else { format!("{name}.wav") };
                                             (path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string(), new_name)
                                         });
-                                        Ok(SampleJobOutput { renamed, copied_gain, ..Default::default() })
+                                        Ok(SampleJobOutput { renamed, copied_gain, edited, ..Default::default() })
                                     });
                                 }
                             }
@@ -924,6 +950,7 @@ pub async fn spawn_usb_handler(
                 }
             },
             Some(done) = sample_job_rx.recv() => {
+                sample_jobs_running = sample_jobs_running.saturating_sub(1);
                 if let Some(key) = &done.key {
                     busy_samples.remove(key);
                 }
@@ -944,6 +971,13 @@ pub async fn spawn_usb_handler(
                             settings.set_sample_gain_percent(copy.clone(), gain).await;
                             settings.save().await;
                         }
+                        if let Some((name, gain)) = &output.edited {
+                            for device in devices.values() {
+                                let name = name.clone();
+                                let gain = *gain;
+                                device.send(move |d| Box::pin(async move { d.sample_file_edited(&name, gain) }));
+                            }
+                        }
                         for device in devices.values() {
                             let tracks = output.tracks.clone();
                             device.send(move |d| Box::pin(async move {
@@ -960,15 +994,20 @@ pub async fn spawn_usb_handler(
                     Err(e) => Err(e),
                 };
                 let _ = done.sender.send(result);
+
+                // The renames are applied above, the files can be checked now
+                if sample_jobs_running == 0 && validate_pending {
+                    validate_pending = false;
+                    validate_samplers(&devices);
+                }
             }
             Some(path) = file_rx.recv() => {
                 // Notify devices if Samples have changed..
                 if path == PathTypes::Samples {
-                    for device in devices.values() {
-                        device.send(|d| Box::pin(async move {
-                            let _ = d.validate_sampler().await;
-                            true
-                        }));
+                    if sample_jobs_running > 0 {
+                        validate_pending = true;
+                    } else {
+                        validate_samplers(&devices);
                     }
                 }
 
@@ -1161,6 +1200,8 @@ struct SampleJobOutput {
     tracks: Vec<TrashedTrack>,
     // A copy saved by the editor: (original name, copy name), the copy gets the same gain
     copied_gain: Option<(String, String)>,
+    // A sample edited in place: (its name, its new gain), for the tracks loaded on the devices
+    edited: Option<(String, f64)>,
 }
 
 struct SampleJobDone {
@@ -1192,6 +1233,34 @@ fn spawn_sample_job<F>(
             })
             .await;
     });
+}
+
+/// The gain that brings a sample to the sampler's loudness, as when it's added to a button.
+fn measure_gain(file: &Path) -> Option<f64> {
+    let mut player =
+        goxlr_audio::player::Player::new(&file.to_path_buf(), None, None, None, None, None).ok()?;
+    let state = player.get_state();
+    player.calculate_gain();
+    if state.error.lock().ok()?.is_some() {
+        return None;
+    }
+    Some(
+        state
+            .calculated_gain
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Drops the sampler tracks whose file is gone, on every device.
+fn validate_samplers(devices: &HashMap<String, DeviceActor>) {
+    for device in devices.values() {
+        device.send(|d| {
+            Box::pin(async move {
+                let _ = d.validate_sampler().await;
+                true
+            })
+        });
+    }
 }
 
 /// Points the saved profiles at a renamed sample file (slow: every profile is read).

@@ -721,6 +721,12 @@ pub fn sample_names_at(base: &Path, relative: &str) -> Result<Vec<String>> {
 /// original file or as a new file named `save_as` next to it. When replacing, the original is
 /// moved to the trash in `backups` first, so it can be restored. Replacing a file that isn't a
 /// WAV gives it a .wav name, which is returned so profiles can follow it.
+fn new_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 pub fn edit_sample_file(
     base: &Path,
     backups: &Path,
@@ -753,6 +759,14 @@ pub fn edit_sample_file(
     let (Some(old_name), Some(new_name)) = (name_of(&source), name_of(&target)) else {
         bail!("Invalid file name");
     };
+    // A copy under the source's own name would overwrite it with no copy in the trash: that's
+    // what "replace" is for, and it keeps the original.
+    if save_as.is_some() && (target == source || is_case_change(&source, &target)) {
+        bail!(
+            "{} is the file being edited, choose another name or replace it",
+            new_name_of(&target)
+        );
+    }
     // Replacing 'X.WAV' writes 'X.wav', the same file on Windows and macOS.
     let same_file = save_as.is_none() && is_case_change(&source, &target);
     if target != source && !same_file {
@@ -1257,6 +1271,39 @@ mod edit_undo_tests {
         assert_eq!(restored.path, "intro.wav");
         assert!(restored.renamed.is_none());
         assert_eq!(fs::read(base.join("intro.wav")).unwrap(), original);
+        assert_eq!(list_trash(&backups).len(), 1);
+    }
+
+    #[test]
+    fn a_restore_that_cant_happen_keeps_the_edited_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(base.join("Other")).unwrap();
+        let audio = DecodedAudio {
+            sample_rate: 8000,
+            channels: 1,
+            samples: (0..8000).map(|i| (i % 40) as f32 / 100.0).collect(),
+            bits_per_sample: Some(16),
+        };
+        atomic_write(base.join("intro.wav"), |file| {
+            audio.write_wav(BufWriter::new(file))
+        })
+        .unwrap();
+        let edit = SampleEdit {
+            remove: vec![(0.0, 0.5)],
+            normalize: false,
+        };
+        // Saving a copy under the source's name is refused (it would overwrite it)
+        assert!(edit_sample_file(&base, &backups, "intro.wav", &edit, Some("intro")).is_err());
+        edit_sample_file(&base, &backups, "intro.wav", &edit, None).unwrap();
+        let edited = fs::read(base.join("intro.wav")).unwrap();
+
+        // Another sample took the original's name meanwhile: the restore is refused, and the
+        // edited version stays where it is
+        fs::write(base.join("Other/intro.wav"), b"other").unwrap();
+        let id = list_trash(&backups)[0].id.clone();
+        assert!(restore_trash_item(&base, &backups, &id).is_err());
+        assert_eq!(fs::read(base.join("intro.wav")).unwrap(), edited);
         assert_eq!(list_trash(&backups).len(), 1);
     }
 }

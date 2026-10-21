@@ -281,6 +281,23 @@ impl SampleBase {
 
     /// Points every track using the sample file `old` at `new` instead, in all banks. Returns
     /// how many tracks were changed.
+    /// A file edited in place: its tracks play it whole again, at its new gain (the old
+    /// start / stop and gain were measured on the audio before the edit).
+    pub fn reset_track_file(&mut self, name: &str, gain: f64) -> usize {
+        let mut changed = 0;
+        for stack in self.sample_stack.values_mut() {
+            for track in stack.get_tracks_mut() {
+                if track.track == name {
+                    track.start_position = 0.0;
+                    track.end_position = 100.0;
+                    track.normalized_gain = gain;
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
     pub fn rename_track_file(&mut self, old: &str, new: &str) -> usize {
         let mut changed = 0;
         for stack in self.sample_stack.values_mut() {

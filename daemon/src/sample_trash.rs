@@ -253,22 +253,16 @@ pub fn restore_trash_item(samples: &Path, backups: &Path, id: &str) -> Result<Re
 
     // Restoring an original that an edit replaced undoes the edit: the edited version goes to
     // the trash (so it can be brought back too), and profiles follow if its name was different.
-    let mut renamed = None;
-    if let Some(edited) = &record.replaced_by
-        && let Ok(edited_path) = sample_path(samples, edited)
-        && edited_path.is_file()
-    {
-        trash_sample_path(samples, backups, edited, vec![])
-            .context("Unable to move the edited version to the trash")?;
-        let name_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
-        let (edited_name, original_name) = (name_of(edited), name_of(&record.path));
-        if edited_name != original_name {
-            renamed = Some((edited_name, original_name));
-        }
-    }
+    // Everything is checked first: a restore that can't happen leaves the edited version alone.
+    let edited = record
+        .replaced_by
+        .as_ref()
+        .and_then(|edited| sample_path(samples, edited).ok().map(|path| (edited, path)))
+        .filter(|(_, path)| path.is_file());
 
     let target = sample_path(samples, &record.path)?;
-    if target.exists() {
+    let target_is_edited = edited.as_ref().is_some_and(|(_, path)| path == &target);
+    if target.exists() && !target_is_edited {
         bail!("{} already exists, rename or move it first", record.path);
     }
     // Profiles find a sample by its file name alone, so a name used elsewhere would be ambiguous.
@@ -280,8 +274,14 @@ pub fn restore_trash_item(samples: &Path, backups: &Path, id: &str) -> Result<Re
     }
     let used: HashSet<String> =
         recursive_file_list(samples.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
-            .into_values()
-            .map(|name| name.to_lowercase())
+            .into_iter()
+            // The edited version is about to leave (another file of that name still counts)
+            .filter(|(relative, _)| {
+                edited
+                    .as_ref()
+                    .is_none_or(|(_, path)| path != &samples.join(relative))
+            })
+            .map(|(_, name)| name.to_lowercase())
             .collect();
     let taken: Vec<String> = names
         .into_iter()
@@ -293,6 +293,18 @@ pub fn restore_trash_item(samples: &Path, backups: &Path, id: &str) -> Result<Re
             taken.join(", ")
         );
     }
+
+    let mut renamed = None;
+    if let Some((edited, _)) = &edited {
+        trash_sample_path(samples, backups, edited, vec![])
+            .context("Unable to move the edited version to the trash")?;
+        let name_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let (edited_name, original_name) = (name_of(edited), name_of(&record.path));
+        if edited_name != original_name {
+            renamed = Some((edited_name, original_name));
+        }
+    }
+
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }

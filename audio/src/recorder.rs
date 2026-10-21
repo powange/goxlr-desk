@@ -292,7 +292,12 @@ impl BufferedRecorder {
             bits_per_sample: 24,
             sample_format: hound::SampleFormat::Int,
         };
-        let mut writer = hound::WavWriter::create(path, spec)?;
+        // Never over an existing file (two recordings named alike would write into one)
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let mut writer = hound::WavWriter::new(std::io::BufWriter::new(file), spec)?;
 
         // EBU Prep is here to make sure that recent samples have hit a threshold to start recording.
         let mut ebu_prep_r128 = EbuR128::new(2, 48000, Mode::SAMPLE_PEAK)?;
