@@ -482,7 +482,10 @@ mod tests {
         let damaged = trash_directory(&backups).join("damaged");
         fs::create_dir_all(&damaged).unwrap();
         let old = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
-        fs::File::open(&damaged).unwrap().set_modified(old).ok();
+        // A folder can't be opened as a file on Windows: there it just isn't aged
+        if let Ok(folder) = fs::File::open(&damaged) {
+            folder.set_modified(old).ok();
+        }
 
         // At most about two items' worth: the oldest goes
         purge_trash_with(&backups, TRASH_RETENTION, 2500);
