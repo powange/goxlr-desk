@@ -2015,8 +2015,7 @@ impl<'a> Device<'a> {
                 self.apply_mute_from_profile(fader, None)?;
 
                 let channel = self.profile.get_fader_assignment(fader);
-                if BasicInputDevice::can_from(channel) {
-                    let input = BasicInputDevice::from(channel);
+                if let Ok(input) = BasicInputDevice::try_from(channel) {
                     self.apply_routing(input).await?;
 
                     if input == BasicInputDevice::Chat && self.vc_mute_also_mute_cm {
@@ -2068,9 +2067,12 @@ impl<'a> Device<'a> {
                 self.apply_mic_gain()?;
             }
             GoXLRCommand::SetMicrophoneGain(mic_type, gain) => {
-                self.mic_profile.set_mic_type(mic_type)?;
+                // Sets that type's gain, without making it the active type (SetMicrophoneType
+                // does that): the gain is applied now only if it's the one in use.
                 self.mic_profile.set_mic_gain(mic_type, gain)?;
-                self.apply_mic_gain()?;
+                if self.mic_profile.mic_type() == mic_type {
+                    self.apply_mic_gain()?;
+                }
             }
             GoXLRCommand::SetRouter(input, output, enabled) => {
                 debug!("Setting Routing: {:?} {:?} {}", input, output, enabled);

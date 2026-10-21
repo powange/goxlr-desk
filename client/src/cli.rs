@@ -29,6 +29,7 @@ pub struct Cli {
     #[arg(long)]
     pub status_json: bool,
 
+    /// Display the address of the web interface
     #[arg(long)]
     pub status_http: bool,
 
@@ -46,18 +47,18 @@ pub struct Cli {
 #[derive(Debug, Args)]
 pub struct MicrophoneControls {
     /// Set the gain of the plugged in dynamic (XLR) microphone.
-    /// Value is in decibels and recommended to be lower than 72dB.
-    #[arg(long)]
+    /// Value is in decibels, 0 to 72. The active microphone type doesn't change.
+    #[arg(value_parser = clap::value_parser!(u16).range(0..=72), long)]
     pub dynamic_gain: Option<u16>,
 
     /// Set the gain of the plugged in condenser (XLR with phantom power) microphone.
-    /// Value is in decibels and recommended to be lower than 72dB.
-    #[arg(long)]
+    /// Value is in decibels, 0 to 72. The active microphone type doesn't change.
+    #[arg(value_parser = clap::value_parser!(u16).range(0..=72), long)]
     pub condenser_gain: Option<u16>,
 
     /// Set the gain of the plugged in jack (3.5mm) microphone.
-    /// Value is in decibels and recommended to be lower than 72dB.
-    #[arg(long)]
+    /// Value is in decibels, 0 to 72. The active microphone type doesn't change.
+    #[arg(value_parser = clap::value_parser!(u16).range(0..=72), long)]
     pub jack_gain: Option<u16>,
 }
 

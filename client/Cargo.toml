@@ -24,6 +24,7 @@ name = "goxlr-client-quiet"
 path = "src/bin/quiet.rs"
 
 [dependencies]
+enum-map = { workspace = true }
 goxlr-ipc = { path = "../ipc" }
 goxlr-types = { path = "../types", features = ["clap"] }
 

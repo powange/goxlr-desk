@@ -229,25 +229,25 @@ pub enum InputDevice {
 
 impl InputDevice {
     pub fn can_from(channel: ChannelName) -> bool {
-        !matches!(
-            channel,
-            ChannelName::Headphones | ChannelName::MicMonitor | ChannelName::LineOut
-        )
+        InputDevice::try_from(channel).is_ok()
     }
 }
 
-impl From<ChannelName> for InputDevice {
-    fn from(value: ChannelName) -> Self {
+/// The input a channel plays from; output channels (headphones, line out, mic monitor) have none.
+impl TryFrom<ChannelName> for InputDevice {
+    type Error = ChannelName;
+
+    fn try_from(value: ChannelName) -> Result<Self, Self::Error> {
         match value {
-            ChannelName::Mic => InputDevice::Microphone,
-            ChannelName::LineIn => InputDevice::LineIn,
-            ChannelName::Console => InputDevice::Console,
-            ChannelName::System => InputDevice::System,
-            ChannelName::Game => InputDevice::Game,
-            ChannelName::Chat => InputDevice::Chat,
-            ChannelName::Sample => InputDevice::Samples,
-            ChannelName::Music => InputDevice::Music,
-            _ => panic!("Attempted to cast output to InputChannel!"),
+            ChannelName::Mic => Ok(InputDevice::Microphone),
+            ChannelName::LineIn => Ok(InputDevice::LineIn),
+            ChannelName::Console => Ok(InputDevice::Console),
+            ChannelName::System => Ok(InputDevice::System),
+            ChannelName::Game => Ok(InputDevice::Game),
+            ChannelName::Chat => Ok(InputDevice::Chat),
+            ChannelName::Sample => Ok(InputDevice::Samples),
+            ChannelName::Music => Ok(InputDevice::Music),
+            ChannelName::Headphones | ChannelName::MicMonitor | ChannelName::LineOut => Err(value),
         }
     }
 }

@@ -6,14 +6,23 @@ use async_trait::async_trait;
 #[derive(Debug)]
 pub struct WebClient {
     url: String,
+    // One client for every request, with time limits (a daemon that doesn't answer mustn't
+    // leave the command waiting until the OS gives up on the connection)
+    client: reqwest::Client,
     status: DaemonStatus,
     http_settings: HttpSettings,
 }
 
 impl WebClient {
     pub fn new(url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
         Self {
             url,
+            client,
             status: DaemonStatus::default(),
             http_settings: Default::default(),
         }
@@ -23,11 +32,14 @@ impl WebClient {
 #[async_trait]
 impl Client for WebClient {
     async fn send(&mut self, request: DaemonRequest) -> anyhow::Result<()> {
-        let resp = reqwest::Client::new()
+        // A 404 or 500 says so, rather than failing to decode a page as JSON
+        let resp = self
+            .client
             .post(&self.url)
             .json(&request)
             .send()
             .await?
+            .error_for_status()?
             .json::<DaemonResponse>()
             .await?;
 

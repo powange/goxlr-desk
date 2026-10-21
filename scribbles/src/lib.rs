@@ -2,7 +2,7 @@ use ab_glyph::{FontRef, PxScale};
 use anyhow::{Result, bail};
 use image::ImageFormat::Png;
 use image::imageops::{BiLevel, FilterType, dither, overlay};
-use image::{ColorType, DynamicImage, GenericImage, GenericImageView, GrayImage, Luma, Rgba};
+use image::{DynamicImage, GenericImage, GenericImageView, GrayImage, Luma, Rgba};
 use imageproc::drawing::{draw_text_mut, text_size};
 use log::warn;
 use std::borrow::BorrowMut;
@@ -119,7 +119,8 @@ fn load_grayscale_image(path: PathBuf) -> Result<DynamicImage> {
 
     let mut img = img.grayscale();
 
-    if img.color() == ColorType::La8 || img.color() == ColorType::L16 {
+    // Any image with transparency (LA8, LA16 for 16 bit icons..), L16 has no alpha channel
+    if img.color().has_alpha() {
         // Ensure any fully transparent pixels are white..
         for (x, y, pixel) in img.clone().pixels() {
             if pixel[3] == 0 {
@@ -228,8 +229,8 @@ fn to_goxlr(img: GrayImage, invert: bool) -> Result<[u8; 1024]> {
     let mut bytes: [u8; 1024] = [base; 1024];
     let white = Luma::from([255_u8]);
 
-    for x in 0..img.width() - 1 {
-        for y in 0..img.height() - 1 {
+    for x in 0..img.width() {
+        for y in 0..img.height() {
             if img.get_pixel(x, y) != &white {
                 let byte = ((128 * (y / 8)) + x) as usize;
                 let bit = y % 8;

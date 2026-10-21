@@ -2067,6 +2067,7 @@ dependencies = [
  "anyhow",
  "clap 4.6.7",
  "clap_complete",
+ "enum-map",
  "goxlr-ipc",
  "goxlr-types",
  "interprocess",
