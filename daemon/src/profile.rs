@@ -1378,6 +1378,8 @@ impl ProfileAdapter {
     }
 
     // TODO: This can probably be cleaned with EnumIter
+    /// The fader with this profile id (0 to 3). Only called for a mic on a fader (see
+    /// is_mic_on_fader), the id is checked when the profile is read.
     pub fn fader_from_id(&self, fader: u8) -> FaderName {
         match fader {
             0 => FaderName::A,
@@ -3004,6 +3006,8 @@ fn get_profile_colour_map(profile: &ProfileSettings, colour_target: ColourTarget
         ColourTargets::ReverbEncoder => profile.reverb_encoder().colour_map(),
         ColourTargets::EchoEncoder => profile.echo_encoder().colour_map(),
         ColourTargets::LogoX => profile.simple_element(SimpleElements::LogoX).colour_map(),
+        // The light inside the GoXLR has its own colour slot on the device but none in the
+        // profile: it takes the Logo X (Accent) colour, so the two always match.
         ColourTargets::InternalLight => profile.simple_element(SimpleElements::LogoX).colour_map(),
     }
 }
@@ -3064,6 +3068,7 @@ fn get_profile_colour_map_mut(
         ColourTargets::LogoX => profile
             .simple_element_mut(SimpleElements::LogoX)
             .colour_map_mut(),
+        // Shared with the Logo X, see get_profile_colour_map
         ColourTargets::InternalLight => profile
             .simple_element_mut(SimpleElements::LogoX)
             .colour_map_mut(),

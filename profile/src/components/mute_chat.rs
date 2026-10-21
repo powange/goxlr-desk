@@ -78,7 +78,18 @@ impl MuteChat {
     pub fn parse_mute_chat(&mut self, attributes: &Vec<Attribute>) -> Result<(), ParseError> {
         for attr in attributes {
             if attr.name == "micIsAnActiveFader" {
-                self.mic_fader_id = attr.value.parse()?;
+                // 0 to 3 are the faders, 4 is none; anything else (or unreadable) is none too,
+                // rather than a fader picked by accident or a profile refused
+                self.mic_fader_id = match attr.value.trim().parse::<u8>() {
+                    Ok(id) if id <= 4 => id,
+                    _ => {
+                        log::warn!(
+                            "micIsAnActiveFader: {} isn't a fader, the mic isn't on one",
+                            attr.value
+                        );
+                        4
+                    }
+                };
                 continue;
             }
 

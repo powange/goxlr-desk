@@ -1250,6 +1250,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mic_fader_id_out_of_range_means_no_fader() {
+        let with = |id: &str| {
+            let profile = TEST_PROFILE.replacen(
+                "micIsAnActiveFader=\"4\"",
+                &format!("micIsAnActiveFader=\"{id}\""),
+                1,
+            );
+            ProfileSettings::load(profile.as_bytes())
+                .unwrap()
+                .mute_chat()
+                .mic_fader_id()
+        };
+        assert_eq!(with("2"), 2);
+        assert_eq!(with("7"), 4);
+        assert_eq!(with("-1"), 4);
+        assert_eq!(with("x"), 4);
+    }
+
+    #[test]
     fn a_broken_preset_changes_nothing() {
         let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
         let current = settings.context().selected_effects();
