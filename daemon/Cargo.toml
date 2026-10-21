@@ -142,12 +142,12 @@ core-foundation = "0.10.0"
 io-kit-sys = "0.4.1"
 
 [build-dependencies]
+# The Windows icon, also when cross-compiling from another system
+embed-resource = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
 directories = "6.0.0"
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
-windres = { workspace = true }
 
 [package.metadata.deb]
 name = "goxlr-utility"

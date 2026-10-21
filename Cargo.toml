@@ -95,7 +95,7 @@ sysinfo = "0.37.2"
 ### Windows Specific
 windows = "0.62.2"
 winreg = "0.55.0"
-windres = "0.2.2"
+embed-resource = "3.0.12"
 
 ### Linux Specific
 nix = "0.30.1"
