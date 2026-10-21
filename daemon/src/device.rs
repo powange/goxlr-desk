@@ -550,6 +550,8 @@ impl Device {
                     error!("{}", error);
                 }
                 self.button_states[button].hold_handled = true;
+                // A hold mutes for everyone, mutes the mic..: shown now, not at the next refresh
+                state_updated = true;
             }
         }
 
@@ -857,12 +859,19 @@ impl Device {
         Ok(())
     }
 
+    /// Clears the mic mute button (before its mode or function changes), whatever its mode: the
+    /// press handler can't be used for this, in hold mode a press mutes.
     async fn unmute_chat_if_muted(&mut self) -> Result<()> {
         let (_mute_toggle, muted_to_x, muted_to_all, _mute_function) =
             self.profile.get_mute_chat_button_state();
 
         if muted_to_x || muted_to_all {
-            self.handle_cough_mute(true, false, false, false).await?;
+            self.profile.set_mute_chat_button_on(false);
+            self.profile.set_mute_chat_button_blink(false);
+            self.apply_cough_from_profile()?;
+            self.apply_effects(LinkedHashSet::from_iter([EffectKey::MicInputMute]))?;
+            self.apply_routing(BasicInputDevice::Microphone).await?;
+            self.update_button_states()?;
         }
 
         Ok(())
@@ -1100,7 +1109,6 @@ impl Device {
 
         if muted_to_all || mute_function == MuteFunction::All {
             // This fader has previously been 'Muted to All', we need to restore the volume..
-            let previous_volume = self.profile.get_mute_button_previous_volume(fader);
 
             if channel != ChannelName::Mic
                 || (channel == ChannelName::Mic && !self.mic_muted_by_cough())
@@ -1114,20 +1122,7 @@ impl Device {
 
             // As with mute, the mini doesn't modify volumes on mute / unmute
             if !self.is_device_mini() && !lock_faders {
-                self.goxlr.set_volume(channel, previous_volume)?;
-                self.profile.set_channel_volume(channel, previous_volume)?;
-
-                // Same as setting, but we also need to restore it on the ratio
-                if self.device_supports_mix2()
-                    && self.profile.is_submix_enabled()
-                    && let Some(sub) = self.profile.get_submix_from_channel(channel)
-                    && self.profile.is_channel_linked(sub)
-                {
-                    let ratio = self.profile.get_submix_ratio(sub);
-                    let linked_volume = (previous_volume as f64 * ratio) as u8;
-                    self.goxlr.set_sub_volume(sub, linked_volume)?;
-                    self.profile.set_submix_volume(sub, linked_volume);
-                }
+                self.restore_fader_volume(fader)?;
             } else {
                 if self.needs_submix_correction(channel) {
                     // This is a special case, when calling unmute on submix firmware, the LineOut
@@ -1164,6 +1159,31 @@ impl Device {
         let _ = self.global_events.send(TTSMessage(message)).await;
 
         self.update_button_states()?;
+        Ok(())
+    }
+
+    /// Puts back the level a fader had before it was muted for everyone (a mute for everyone
+    /// takes it to 0). Not on a Mini, nor with the faders locked: they don't move on mute.
+    fn restore_fader_volume(&mut self, fader: FaderName) -> Result<()> {
+        if self.is_device_mini() || self.cached.lock_faders {
+            return Ok(());
+        }
+        let channel = self.profile.get_fader_assignment(fader);
+        let previous_volume = self.profile.get_mute_button_previous_volume(fader);
+        self.goxlr.set_volume(channel, previous_volume)?;
+        self.profile.set_channel_volume(channel, previous_volume)?;
+
+        // Same as setting, but we also need to restore it on the ratio
+        if self.device_supports_mix2()
+            && self.profile.is_submix_enabled()
+            && let Some(sub) = self.profile.get_submix_from_channel(channel)
+            && self.profile.is_channel_linked(sub)
+        {
+            let ratio = self.profile.get_submix_ratio(sub);
+            let linked_volume = (previous_volume as f64 * ratio) as u8;
+            self.goxlr.set_sub_volume(sub, linked_volume)?;
+            self.profile.set_submix_volume(sub, linked_volume);
+        }
         Ok(())
     }
 
@@ -2691,6 +2711,11 @@ impl Device {
                     let volume = self.profile.get_channel_volume(channel);
                     self.profile.set_mute_previous_volume(fader, volume)?;
                 }
+                // And the other way: a mute for everyone (channel at 0) that becomes a mute to X
+                // gets its level back, or it stays silent everywhere
+                if was_hard_muted && !self.profile.is_fader_hard_muted(fader) {
+                    self.restore_fader_volume(fader)?;
+                }
 
                 // We'll pass 'None' into this as there's a guaranteed change..
                 self.apply_mute_from_profile(fader, None)?;
@@ -2730,6 +2755,7 @@ impl Device {
 
                 // Reapply the Cough settings from the profile
                 self.apply_cough_from_profile()?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::MicInputMute]))?;
                 self.apply_routing(BasicInputDevice::Microphone).await?;
             }
             GoXLRCommand::SetCoughIsHold(is_hold) => {
