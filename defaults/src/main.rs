@@ -7,10 +7,10 @@ use crate::Errors::{PathNotDir, PathNotExist};
 use include_dir::{Dir, include_dir};
 use std::path::PathBuf;
 
-const PROFILES: Dir = include_dir!("./defaults/resources/profiles");
-const MIC_PROFILES: Dir = include_dir!("./defaults/resources/mic-profiles");
-const PRESETS: Dir = include_dir!("./defaults/resources/presets");
-const ICONS: Dir = include_dir!("./defaults/resources/icons");
+const PROFILES: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources/profiles");
+const MIC_PROFILES: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources/mic-profiles");
+const PRESETS: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources/presets");
+const ICONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources/icons");
 
 #[derive(Debug)]
 enum Errors {
@@ -25,9 +25,11 @@ fn main() -> Result<(), Errors> {
 
     // Check if the provided path exists, and is a directory..
     if !args.file_path.exists() {
+        eprintln!("Path does not exist: {}", args.file_path.display());
         return Err(PathNotExist);
     }
     if !args.file_path.is_dir() {
+        eprintln!("Path is not a directory: {}", args.file_path.display());
         return Err(PathNotDir);
     }
 
@@ -46,13 +48,13 @@ fn main() -> Result<(), Errors> {
             if !args.overwrite {
                 continue;
             } else if let Err(e) = fs::remove_file(&file_path) {
-                eprintln!("Error Removing File: {e}");
+                eprintln!("Error Removing File {}: {e}", file_path.display());
                 return Err(Errors::ErrorRemovingFile);
             }
         }
 
         if let Err(e) = fs::write(&file_path, file.contents()) {
-            eprintln!("Error Writing File: {e}");
+            eprintln!("Error Writing File {}: {e}", file_path.display());
             return Err(Errors::ErrorWritingFile);
         }
     }

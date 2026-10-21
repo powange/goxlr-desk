@@ -156,7 +156,7 @@ impl AudioHandler {
     fn get_output_device_patterns(&self) -> Vec<Regex> {
         let override_output = OVERRIDE_SAMPLER_OUTPUT.lock().unwrap().deref().clone();
         if let Some(device) = override_output {
-            return vec![Regex::new(&device).expect("Invalid Regex in Audio Handler")];
+            return vec![override_pattern(&device)];
         }
 
         let patterns = vec![
@@ -175,7 +175,7 @@ impl AudioHandler {
     fn get_input_device_patterns(&self) -> Vec<Regex> {
         let override_input = OVERRIDE_SAMPLER_INPUT.lock().unwrap().deref().clone();
         if let Some(device) = override_input {
-            return vec![Regex::new(&device).expect("Invalid Regex in Audio Handler")];
+            return vec![override_pattern(&device)];
         }
 
         let patterns = vec![
@@ -655,4 +655,12 @@ pub struct CalculationResult {
     pub bank: SampleBank,
     pub button: SampleButtons,
     pub gain: f64,
+}
+
+/// A device override is matched as a pattern when it is one, and literally otherwise (a device
+/// name containing '(' or '+' isn't a valid expression, and shouldn't bring the daemon down).
+fn override_pattern(device: &str) -> Regex {
+    Regex::new(device).unwrap_or_else(|_| {
+        Regex::new(&fancy_regex::escape(device)).expect("An escaped string is a valid expression")
+    })
 }

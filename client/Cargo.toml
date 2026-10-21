@@ -42,3 +42,5 @@ goxlr-types = { path = "../types", features = ["clap"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 
+[lints]
+workspace = true

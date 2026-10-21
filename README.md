@@ -94,9 +94,25 @@ and change the UI Handler there.
 
 ## Building
 
-Build instructions and other useful information can be found on the
+Building from source needs Rust 1.88 or later (see `rust-version` in `Cargo.toml`). On Linux, a few system
+packages are needed too, on Debian / Ubuntu:
+
+```
+sudo apt-get install build-essential pkg-config libdbus-1-dev libspeechd-dev libpulse-dev
+```
+
+(On Fedora: `dbus-devel speech-dispatcher-devel pulseaudio-libs-devel pkgconf-pkg-config`.) Then:
+
+```
+cargo build --release
+```
+
+The binaries land in `target/release/`. On Linux, the udev rules in `50-goxlr.rules` need to be copied to
+`/etc/udev/rules.d/` so the GoXLR can be used without root. The web interface is embedded from
+`daemon/web-content/`, built from the [UI repository](https://github.com/GoXLR-on-Linux/goxlr-ui).
+
+More information can be found on the
 project's [wiki](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Compilation-Guide).
-While it's a little sparse at the moment, over time it should grow, and requests / feedback are always welcome!
 
 ## Disclaimer
 

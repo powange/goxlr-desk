@@ -22,4 +22,6 @@ clap = { workspace = true, optional = true }
 
 
 serde_repr = "0.1.20"
-derivative = "2.2.0"
+
+[lints]
+workspace = true

@@ -15,11 +15,11 @@ use file_rotate::compression::Compression;
 use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
 use json_patch::Patch;
-use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use simplelog::{
     ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
 };
+use std::sync::LazyLock;
 use sys_locale::get_locale;
 
 use tokio::join;
@@ -85,15 +85,15 @@ management, and have the utility obey.
 */
 pub static HANDLE_MACOS_AGGREGATES: Mutex<Option<bool>> = Mutex::new(Some(true));
 
-lazy_static! {
-    /**
-    This is a fetcher of the system locale, used for language and translations of the UI.
-    the sys-locale package should give us valid readings on Linux, MacOS and Windows
-     */
-    static ref SYSTEM_LOCALE: String = get_locale()
+/**
+This is a fetcher of the system locale, used for language and translations of the UI.
+the sys-locale package should give us valid readings on Linux, MacOS and Windows
+ */
+static SYSTEM_LOCALE: LazyLock<String> = LazyLock::new(|| {
+    get_locale()
         .unwrap_or_else(|| String::from("en_GB"))
-        .replace('-', "_");
-}
+        .replace('-', "_")
+});
 
 // This is for global 'JSON Patches', for when something changes.
 #[derive(Debug, Clone)]

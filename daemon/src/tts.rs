@@ -74,12 +74,8 @@ impl TTS {
     any normal behaviours because TTS didn't work.
      */
     pub async fn speak_tts(&mut self, message: String) {
-        if self.settings.get_tts_enabled().await.is_none() {
-            // TTS isn't available..
-            return;
-        }
-
-        if !self.settings.get_tts_enabled().await.unwrap() {
+        // Not available (None), or turned off..
+        if self.settings.get_tts_enabled().await != Some(true) {
             return;
         }
 

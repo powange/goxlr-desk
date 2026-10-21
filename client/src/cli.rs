@@ -65,6 +65,7 @@ pub struct MicrophoneControls {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum SubCommands {
+    /// Firmware updates
     Firmware {
         #[command(subcommand)]
         command: FirmwareCommands,
@@ -145,11 +146,13 @@ pub enum SubCommands {
         command: EffectsCommands,
     },
 
+    /// Sampler banks, buttons and playback
     Sampler {
         #[clap[subcommand]]
         command: SamplerCommands,
     },
 
+    /// Device and utility settings
     Settings {
         #[clap[subcommand]]
         command: DeviceSettings,
@@ -164,7 +167,7 @@ fn percent_value(s: &str) -> Result<u8, String> {
 
     let value = value.unwrap();
     if value > 100 {
-        return Err(String::from("Value must be lower than 100"));
+        return Err(String::from("Value must be between 0 and 100"));
     }
     Ok(value)
 }
@@ -187,9 +190,12 @@ fn percent_value_float(s: &str) -> Result<f32, String> {
 #[command(arg_required_else_help = true)]
 #[allow(clippy::enum_variant_names)]
 pub enum FirmwareCommands {
+    /// Update the firmware, from a file or the latest release when no path is given
     FirmwareUpdate { path: Option<PathBuf> },
 
+    /// Continue an update paused awaiting confirmation
     ContinueFirmwareUpdate,
+    /// Clear the state of a finished or failed update
     ClearFirmwareUpdate,
 }
 
@@ -394,6 +400,7 @@ pub enum EqualiserCommands {
         #[arg(allow_hyphen_values = true)]
         value: f32,
     },
+    /// Set the Gain of an Equaliser frequency
     Gain {
         #[arg(value_enum)]
         /// The Frequency to Modify
@@ -447,18 +454,22 @@ pub enum CompressorCommands {
         #[arg(allow_hyphen_values = true)]
         value: i8,
     },
+    /// Set the Compressor Ratio
     Ratio {
         #[arg(value_enum)]
         value: CompressorRatio,
     },
+    /// Set the Compressor Attack Time
     Attack {
         #[arg(value_enum)]
         value: CompressorAttackTime,
     },
+    /// Set the Compressor Release Time
     Release {
         #[arg(value_enum)]
         value: CompressorReleaseTime,
     },
+    /// Set the Compressor Make-Up Gain (dB)
     MakeUp {
         #[arg(allow_hyphen_values = true)]
         value: i8,
@@ -793,41 +804,48 @@ pub enum AllFaderCommands {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum EffectsCommands {
-    LoadEffectPreset {
-        name: String,
-    },
-    RenameActivePreset {
-        name: String,
-    },
+    /// Load an Effect Preset from the presets directory
+    LoadEffectPreset { name: String },
+    /// Rename the active Effect Preset
+    RenameActivePreset { name: String },
+    /// Save the active Effect Preset to the presets directory
     SaveActivePreset,
+    /// Switch the active Effect Preset
     SetActivePreset {
         #[arg(value_enum)]
         preset: EffectBankPresets,
     },
+    /// Reverb settings
     Reverb {
         #[command(subcommand)]
         command: Reverb,
     },
+    /// Echo settings
     Echo {
         #[command(subcommand)]
         command: Echo,
     },
+    /// Pitch settings
     Pitch {
         #[command(subcommand)]
         command: Pitch,
     },
+    /// Gender settings
     Gender {
         #[command(subcommand)]
         command: Gender,
     },
+    /// Megaphone settings
     Megaphone {
         #[command(subcommand)]
         command: Megaphone,
     },
+    /// Robot settings
     Robot {
         #[command(subcommand)]
         command: Robot,
     },
+    /// Hard Tune settings
     HardTune {
         #[command(subcommand)]
         command: HardTune,
@@ -961,10 +979,12 @@ pub enum Pitch {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum Gender {
+    /// Set the Gender Style
     Style {
         #[arg(value_enum)]
         style: GenderStyle,
     },
+    /// Set the Gender Amount
     Amount {
         #[arg(allow_hyphen_values = true)]
         amount: i8,
@@ -1091,6 +1111,7 @@ pub enum HardTune {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum SamplerCommands {
+    /// Add a sample file to a button
     Add {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1101,6 +1122,7 @@ pub enum SamplerCommands {
         file: String,
     },
 
+    /// Remove a sample from a button, by its position
     RemoveByIndex {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1111,6 +1133,7 @@ pub enum SamplerCommands {
         index: usize,
     },
 
+    /// Play a button's sample, by its position
     PlayByIndex {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1121,6 +1144,7 @@ pub enum SamplerCommands {
         index: usize,
     },
 
+    /// Play the next sample on a button
     PlayNextTrack {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1129,6 +1153,7 @@ pub enum SamplerCommands {
         button: SampleButtons,
     },
 
+    /// Stop a button's playback
     StopPlayback {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1137,6 +1162,7 @@ pub enum SamplerCommands {
         button: SampleButtons,
     },
 
+    /// Set how a button plays its samples
     PlaybackMode {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1148,6 +1174,7 @@ pub enum SamplerCommands {
         mode: SamplePlaybackMode,
     },
 
+    /// Set the order a button plays its samples in
     PlaybackOrder {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1159,6 +1186,7 @@ pub enum SamplerCommands {
         mode: SamplePlayOrder,
     },
 
+    /// Set where a sample starts playing (percentage)
     StartPercent {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1173,6 +1201,7 @@ pub enum SamplerCommands {
         start_position: f32,
     },
 
+    /// Set where a sample stops playing (percentage)
     StopPercent {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1187,6 +1216,7 @@ pub enum SamplerCommands {
         stop_position: f32,
     },
 
+    /// Switch the active Sample Bank
     SetActiveBank {
         #[arg(value_enum)]
         preset: SampleBank,

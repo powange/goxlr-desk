@@ -6,8 +6,8 @@ use std::time::Duration;
 use std::{mem, ptr};
 
 use anyhow::{Result, bail};
-use lazy_static::lazy_static;
 use log::{debug, error, warn};
+use std::sync::LazyLock;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use windows::Win32::Foundation::{
@@ -43,9 +43,8 @@ use crate::events::{DaemonState, EventTriggers};
 
 const EVENT_MESSAGE: u32 = WM_USER + 1;
 
-lazy_static! {
-    static ref RESPAWN: u32 = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
-}
+static RESPAWN: LazyLock<u32> =
+    LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
 
 pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> Result<()> {
     debug!("Spawning Windows Tray..");

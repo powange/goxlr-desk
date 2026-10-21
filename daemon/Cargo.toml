@@ -44,7 +44,6 @@ byteorder = { workspace = true }
 clap = { workspace = true }
 include_dir = { workspace = true }
 cfg-if = { workspace = true }
-lazy_static = { workspace = true }
 fancy-regex = { workspace = true }
 which = { workspace = true }
 
@@ -156,10 +155,10 @@ assets = [
     ["../daemon/resources/goxlr-utility-large.png", "usr/share/pixmaps/goxlr-utility.png", "644"],
     ["../daemon/resources/goxlr-utility.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["../daemon/resources/goxlr-utility.desktop", "usr/share/applications/", "644"],
-    ["../deployment/deb/goxlr-client.bash", "usr/share/bash-completion/completions/", "644"],
+    ["../deployment/deb/goxlr-client.bash", "usr/share/bash-completion/completions/goxlr-client", "644"],
     ["../deployment/deb/goxlr-client.fish", "usr/share/fish/vendor_completions.d/", "644"],
     ["../deployment/deb/_goxlr-client", "usr/share/zsh/vendor-completions/", "644"],
-    ["../deployment/deb/goxlr-daemon.bash", "usr/share/bash-completion/completions/", "644"],
+    ["../deployment/deb/goxlr-daemon.bash", "usr/share/bash-completion/completions/goxlr-daemon", "644"],
     ["../deployment/deb/goxlr-daemon.fish", "usr/share/fish/vendor_completions.d/", "644"],
     ["../deployment/deb/_goxlr-daemon", "usr/share/zsh/vendor-completions/", "644"],
 ]
@@ -185,12 +184,12 @@ assets = [
     { source = "../daemon/resources/goxlr-utility-large.png", dest = "/usr/share/pixmaps/goxlr-utility.png", mode = "0644" },
     { source = "../daemon/resources/goxlr-utility.svg", dest = "/usr/share/icons/hicolor/scalable/apps/goxlr-utility.svg", mode = "0644" },
     { source = "../daemon/resources/goxlr-utility.desktop", dest = "/usr/share/applications/goxlr-utility.desktop", mode = "0644" },
-    { source = "../deployment/deb/goxlr-client.bash", dest = "/usr/share/bash-completion/completions/goxlr-client.bash", mode = "0644" },
+    { source = "../deployment/deb/goxlr-client.bash", dest = "/usr/share/bash-completion/completions/goxlr-client", mode = "0644" },
     { source = "../deployment/deb/goxlr-client.fish", dest = "/usr/share/fish/vendor_completions.d/goxlr-client.fish", mode = "0644" },
-    { source = "../deployment/deb/_goxlr-client", dest = "/usr/share/zsh/vendor-completions/_goxlr-client", mode = "0644" },
-    { source = "../deployment/deb/goxlr-daemon.bash", dest = "/usr/share/bash-completion/completions/goxlr-daemon.bash", mode = "0644" },
+    { source = "../deployment/deb/_goxlr-client", dest = "/usr/share/zsh/site-functions/_goxlr-client", mode = "0644" },
+    { source = "../deployment/deb/goxlr-daemon.bash", dest = "/usr/share/bash-completion/completions/goxlr-daemon", mode = "0644" },
     { source = "../deployment/deb/goxlr-daemon.fish", dest = "/usr/share/fish/vendor_completions.d/goxlr-daemon.fish", mode = "0644" },
-    { source = "../deployment/deb/_goxlr-daemon", dest = "/usr/share/zsh/vendor-completions/_goxlr-daemon", mode = "0644" },
+    { source = "../deployment/deb/_goxlr-daemon", dest = "/usr/share/zsh/site-functions/_goxlr-daemon", mode = "0644" },
 ]
 
 # Tiny scriptlet, should reload udev if possible.
@@ -225,3 +224,6 @@ speech-dispatcher = ">= 0.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[lints]
+workspace = true

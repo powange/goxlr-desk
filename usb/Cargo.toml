@@ -31,7 +31,6 @@ rusb = { workspace = true }
 
 # Dependencies specifically for building under Windows
 [target.'cfg(windows)'.dependencies]
-lazy_static = { workspace = true }
 winreg = { workspace = true }
 
 libloading = "0.8.9"
@@ -43,3 +42,6 @@ windows = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Devices_DeviceAndDriverInstallation"
 ] }
+
+[lints]
+workspace = true

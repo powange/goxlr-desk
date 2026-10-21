@@ -44,7 +44,7 @@ use goxlr_types::FaderName;
 use crate::primary_worker::{DeviceCommand, DeviceSender};
 use crate::servers::server_packet::handle_packet;
 
-const WEB_CONTENT: Dir = include_dir!("./daemon/web-content/");
+const WEB_CONTENT: Dir = include_dir!("$CARGO_MANIFEST_DIR/web-content/");
 
 // Firmware files are a few megabytes, anything far beyond this isn't a firmware.
 const MAX_FIRMWARE_SIZE: usize = 64 * 1024 * 1024;

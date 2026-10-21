@@ -1,6 +1,5 @@
 #[cfg(feature = "clap")]
 use clap::ValueEnum;
-use derivative::Derivative;
 use enum_map::Enum;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -252,8 +251,7 @@ impl TryFrom<ChannelName> for InputDevice {
     }
 }
 
-#[derive(Debug, Eq, Copy, Clone, Display, EnumIter, EnumCount, Derivative)]
-#[derivative(PartialEq, Hash)]
+#[derive(Debug, Eq, Copy, Clone, Display, EnumIter, EnumCount, PartialEq, Hash)]
 #[cfg_attr(feature = "clap", derive(ValueEnum))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum EffectKey {
@@ -367,9 +365,8 @@ pub enum EffectKey {
     Encoder4Enabled = 0x0151,
 }
 
-// Eq and Derivative allow for these to be added to a HashSet (the values make EnumSet unusable)
-#[derive(Debug, Copy, Clone, Eq, Display, EnumIter, EnumCount, Derivative)]
-#[derivative(PartialEq, Hash)]
+// Eq and Hash allow for these to be added to a HashSet (the values make EnumSet unusable)
+#[derive(Debug, Copy, Clone, Eq, Display, EnumIter, EnumCount, PartialEq, Hash)]
 #[cfg_attr(feature = "clap", derive(ValueEnum))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum MicrophoneParamKey {

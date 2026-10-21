@@ -80,13 +80,13 @@ impl BufferedRecorder {
         let buffer_size = max(forced_buffer, user_buffer);
 
         // Convert the list of Strings into a Regexp vec..
-        let regex = devices
-            .iter()
-            .map(|expression| {
-                Regex::new(expression)
-                    .unwrap_or_else(|_| panic!("Unable to Parse Regular Expression: {expression}"))
-            })
-            .collect();
+        let mut regex = Vec::with_capacity(devices.len());
+        for expression in &devices {
+            match Regex::new(expression) {
+                Ok(expression) => regex.push(expression),
+                Err(error) => bail!("Unable to Parse Regular Expression {expression}: {error}"),
+            }
+        }
 
         Ok(Self {
             devices: regex,

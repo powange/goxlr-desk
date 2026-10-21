@@ -1,15 +1,13 @@
 use anyhow::{Result, bail};
 use ini::Ini;
-use lazy_static::lazy_static;
 use log::debug;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::{env, fs};
 
 const AUTOSTART_FILENAME: &str = "goxlr-daemon.desktop";
 
-lazy_static! {
-    static ref STARTUP_PATH: Option<PathBuf> = get_startup_dir();
-}
+static STARTUP_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(get_startup_dir);
 
 pub fn has_autostart() -> bool {
     if let Some(path) = &*STARTUP_PATH {

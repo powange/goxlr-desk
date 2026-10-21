@@ -22,10 +22,13 @@ enum-map = { workspace = true }
 interprocess = { workspace = true }
 
 tokio-util = { version = "0.7.16", features = ["codec", "compat"] }
-tokio-serde = { version = "0.9.0", features = ["bincode", "json"] }
+tokio-serde = { version = "0.9.0", features = ["json"] }
 async-trait = "0.1.89"
 
 # Used for Web Requests
 reqwest = { workspace = true, features = ["json"] }
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

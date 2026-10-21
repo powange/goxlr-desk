@@ -22,3 +22,6 @@ nix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windres = { workspace = true }
+
+[lints]
+workspace = true

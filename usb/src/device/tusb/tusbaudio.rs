@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
-use lazy_static::lazy_static;
 use libloading::{Library, Symbol};
 use log::{debug, error, info, warn};
+use std::sync::LazyLock;
 use tokio::sync::mpsc::Sender;
 use widestring::U16CStr;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -84,13 +84,12 @@ pub fn is_invalid_handle(error: &anyhow::Error) -> bool {
 }
 
 static GOXLR_GUID: GUID = GUID::from_u128(0x024D0372_641F_4B7B_8140_F4DFE458C982);
-lazy_static! {
-    // Initialise the Library..
-    static ref LIBRARY: Library = unsafe {
-       Library::new(locate_library().as_str()).expect("Unable to Load GoXLR API Driver")
-    };
-    pub static ref TUSB_INTERFACE: TUSBAudio<'static> = TUSBAudio::new().expect("Unable to Parse GoXLR API Driver");
-}
+// Initialise the Library..
+static LIBRARY: LazyLock<Library> = LazyLock::new(|| unsafe {
+    Library::new(locate_library().as_str()).expect("Unable to Load GoXLR API Driver")
+});
+pub static TUSB_INTERFACE: LazyLock<TUSBAudio<'static>> =
+    LazyLock::new(|| TUSBAudio::new().expect("Unable to Parse GoXLR API Driver"));
 
 fn locate_library() -> String {
     // HKLM only: HKEY_CLASSES_ROOT also reads the user's own classes (HKCU), which any program

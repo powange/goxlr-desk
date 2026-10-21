@@ -18,6 +18,11 @@ pub const PID_GOXLR_FULL: u16 = 0x8fe0;
 async fn main() -> Result<(), String> {
     println!("Beginning Run..");
 
+    // Devices which couldn't be checked or initialised, they make the run fail (a non-zero exit
+    // code, so whatever launched us can tell)
+    #[allow(unused_mut, unused_assignments)]
+    let mut failures = 0;
+
     #[cfg(windows)]
     {
         println!("This application should not be run on Windows");
@@ -27,7 +32,7 @@ async fn main() -> Result<(), String> {
     #[cfg(not(windows))]
     {
         println!("Checking for available GoXLR devices..");
-        find_devices();
+        failures = find_devices();
     }
 
     #[cfg(target_os = "macos")]
@@ -44,8 +49,8 @@ async fn main() -> Result<(), String> {
 
         let args: Vec<String> = env::args().collect();
         if !args.contains(&String::from("--xpc")) {
-            // Not an XPC caller, we're fine..
-            return Ok(());
+            // Not an XPC caller, we're done..
+            return outcome(failures);
         }
 
         let target = match CString::new("com.apple.iokit.matching") {
@@ -83,7 +88,17 @@ async fn main() -> Result<(), String> {
 
     // It's impossible for Windows to ever get here :D
     #[allow(unreachable_code)]
-    Ok(())
+    outcome(failures)
+}
+
+fn outcome(failures: usize) -> Result<(), String> {
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{failures} GoXLR device(s) could not be initialised"
+        ))
+    }
 }
 
 #[cfg(not(windows))]
@@ -96,8 +111,10 @@ fn device_address<C: UsbContext>(device: &Device<C>) -> String {
     )
 }
 
+/// Checks (and if needed initialises) every GoXLR, returning how many couldn't be.
 #[cfg(not(windows))]
-fn find_devices() {
+fn find_devices() -> usize {
+    let mut failures = 0;
     if let Ok(devices) = rusb::devices() {
         for device in devices.iter() {
             if let Ok(descriptor) = device.device_descriptor()
@@ -132,6 +149,7 @@ fn find_devices() {
                                     );
                                 }
                                 Err(e) => {
+                                    failures += 1;
                                     eprintln!(
                                         "Couldn't initialize device {}: {}",
                                         device_address(&device),
@@ -140,6 +158,7 @@ fn find_devices() {
                                 }
                             }
                         } else if let Err(e) = result {
+                            failures += 1;
                             eprintln!("Error Checking Device {}: {:?}", device_address(&device), e);
                         } else {
                             // We need to read the last command out the buffer..
@@ -162,7 +181,8 @@ fn find_devices() {
                         }
                     }
                     Err(e) => {
-                        println!(
+                        failures += 1;
+                        eprintln!(
                             "Unable to open the device {}.. {}",
                             device_address(&device),
                             e
@@ -172,6 +192,7 @@ fn find_devices() {
             }
         }
     }
+    failures
 }
 
 #[cfg(not(windows))]

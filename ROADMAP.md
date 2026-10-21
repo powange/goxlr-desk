@@ -1,5 +1,5 @@
 # Roadmap
-*Last Updated for 0.12.2 Release*
+*Last Updated for 1.2.4 Release*
 
 ## Completed Features
 * Initialisation of Devices under Linux
@@ -31,6 +31,8 @@
 * Customisable Actions on Exit (Save / Load profiles and Lighting)
 * Accessibility Options (fully accessible UI, TTS on buttons)
 * Logging options for troubleshooting
+* Sample editing, with a trash to restore deleted or replaced samples
+* Profile and settings backups
 
 ## Not Implemented
 [ This space intentionally left blank. ]

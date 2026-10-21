@@ -24,7 +24,7 @@ use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
 use goxlr_profile_loader::atomic::atomic_write;
-use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::ModifyKind;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::io::BufWriter;
 use tokio::sync::mpsc;
@@ -286,20 +286,14 @@ pub async fn spawn_file_notification_service(
                     match result {
                         Ok(event) => {
                             match event.kind {
-                                // Triggered on the Creation of a file / folder..
-                                EventKind::Create(CreateKind::File) |
-                                EventKind::Create(CreateKind::Folder) |
-                                EventKind::Create(CreateKind::Any) |
+                                // Triggered on the Creation or Removal of a file / folder,
+                                // whatever the backend calls it (some report 'Other')..
+                                EventKind::Create(_) |
+                                EventKind::Remove(_) |
 
-                                // Triggered on the Removal of a File / Folder
-                                EventKind::Remove(RemoveKind::File) |
-                                EventKind::Remove(RemoveKind::Folder) |
-                                EventKind::Remove(RemoveKind::Any) |
-
-                                // Triggered on Rename / Move of a file
-                                EventKind::Modify(ModifyKind::Name(RenameMode::From)) |
-                                EventKind::Modify(ModifyKind::Name(RenameMode::To)) |
-                                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                                // Triggered on Rename / Move of a file (FSEvents reports these
+                                // as RenameMode::Any)
+                                EventKind::Modify(ModifyKind::Name(_)) => {
 
                                     for path in &event.paths {
                                         // Hidden temporary files (.name.tmp, .name.import) come

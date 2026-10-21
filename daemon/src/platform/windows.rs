@@ -1,11 +1,11 @@
 use crate::DaemonState;
 use crate::events::EventTriggers;
 use anyhow::{Result, bail};
-use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use mslnk::ShellLink;
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::{env, fs};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
@@ -23,9 +23,7 @@ const GOXLR_APP_NAME: &str = "GoXLR App.exe";
 const GOXLR_BETA_APP_NAME: &str = "GoXLR Beta App.exe";
 const AUTOSTART_FILENAME: &str = "GoXLR Utility.lnk";
 
-lazy_static! {
-    static ref STARTUP_PATH: Option<PathBuf> = get_startup_dir();
-}
+static STARTUP_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(get_startup_dir);
 
 pub fn perform_platform_preflight() -> Result<()> {
     if !locate_goxlr_driver() {

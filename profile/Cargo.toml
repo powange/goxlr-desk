@@ -21,3 +21,6 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 ritelinked = "0.3.2"
 quick-xml = "0.42.0"
 fastrand = "2.3.0"
+
+[lints]
+workspace = true
