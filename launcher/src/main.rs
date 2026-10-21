@@ -7,14 +7,13 @@ use std::path::PathBuf;
 use goxlr_ipc::client::Client;
 use goxlr_ipc::clients::ipc::ipc_client::IPCClient;
 use goxlr_ipc::clients::ipc::ipc_socket::Socket;
+use goxlr_ipc::location::{NAMED_PIPE, socket_candidates, socket_path};
 use goxlr_ipc::{DaemonCommand, DaemonRequest, DaemonResponse};
 use interprocess::local_socket::tokio::prelude::LocalSocketStream;
 use interprocess::local_socket::traits::tokio::Stream;
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use which::which;
 
-static SOCKET_PATH: &str = "/tmp/goxlr.socket";
-static NAMED_PIPE: &str = "@goxlr.socket";
 static DAEMON_NAME: &str = "goxlr-daemon";
 
 #[tokio::main]
@@ -29,10 +28,20 @@ async fn main() -> Result<()> {
 }
 
 async fn get_connection() -> Result<LocalSocketStream> {
+    // The named pipe on Windows, otherwise this user's socket, then the legacy shared one.
+    if !cfg!(windows) {
+        for candidate in socket_candidates() {
+            if let Ok(name) = candidate.to_fs_name::<GenericFilePath>()
+                && let Ok(connection) = LocalSocketStream::connect(name).await
+            {
+                return Ok(connection);
+            }
+        }
+    }
     let path = if cfg!(windows) {
         NAMED_PIPE.to_ns_name::<GenericNamespaced>()
     } else {
-        SOCKET_PATH.to_fs_name::<GenericFilePath>()
+        socket_path().to_fs_name::<GenericFilePath>()
     };
 
     let path = match path {

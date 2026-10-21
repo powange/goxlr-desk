@@ -4340,13 +4340,21 @@ impl<'a> Device<'a> {
                 return Ok(());
             } else {
                 // We need to work out the current ratio between the channel, and it's mix..
-                let volume = self.profile.get_channel_volume(channel);
+                let mut volume = self.profile.get_channel_volume(channel);
+                // A channel muted to all sits at 0 for the moment: its real level is the one
+                // it goes back to on unmute.
+                if volume == 0
+                    && let Some(fader) = self.profile.get_fader_from_channel(channel)
+                {
+                    volume = self.profile.get_mute_button_previous_volume(fader);
+                }
                 let channel_volume = if volume == 0 { 1 } else { volume };
 
                 let profile_mix = self.profile.get_submix_volume(mix);
                 let mix_volume = if profile_mix == 0 { 1 } else { profile_mix };
 
-                let ratio = mix_volume as f64 / channel_volume as f64;
+                // Bounded, so a near silent channel can't make the mix jump to full volume
+                let ratio = (mix_volume as f64 / channel_volume as f64).clamp(0.0, 4.0);
 
                 // Enable the link, and set the ratio..
                 self.profile.set_submix_linked(mix, linked)?;

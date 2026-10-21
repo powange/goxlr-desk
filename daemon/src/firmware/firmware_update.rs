@@ -11,7 +11,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use xmltree::Element;
@@ -214,8 +214,27 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
 
     // Now we'll grab and process that file
     set_update_state(&device.serial, sender.clone(), UpdateState::Download).await?;
-    let url = format!("{}{}", FIRMWARE_PATHS[device.source], file_name.0);
-    let output_path = std::env::temp_dir().join(file_name.0);
+    // The name comes from the server's manifest: only its last part is used on disk, and a
+    // path leaving the firmware folder on the server is refused.
+    let remote = file_name.0.replace('\\', "/");
+    if remote.starts_with('/')
+        || remote
+            .split('/')
+            .any(|part| part == ".." || part.contains(':'))
+    {
+        bail!(
+            "Unexpected firmware file name in the manifest: {}",
+            file_name.0
+        );
+    }
+    let Some(local_name) = remote.rsplit('/').next().filter(|name| !name.is_empty()) else {
+        bail!(
+            "Unexpected firmware file name in the manifest: {}",
+            file_name.0
+        );
+    };
+    let url = format!("{}{}", FIRMWARE_PATHS[device.source], remote);
+    let output_path = private_download_dir()?.join(local_name);
 
     info!(
         "Downloading Firmware, URL: {}, Expected Version: {}",
@@ -229,8 +248,10 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
     let mut file = File::create(&output_path)?;
     let mut last_percent = 0;
 
+    // A server that stops sending must not leave the update in Download for ever.
     let client = ClientBuilder::new()
         .connect_timeout(Duration::from_secs(2))
+        .read_timeout(Duration::from_secs(30))
         .build()?;
     let res = client.get(url).send().await?;
     if let Some(size) = res.content_length() {
@@ -300,8 +321,10 @@ async fn clear_nvr(serial: &str, sender: Sender) -> Result<()> {
     // Now we simply sit, wait, and update until we're done.
     let mut last_percent = 0_u8;
     let mut progress = 0;
+    let deadline = Instant::now() + STEP_DEADLINE;
     while progress != 255 {
         sleep(Duration::from_millis(100)).await;
+        check_deadline(deadline, "clearing the firmware memory")?;
 
         let (oneshot, receiver) = oneshot::channel();
         let message = FirmwareMessages::PollEraseNVR(oneshot);
@@ -382,6 +405,10 @@ async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Re
         sender.send(message).await?;
         let response = receiver.await??;
 
+        // Nothing validated would loop for ever
+        if response.count == 0 {
+            bail!("Error Validating Firmware, the device validated nothing");
+        }
         processed_bytes += response.count;
         if processed_bytes > firmware_size {
             bail!("Error Validating Firmware, Length Mismatch");
@@ -412,7 +439,11 @@ async fn hardware_verify(serial: &str, sender: Sender) -> Result<()> {
     receiver.await??;
 
     let mut complete = false;
+    let deadline = Instant::now() + STEP_DEADLINE;
     while !complete {
+        // Leave the device's USB link to the other requests between polls
+        sleep(Duration::from_millis(100)).await;
+        check_deadline(deadline, "verifying the firmware")?;
         let (oneshot, receiver) = oneshot::channel();
         let message = FirmwareMessages::PollHardwareVerify(oneshot);
         let message = FirmwareRequest::FirmwareMessage(serial.to_owned(), message);
@@ -425,7 +456,7 @@ async fn hardware_verify(serial: &str, sender: Sender) -> Result<()> {
         let processed = response.processed_bytes;
         let total = response.total_bytes;
 
-        let percent = ((processed as f32 / total as f32) * 100.) as u8;
+        let percent = percent_of(processed as u64, total as u64);
         if percent != last_percent {
             last_percent = percent;
             set_update_stage_percent(serial, sender.clone(), percent).await?;
@@ -446,7 +477,11 @@ async fn hardware_write(serial: &str, sender: Sender) -> Result<()> {
     receiver.await??;
 
     let mut complete = false;
+    let deadline = Instant::now() + STEP_DEADLINE;
     while !complete {
+        // Leave the device's USB link to the other requests between polls
+        sleep(Duration::from_millis(100)).await;
+        check_deadline(deadline, "writing the firmware")?;
         let (oneshot, receiver) = oneshot::channel();
         let message = FirmwareMessages::PollHardwareWrite(oneshot);
         let message = FirmwareRequest::FirmwareMessage(serial.to_owned(), message);
@@ -459,13 +494,58 @@ async fn hardware_write(serial: &str, sender: Sender) -> Result<()> {
         let processed = response.processed_bytes;
         let total = response.total_bytes;
 
-        let percent = ((processed as f32 / total as f32) * 100.) as u8;
+        let percent = percent_of(processed as u64, total as u64);
         if percent != last_percent {
             last_percent = percent;
             set_update_stage_percent(serial, sender.clone(), percent).await?;
         }
     }
     Ok(())
+}
+
+/// A new folder only this user can use, for the downloaded firmware: the shared temporary
+/// folder would let another user swap the file between its check and the flash.
+fn private_download_dir() -> Result<PathBuf> {
+    let base = std::env::temp_dir();
+    for attempt in 0..100 {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = base.join(format!(
+            "goxlr-firmware-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("Unable to create a folder for the firmware download");
+}
+
+// No firmware step should take this long; past it, the update fails rather than wait for ever.
+const STEP_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+fn check_deadline(deadline: Instant, step: &str) -> Result<()> {
+    if Instant::now() > deadline {
+        bail!("The device took too long {}", step);
+    }
+    Ok(())
+}
+
+fn percent_of(processed: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((processed.min(total) as f32 / total as f32) * 100.) as u8
 }
 
 async fn reboot_goxlr(serial: &str, sender: Sender) {

@@ -285,7 +285,8 @@ async fn run_utility() -> Result<()> {
     let (global_tx, global_rx) = mpsc::channel(32);
 
     // Create the 'Patch' Sending Channel..
-    let (broadcast_tx, broadcast_rx) = broadcast::channel(16);
+    // Room for bursts (a profile load): a client that still falls behind resynchronises.
+    let (broadcast_tx, broadcast_rx) = broadcast::channel(256);
     drop(broadcast_rx);
 
     // Create the USB Event Channel..

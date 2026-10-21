@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub mod client;
 pub mod clients;
 mod device;
+pub mod location;
 
 pub use device::*;
 use goxlr_types::{

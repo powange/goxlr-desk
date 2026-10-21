@@ -2628,12 +2628,22 @@ impl ProfileAdapter {
             return Ok(());
         }
 
-        // If we get here, we're simply moving between two monitors not involving headphones,
-        // so we just update the routing table.
+        // If we get here, we're simply moving between two monitors not involving headphones:
+        // the headphones take the new output's routing, and its mix too (as Headphones -> X
+        // does), otherwise they stay on the previous output's mix.
         for input in InputDevice::iter() {
             let router = self.get_router(input);
             self.set_monitor_routing(input, OutputDevice::Headphones, router[device]);
         }
+        let new_mix = self
+            .profile
+            .settings()
+            .mix_routing()
+            .get_assignment(profile_device);
+        self.profile
+            .settings_mut()
+            .mix_routing_mut()
+            .set_assignment(OutputChannels::Headphones, new_mix)?;
 
         Ok(())
     }

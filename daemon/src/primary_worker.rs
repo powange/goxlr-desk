@@ -810,11 +810,15 @@ pub async fn spawn_usb_handler(
                         }
                     },
                     DeviceCommand::ContinueFirmwareUpdate(serial, sender) => {
-                        if let Some(state) = devices_firmware.get(&serial) {
-                            match &state.status.state {
+                        if let Some(state) = devices_firmware.get_mut(&serial) {
+                            match state.status.state.clone() {
                                 UpdateState::Pause(file_info) => {
                                     info!("Continuing Firmware Update..");
-                                    tokio::spawn(do_firmware_update(state.settings.clone(), file_info.to_owned()));
+                                    // Leave Pause now: a second Continue (double click, a retry)
+                                    // must not start another flash of the same device.
+                                    state.status.state = UpdateState::Starting;
+                                    change_found = true;
+                                    tokio::spawn(do_firmware_update(state.settings.clone(), file_info));
                                     let _ = sender.send(Ok(()));
                                 }
                                 _ => {

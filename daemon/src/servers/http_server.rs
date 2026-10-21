@@ -491,7 +491,20 @@ async fn websocket(
 
         let close_reason = loop {
             tokio::select! {
-                Ok(patch) = broadcast_rx.recv() => {
+                received = broadcast_rx.recv() => {
+                    let patch = match received {
+                        Ok(patch) => patch,
+                        // Patches are differences: once one is missed, the client's state is
+                        // wrong. Close, the client reconnects and gets the whole status again.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                            warn!("WebSocket client missed {} updates, asking it to resynchronise", missed);
+                            break Some(CloseReason {
+                                code: CloseCode::Again,
+                                description: Some(String::from("Missed updates, reconnect to resynchronise")),
+                            });
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+                    };
                     let message = WsResponse(WebsocketResponse {
                         id: u64::MAX,
                         data: DaemonResponse::Patch(patch.data),
