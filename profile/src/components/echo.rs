@@ -13,7 +13,9 @@ use crate::components::colours::{Colour, ColourMap};
 
 use crate::Preset;
 use crate::components::UnknownAttributes;
-use crate::components::{check_range, style_from_index};
+use crate::components::{
+    check_range, clamp_loaded, knob_to_percentage, percentage_to_knob, style_from_index,
+};
 use crate::profile::Attribute;
 use goxlr_types::effect_ranges as ranges;
 
@@ -98,7 +100,9 @@ impl EchoEncoderBase {
             }
 
             if attr.name == "DELAY_KNOB_POSITION" {
-                preset.set_knob_position(attr.value.parse::<c_float>()? as i8)?;
+                let position = attr.value.parse::<c_float>()?;
+                preset.knob_position =
+                    clamp_loaded(position, ranges::KNOB, "DELAY_KNOB_POSITION") as i8;
                 continue;
             }
 
@@ -225,11 +229,11 @@ impl EchoEncoder {
 
     // TODO: This should probably be handled by UIs like basically everything else!
     pub fn get_percentage_amount(&self) -> u8 {
-        ((self.knob_position as u16 * 100) / 24) as u8
+        knob_to_percentage(self.knob_position)
     }
     pub fn set_percentage_value(&mut self, percentage: u8) -> Result<()> {
         check_range(percentage, ranges::PERCENTAGE, "Amount")?;
-        self.set_knob_position(((percentage as i16 * 24) / 100) as i8)?;
+        self.set_knob_position(percentage_to_knob(percentage))?;
         Ok(())
     }
 

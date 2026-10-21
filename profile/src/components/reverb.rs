@@ -13,7 +13,7 @@ use crate::Preset;
 use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap};
 use crate::components::reverb::ReverbStyle::Library;
-use crate::components::{check_range, style_from_index};
+use crate::components::{check_range, knob_to_percentage, percentage_to_knob, style_from_index};
 use crate::profile::Attribute;
 use goxlr_types::effect_ranges as ranges;
 
@@ -233,11 +233,11 @@ impl ReverbEncoder {
     // TODO: As with echo, we probably shouldn't do this!
     pub fn get_percentage_amount(&self) -> u8 {
         // Knob Position and Amount are two very different things, so is percentage :)
-        ((self.knob_position as u16 * 100) / 24) as u8
+        knob_to_percentage(self.knob_position)
     }
     pub fn set_percentage_amount(&mut self, percentage: u8) -> Result<()> {
         check_range(percentage, ranges::PERCENTAGE, "Amount")?;
-        self.set_knob_position(((percentage as i16 * 24) / 100) as i8)?;
+        self.set_knob_position(percentage_to_knob(percentage))?;
         Ok(())
     }
 
@@ -288,15 +288,13 @@ impl ReverbEncoder {
     }
 
     pub fn get_decay_millis(&self) -> u16 {
-        let decay = self.decay;
-        if decay <= 100 {
-            return decay * 10;
-        }
-
-        let base = 1000;
-        let current = decay - 100;
-        let addition = current * 100;
-        base + addition
+        let decay = self.decay as u32;
+        let millis = if decay <= 100 {
+            decay * 10
+        } else {
+            1000 + (decay - 100) * 100
+        };
+        millis.min(u16::MAX as u32) as u16
     }
     pub fn set_decay_millis(&mut self, milliseconds: u16) -> Result<()> {
         // We're going to handle the conversion here directly..
@@ -534,7 +532,7 @@ impl ReverbPreset {
 
 numeric_attributes!(ReverbEncoder {
     reverb_type: u8 = "REVERB_TYPE",
-    decay: u16 = "REVERB_DECAY",
+    decay: u16 = "REVERB_DECAY" in ranges::REVERB_DECAY,
     pre_delay: u8 = "REVERB_PREDELAY" in ranges::REVERB_PREDELAY,
     diffuse: i8 = "REVERB_DIFFUSE" in ranges::REVERB_DIFFUSE,
     low_color: i8 = "REVERB_LOCOLOR" in ranges::REVERB_COLOUR,

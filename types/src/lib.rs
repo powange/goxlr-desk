@@ -983,6 +983,8 @@ pub mod effect_ranges {
     pub const KNOB_CENTRED: RangeInclusive<i64> = -24..=24;
 
     pub const REVERB_DECAY_MILLIS: RangeInclusive<i64> = 10..=20000;
+    /// The decay as stored in a profile (290 is 20 s, see ReverbEncoder::get_decay_millis).
+    pub const REVERB_DECAY: RangeInclusive<i64> = 0..=290;
     pub const REVERB_PREDELAY: RangeInclusive<i64> = 0..=100;
     pub const REVERB_DIFFUSE: RangeInclusive<i64> = -50..=50;
     pub const REVERB_COLOUR: RangeInclusive<i64> = -50..=50;

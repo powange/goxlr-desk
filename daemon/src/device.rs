@@ -3331,6 +3331,11 @@ impl Device {
                 let backups = self.settings.get_backup_directory().await;
                 // Kept in the profile trash, so it can be restored.
                 trash_profile(&profile_directory, &backups, &profile_name, true)?;
+                // Without its backup copy too, or loading it would bring it back.
+                let backup = named_file_path(&backups, &profile_name, "goxlrMicProfile")?;
+                if backup.is_file() {
+                    std::fs::remove_file(backup)?;
+                }
             }
             GoXLRCommand::RenameMicProfile(from, to) => {
                 let profiles = self.settings.get_mic_profile_directory().await;

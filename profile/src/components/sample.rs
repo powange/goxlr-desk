@@ -94,66 +94,78 @@ impl SampleBase {
     }
 
     pub fn parse_sample_stack(&mut self, id: char, attributes: &Vec<Attribute>) -> Result<()> {
+        // A bank this version doesn't know (a 'sampleStackD') is skipped, as the 'sampleBank'
+        // elements are, rather than failing the whole profile.
+        let Ok(bank) = SampleBank::from_str(id.to_string().as_str()) else {
+            warn!("Skipping unknown sample bank {}", id);
+            return Ok(());
+        };
+
         // The easiest way to handle this is to parse everything into key-value pairs, then try
         // to locate all the settings for each track inside it..
-        let bank = SampleBank::from_str(id.to_string().as_str())?;
         let mut map: HashMap<String, String> = HashMap::default();
+        let size_key = format!("sampleStack{id}stackSize");
+        let mut sample_stack = SampleStack::new();
 
         for attr in attributes {
-            map.insert(attr.name.clone(), attr.value.clone());
+            // The tracks are numbered again when written, so none of their attributes is kept
+            // as it was.
+            let known = attr.name.starts_with("track_")
+                || attr.name == size_key
+                || attr.name == "playbackMode"
+                || attr.name == "playOrder";
+            if known {
+                map.insert(attr.name.clone(), attr.value.clone());
+            } else {
+                sample_stack.unknown.keep(attr);
+            }
         }
-
-        let mut sample_stack = SampleStack::new();
 
         // Pull out any 'extra' attributes which may be useful..
         if let Some(value) = map.get("playbackMode") {
-            sample_stack.playback_mode = enum_from_index(value.parse::<usize>()?);
+            sample_stack.playback_mode = value.parse::<usize>().ok().and_then(enum_from_index);
             if sample_stack.playback_mode.is_none() {
                 warn!("Ignoring unknown sample playbackMode: {}", value);
             }
         }
 
         if let Some(value) = map.get("playOrder") {
-            sample_stack.play_order = enum_from_index(value.parse::<usize>()?);
+            sample_stack.play_order = value.parse::<usize>().ok().and_then(enum_from_index);
             if sample_stack.play_order.is_none() {
                 warn!("Ignoring unknown sample playOrder: {}", value);
             }
         }
 
         // Ok, somewhere in here we should have a key that tells us how many tracks are configured..
-        let key = format!("sampleStack{id}stackSize");
-
-        if !map.contains_key(key.as_str()) {
-            self.sample_stack[bank] = sample_stack;
-            return Ok(());
-        }
-
-        if let Some(track_count) = map.get(key.as_str()) {
+        if let Some(track_count) = map.get(size_key.as_str()) {
             let track_count: u8 = track_count.parse()?;
             for i in 0..track_count {
-                if let (Some(track), Some(start), Some(end), Some(gain)) = (
-                    map.get(&format!("track_{i}")),
-                    map.get(&format!("track_{i}StartPosition")),
-                    map.get(&format!("track_{i}EndPosition")),
-                    map.get(&format!("track_{i}NormalizedGain")),
-                ) {
-                    let mut start: f32 = start.parse()?;
-                    let mut end: f32 = end.parse()?;
+                let Some(track) = map.get(&format!("track_{i}")) else {
+                    warn!("Sample bank {}: track {} has no file, skipping it", id, i);
+                    continue;
+                };
 
-                    start = start.clamp(0., 100.);
-                    end = end.clamp(0., 100.);
-
-                    if start > end {
-                        start = end;
+                // A missing or broken setting falls back to playing the whole file, unchanged.
+                let setting = |name: &str, default: f64| -> f64 {
+                    let key = format!("track_{i}{name}");
+                    match map.get(&key).map(|value| value.parse::<f64>()) {
+                        Some(Ok(value)) if value.is_finite() => value,
+                        Some(_) => {
+                            warn!("Sample bank {}: invalid {}, using {}", id, key, default);
+                            default
+                        }
+                        None => {
+                            warn!("Sample bank {}: no {}, using {}", id, key, default);
+                            default
+                        }
                     }
+                };
+                let start = (setting("StartPosition", 0.) as f32).clamp(0., 100.);
+                let end = (setting("EndPosition", 100.) as f32).clamp(start, 100.);
+                let gain = setting("NormalizedGain", 1.);
 
-                    if end < start {
-                        end = start;
-                    }
-
-                    let track = Track::new(track.to_string(), start, end, gain.parse()?);
-                    sample_stack.tracks.push(track);
-                }
+                let track = Track::new(track.to_string(), start, end, gain);
+                sample_stack.tracks.push(track);
             }
         }
 
@@ -244,6 +256,12 @@ impl SampleBase {
                 );
             }
 
+            for (name, unknown) in value.unknown.iter() {
+                if !sub_attributes.contains_key(name) {
+                    sub_attributes.insert(name.clone(), unknown.clone());
+                }
+            }
+
             // Write the attributes into the tag, and close it.
             for (key, value) in &sub_attributes {
                 sub_elem.push_attribute((key.as_str(), value.as_str()));
@@ -318,6 +336,9 @@ pub struct SampleStack {
     playback_mode: Option<PlaybackMode>,
     play_order: Option<PlayOrder>,
 
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
+
     // Transient value, keep track of where we may be sequentially..
     transient_seq_position: usize,
 }
@@ -334,6 +355,7 @@ impl SampleStack {
             tracks: vec![],
             playback_mode: None,
             play_order: None,
+            unknown: UnknownAttributes::default(),
 
             transient_seq_position: 0,
         }

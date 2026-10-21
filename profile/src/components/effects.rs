@@ -125,4 +125,10 @@ impl Effects {
 
         Ok(())
     }
+
+    /// The name of a preset file, or the one it replaced: kept as it is (the official app allows
+    /// names `set_name` refuses, like "Lo-Fi").
+    pub(crate) fn set_loaded_name(&mut self, name: String) {
+        self.name = name;
+    }
 }

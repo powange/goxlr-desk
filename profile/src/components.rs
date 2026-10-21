@@ -62,6 +62,17 @@ pub(crate) fn check_range<T: Into<i64>>(
     goxlr_types::effect_ranges::check(value, range, name).map_err(anyhow::Error::msg)
 }
 
+/// The percentage shown for an effect knob position (0 to 24), rounded to the closest.
+pub(crate) fn knob_to_percentage(knob_position: i8) -> u8 {
+    ((knob_position.clamp(0, 24) as u16 * 100 + 12) / 24) as u8
+}
+
+/// The knob position closest to a percentage, so that a percentage shown and sent back keeps
+/// the knob where it was.
+pub(crate) fn percentage_to_knob(percentage: u8) -> i8 {
+    ((percentage.min(100) as u16 * 24 + 50) / 100) as i8
+}
+
 /// A value read from a file, brought back into its range (with a warning) when it's outside.
 pub(crate) fn clamp_loaded(
     value: std::os::raw::c_float,
@@ -96,6 +107,10 @@ impl UnknownAttributes {
             .push((attribute.name.clone(), attribute.value.clone()));
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().map(|(name, value)| (name, value))
+    }
+
     /// Adds them to the attributes being written, without replacing a known one.
     pub fn write_to<S: std::hash::BuildHasher>(
         &self,
@@ -115,4 +130,24 @@ where
     T: strum::IntoEnumIterator + strum::EnumProperty,
 {
     T::iter().find(|style| style.get_str("uiIndex") == Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_percentage_sent_back_keeps_the_knob() {
+        for knob in 0..=24 {
+            assert_eq!(percentage_to_knob(knob_to_percentage(knob)), knob);
+        }
+        // Each percentage goes to the closest position.
+        for percentage in 0..=100u8 {
+            let knob = percentage_to_knob(percentage) as f32;
+            assert!(
+                (knob - percentage as f32 * 24. / 100.).abs() <= 0.5,
+                "{percentage}"
+            );
+        }
+    }
 }

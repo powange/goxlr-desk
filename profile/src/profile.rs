@@ -573,7 +573,7 @@ impl ProfileSettings {
             *self.megaphone_effect.get_preset_mut(current) = before.4;
             *self.robot_effect.get_preset_mut(current) = before.5;
             *self.hardtune_effect.get_preset_mut(current) = before.6;
-            self.effects_mut(current).set_name(before.7)?;
+            self.effects_mut(current).set_loaded_name(before.7);
         }
         result
     }
@@ -631,7 +631,7 @@ impl ProfileSettings {
                     for attribute in attributes {
                         if attribute.name == "name" {
                             found = true;
-                            self.effects_mut(current).set_name(attribute.value)?;
+                            self.effects_mut(current).set_loaded_name(attribute.value);
                             break;
                         }
                     }
@@ -1217,6 +1217,39 @@ mod tests {
     }
 
     #[test]
+    fn sample_stacks_keep_what_they_dont_know() {
+        use crate::components::sample::SampleBank;
+        let profile = TEST_PROFILE
+            .replacen(
+                "track_0NormalizedGain=\"11.26597213745117187500\" playbackMode=\"1\"",
+                "futureFade=\"4\" playbackMode=\"1\"",
+                1,
+            )
+            .replacen(
+                "<sampleStackC/>\n  </sampleTopLeft>",
+                "<sampleStackC/>\n    <sampleStackD sampleStackDstackSize=\"1\" track_0=\"x.wav\"/>\n  </sampleTopLeft>",
+                1,
+            );
+        assert_ne!(profile, TEST_PROFILE);
+        // A bank this version doesn't know doesn't fail the profile
+        let mut settings = ProfileSettings::load(profile.as_bytes()).unwrap();
+
+        // The track without its gain is kept, playing whole at an unchanged gain
+        let tracks = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(SampleBank::A)
+            .get_tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].normalized_gain(), 1.);
+        assert_eq!(tracks[0].end_position(), 100.);
+
+        let out = normalised(&written(&mut settings));
+        let line = out.iter().find(|l| l.starts_with("sampleStackA ")).unwrap();
+        assert!(line.contains("futureFade=4"), "{line}");
+        assert!(line.contains("track_0=Walkie Talkie Static.wav"), "{line}");
+    }
+
+    #[test]
     fn a_broken_preset_changes_nothing() {
         let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
         let current = settings.context().selected_effects();
@@ -1232,6 +1265,20 @@ mod tests {
             format!("{:?}", settings.reverb_encoder.get_preset(current)),
             before
         );
+
+        // The bank keeps its name too, even one `set_name` would refuse
+        settings
+            .effects_mut(current)
+            .set_loaded_name("Lo-Fi".into());
+        assert!(settings.load_preset(preset.as_bytes()).is_err());
+        assert_eq!(settings.effects(current).name(), "Lo-Fi");
+
+        // A preset named like that loads
+        let named = fs::read_to_string(root.join("defaults/resources/presets/Big Echo.preset"))
+            .unwrap()
+            .replace("name=\"Big Echo\"", "name=\"Big-Echo\"");
+        settings.load_preset(named.as_bytes()).unwrap();
+        assert_eq!(settings.effects(current).name(), "Big-Echo");
     }
 
     /// A light fuzz: random attribute values (empty, huge, negative, not numbers..) never make
