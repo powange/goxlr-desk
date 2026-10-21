@@ -69,6 +69,7 @@ fn retry_delay(failures: u32) -> Duration {
     }
 }
 const APP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const TRASH_PURGE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // Adding a third entry has tripped enum_variant_names, I'll probably need to rename
 // RunDeviceCommand, but that'll need to be in a separate commit, for now, suppress.
@@ -151,6 +152,10 @@ pub async fn spawn_usb_handler(
     let app_duration = APP_CHECK_INTERVAL;
     let app_sleep = sleep(app_duration);
     tokio::pin!(app_sleep);
+
+    // The trashes are purged at startup (when listed) and then once a day
+    let purge_sleep = sleep(TRASH_PURGE_INTERVAL);
+    tokio::pin!(purge_sleep);
 
     // Get the Driver Type and Details..
     let (interface, version) = get_version();
@@ -351,6 +356,14 @@ pub async fn spawn_usb_handler(
                     }
                 }
                 update_sleep.as_mut().reset(tokio::time::Instant::now() + update_duration);
+            },
+            () = &mut purge_sleep => {
+                let backups = settings.get_backup_directory().await;
+                tokio::task::spawn_blocking(move || {
+                    purge_trash(&backups);
+                    purge_profile_trash(&backups);
+                });
+                purge_sleep.as_mut().reset(tokio::time::Instant::now() + TRASH_PURGE_INTERVAL);
             },
             () = &mut app_sleep => {
                 if get_app_path(&mut app_check) {
@@ -567,12 +580,13 @@ pub async fn spawn_usb_handler(
                             DaemonCommand::MoveSamplePath(from, to) => {
                                 let base = settings.get_samples_directory().await;
                                 let profiles = settings.get_profile_directory().await;
+                                let backups = settings.get_backup_directory().await;
                                 // Renaming rewrites the saved profiles, which is slow: done in the
                                 // background, the result comes back through sample_job_rx.
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
                                     let renamed = move_sample_path(&base, &from, &to)?;
                                     if let Some(renamed) = &renamed {
-                                        rename_in_saved_profiles(&profiles, renamed);
+                                        rename_in_saved_profiles(&profiles, &backups, renamed);
                                     }
                                     Ok(SampleJobOutput { renamed, ..Default::default() })
                                 });
@@ -606,7 +620,7 @@ pub async fn spawn_usb_handler(
                                     // Undoing an edit that renamed the sample: profiles go back to it
                                     let renamed = restored.renamed.map(|(old_name, new_name)| RenamedSample { old_name, new_name });
                                     if let Some(renamed) = &renamed {
-                                        rename_in_saved_profiles(&profiles, renamed);
+                                        rename_in_saved_profiles(&profiles, &backups, renamed);
                                     }
                                     Ok(SampleJobOutput { renamed, tracks: restored.tracks, ..Default::default() })
                                 });
@@ -672,7 +686,7 @@ pub async fn spawn_usb_handler(
                                     spawn_sample_job(sample_job_tx.clone(), Some(path.clone()), sender, move || {
                                         let renamed = edit_sample_file(&base, &backups, &path, &edit, save_as.as_deref())?;
                                         if let Some(renamed) = &renamed {
-                                            rename_in_saved_profiles(&profiles, renamed);
+                                            rename_in_saved_profiles(&profiles, &backups, renamed);
                                         }
                                         info!("Edited sample {} ({} part(s) removed, normalized: {})", path, edit.remove.len(), edit.normalize);
                                         // A copy saved under a new name keeps the original's gain
@@ -1106,8 +1120,9 @@ fn spawn_sample_job<F>(
 }
 
 /// Points the saved profiles at a renamed sample file (slow: every profile is read).
-fn rename_in_saved_profiles(profiles: &Path, renamed: &RenamedSample) {
-    let changed = rename_sample_in_saved_profiles(profiles, &renamed.old_name, &renamed.new_name);
+fn rename_in_saved_profiles(profiles: &Path, backups: &Path, renamed: &RenamedSample) {
+    let changed =
+        rename_sample_in_saved_profiles(profiles, backups, &renamed.old_name, &renamed.new_name);
     info!(
         "Renamed sample {} to {}, updated profiles: {:?}",
         renamed.old_name, renamed.new_name, changed

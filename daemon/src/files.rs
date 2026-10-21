@@ -619,6 +619,14 @@ pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<Rena
             if sample_name_used(base, &new_name, Some(&source)) {
                 bail!("A sample named {} already exists", new_name);
             }
+            // Profiles only know the name: with two files of that name (copied by hand), the
+            // profiles playing the other one would be renamed too.
+            if sample_name_used(base, &old_name, Some(&source)) {
+                bail!(
+                    "Another sample is also named {}, rename or move it first so the profiles stay right",
+                    old_name
+                );
+            }
             renamed = Some(RenamedSample { old_name, new_name });
         }
     }

@@ -78,8 +78,19 @@ pub fn saved_profiles_using_samples(directory: &Path, names: &HashSet<String>) -
 
 /// A sample file was renamed: updates every profile saved in `directory` that uses it, and
 /// returns the names of the profiles that changed.
-pub fn rename_sample_in_saved_profiles(directory: &Path, old: &str, new: &str) -> Vec<String> {
+pub fn rename_sample_in_saved_profiles(
+    directory: &Path,
+    backups: &Path,
+    old: &str,
+    new: &str,
+) -> Vec<String> {
     let mut changed = Vec::new();
+    // Each rewritten profile is copied here first: the user never opened most of them
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let kept = backups.join("sample-renames").join(stamp.to_string());
     let Ok(entries) = std::fs::read_dir(directory) else {
         return changed;
     };
@@ -94,6 +105,15 @@ pub fn rename_sample_in_saved_profiles(directory: &Path, old: &str, new: &str) -
         match ProfileAdapter::from_named(name.to_string(), directory) {
             Ok(mut profile) => {
                 if profile.rename_sample_file(old, new) {
+                    let copied = std::fs::create_dir_all(&kept)
+                        .and_then(|_| std::fs::copy(&path, kept.join(entry.file_name())));
+                    if let Err(e) = copied {
+                        warn!(
+                            "Not renaming {} in {}, unable to keep a copy: {}",
+                            old, name, e
+                        );
+                        continue;
+                    }
                     match profile.save(directory, true) {
                         Ok(()) => changed.push(name.to_string()),
                         Err(e) => warn!(
@@ -315,7 +335,7 @@ impl ProfileAdapter {
     pub fn get_fader_mute_state(&self, fader: FaderName) -> ChannelState {
         let (muted_to_x, muted_to_all, mute_function) = self.get_mute_button_state(fader);
 
-        if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) {
+        if hard_muted(muted_to_x, muted_to_all, mute_function) {
             return ChannelState::Muted;
         }
         ChannelState::Unmuted
@@ -1119,6 +1139,12 @@ impl ProfileAdapter {
         (muted_to_x, muted_to_all, mute_function)
     }
 
+    /// Whether a fader is muted for everyone: muted to all, or muted while its function is All.
+    pub fn is_fader_hard_muted(&self, fader: FaderName) -> bool {
+        let (muted_to_x, muted_to_all, mute_function) = self.get_mute_button_state(fader);
+        hard_muted(muted_to_x, muted_to_all, mute_function)
+    }
+
     pub fn get_mute_button_previous_volume(&self, fader: FaderName) -> u8 {
         self.get_mute_button(fader).previous_volume()
     }
@@ -1297,7 +1323,8 @@ impl ProfileAdapter {
 
     /** Fader Stuff */
     pub fn is_mic_on_fader(&self) -> bool {
-        self.profile.settings().mute_chat().mic_fader_id() != 4
+        // 0 to 3 are the faders; anything else (4 in the official profiles) isn't on one
+        self.profile.settings().mute_chat().mic_fader_id() < 4
     }
 
     pub fn get_mic_fader(&self) -> FaderName {
@@ -1734,7 +1761,8 @@ impl ProfileAdapter {
 
     pub fn get_active_hardtune_source(&self) -> InputDevice {
         let source = self.get_active_hardtune_profile().source();
-        match source.unwrap() {
+        // A profile without a source plays like 'All'
+        match source.unwrap_or(HardTuneSource::All) {
             HardTuneSource::Music => InputDevice::Music,
             HardTuneSource::Game => InputDevice::Game,
             HardTuneSource::LineIn => InputDevice::LineIn,
@@ -3489,7 +3517,8 @@ mod tests {
 
     #[test]
     fn renames_samples_in_saved_profiles() {
-        let dir = std::env::temp_dir().join(format!("goxlr-test-profiles-{}", std::process::id()));
+        let root = tempfile::tempdir().unwrap();
+        let (dir, backups) = (root.path().join("profiles"), root.path().join("backups"));
         std::fs::create_dir_all(&dir).unwrap();
 
         // A saved profile with a sample on a button
@@ -3504,15 +3533,20 @@ mod tests {
             .save_as("Other".to_string(), &dir, false)
             .unwrap();
 
-        let changed = rename_sample_in_saved_profiles(&dir, "intro.wav", "start.wav");
+        let changed = rename_sample_in_saved_profiles(&dir, &backups, "intro.wav", "start.wav");
         assert_eq!(changed, vec!["Stream".to_string()]);
+
+        // The profile as it was is kept in the backups
+        let kept: Vec<_> = std::fs::read_dir(backups.join("sample-renames"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(kept[0].path().join("Stream.goxlr").is_file());
 
         // Reloaded from disk, the button now uses the new name
         let mut reloaded = ProfileAdapter::from_named("Stream".to_string(), &dir).unwrap();
         assert!(reloaded.rename_sample_file("start.wav", "check.wav"));
         assert!(!reloaded.rename_sample_file("intro.wav", "check.wav"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -3543,4 +3577,10 @@ mod fingerprint_tests {
             MicProfileAdapter::default().fingerprint()
         );
     }
+}
+
+/// Whether a mute button state means "nobody hears it": muted to all (held), or muted while the
+/// button's function is All. The one place this rule is written, for faders and the cough button.
+pub fn hard_muted(muted_to_x: bool, muted_to_all: bool, mute_function: MuteFunction) -> bool {
+    muted_to_all || (muted_to_x && mute_function == MuteFunction::All)
 }

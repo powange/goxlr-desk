@@ -65,7 +65,7 @@ impl EchoEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[EchoEncoder] Unparsed Attribute: {}", attr.name);
+                log::warn!("[EchoEncoder] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -143,7 +143,7 @@ impl EchoEncoderBase {
                 continue;
             }
 
-            println!("[EchoEncoder] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[EchoEncoder] Unparsed Child Attribute: {}", attr.name);
         }
 
         self.preset_map[preset_enum] = preset;

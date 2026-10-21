@@ -64,7 +64,7 @@ impl PitchEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[PitchEncoder] Unparsed Attribute: {}", attr.name);
+                log::warn!("[PitchEncoder] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -115,7 +115,7 @@ impl PitchEncoderBase {
                 continue;
             }
 
-            println!("[PitchEncoder] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[PitchEncoder] Unparsed Child Attribute: {}", attr.name);
         }
 
         self.preset_map[preset_enum] = preset;

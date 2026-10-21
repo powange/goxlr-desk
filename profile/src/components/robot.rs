@@ -60,7 +60,7 @@ impl RobotEffectBase {
     pub fn parse_robot_root(&mut self, attributes: &Vec<Attribute>) -> Result<()> {
         for attr in attributes {
             if !self.colour_map.read_colours(attr)? {
-                println!("[robotEffect] Unparsed Attribute: {}", attr.name);
+                log::warn!("[robotEffect] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -143,7 +143,7 @@ impl RobotEffectBase {
                 preset.vocoder_high_bw = attr.value.parse::<c_float>()? as u8;
                 continue;
             }
-            println!("[RobotEffect] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[RobotEffect] Unparsed Child Attribute: {}", attr.name);
         }
 
         self.preset_map[preset_enum] = preset;

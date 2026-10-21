@@ -76,7 +76,7 @@ impl BrowserPreviewTree {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
+                log::warn!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
             }
         }
 

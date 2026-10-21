@@ -41,8 +41,10 @@ use crate::firmware::firmware_update::{
 };
 use crate::mic_profile::{DEFAULT_MIC_PROFILE_NAME, MicProfileAdapter};
 use crate::profile::{
-    DEFAULT_PROFILE_NAME, ProfileAdapter, usb_to_standard_button, version_newer_or_equal_to,
+    DEFAULT_PROFILE_NAME, ProfileAdapter, hard_muted, usb_to_standard_button,
+    version_newer_or_equal_to,
 };
+use crate::profile_store::load_with_backup;
 use crate::profile_trash::trash_profile;
 use crate::sample_trash::TrashedTrack;
 
@@ -142,71 +144,18 @@ impl<'a> Device<'a> {
 
         let profile_path = settings_handle.get_profile_directory().await;
         let backup_path = settings_handle.get_backup_directory().await;
-        let profile = ProfileAdapter::from_named(profile_name.clone(), &profile_path);
-
-        // Check load situation..
-        let profile = match profile {
-            Ok(mut profile) => {
-                debug!("Profile Successfully Loaded, Performing Backup..");
-                profile.save(&backup_path, true).unwrap_or_else(|e| {
-                    warn!("Unable to Backup Profile: {}", e);
-                });
-                debug!("Main Profile Backup Complete");
-                profile
-            }
-            Err(e) => {
-                warn!("Failed to Load Profile: {}, checking for backup..", e);
-                match ProfileAdapter::from_named(profile_name, &backup_path) {
-                    Ok(mut profile) => {
-                        info!("Successfully Loaded backup profile");
-
-                        debug!("Overwriting existing corrupt / missing profile..");
-                        profile.save(&profile_path, true).unwrap_or_else(|e| {
-                            warn!("Unable to replace existing profile: {}", e);
-                        });
-
-                        // Return the new profile..
-                        profile
-                    }
-                    Err(e) => {
-                        warn!("Unable to Load Backup: {}, loading default", e);
-                        ProfileAdapter::default()
-                    }
-                }
-            }
-        };
+        let profile = load_with_backup(&profile_name, &profile_path, &backup_path, true)
+            .unwrap_or_else(|e| {
+                warn!("{}, loading the default profile", e);
+                ProfileAdapter::default()
+            });
 
         let mic_path = settings_handle.get_mic_profile_directory().await;
-        let mic_profile = MicProfileAdapter::from_named(mic_name.clone(), &mic_path);
-
-        let mic_profile = match mic_profile {
-            Ok(mut profile) => {
-                debug!("Mic Profile Successfully Loaded, Performing Backup..");
-                profile.save(&backup_path, true).unwrap_or_else(|e| {
-                    warn!("Unable to Backup Mic Profile: {}", e);
-                });
-                debug!("Mic Profile Backup Complete");
-                profile
-            }
-            Err(e) => {
-                warn!("Failed to Load Mic Profile: {}, checking for backup..", e);
-                match MicProfileAdapter::from_named(mic_name, &backup_path) {
-                    Ok(mut profile) => {
-                        info!("Successfully Loaded Backup Profile");
-
-                        debug!("Overwriting existing corrupt / missing profile..");
-                        profile.save(&mic_path, true).unwrap_or_else(|e| {
-                            warn!("Unable to replace existing Mic Profile {}", e);
-                        });
-                        profile
-                    }
-                    Err(e) => {
-                        warn!("Unable to Load Backup: {} loading default", e);
-                        MicProfileAdapter::default()
-                    }
-                }
-            }
-        };
+        let mic_profile = load_with_backup(&mic_name, &mic_path, &backup_path, true)
+            .unwrap_or_else(|e| {
+                warn!("{}, loading the default mic profile", e);
+                MicProfileAdapter::default()
+            });
 
         let mut audio_handler = None;
         if hardware.device_type == DeviceType::Full {
@@ -464,49 +413,13 @@ impl<'a> Device<'a> {
         for command in commands {
             debug!("{:?}", command);
 
-            // Below is a list of all commands which will write to a disk, if any of them are
-            // in our command list, we do nothing.
-            match command {
-                // Shutdown / Sleep / Wake Commandsets
-                GoXLRCommand::SetShutdownCommands(_)
-                | GoXLRCommand::SetSleepCommands(_)
-                | GoXLRCommand::SetWakeCommands(_)
-                // Presets
-                | GoXLRCommand::SaveActivePreset()
-                // Profile Related Commands
-                | GoXLRCommand::NewProfile(_)
-                | GoXLRCommand::LoadProfile(_, true)
-                | GoXLRCommand::SaveProfile()
-                | GoXLRCommand::SaveProfileAs(_)
-                // Mic Profile Related Commands
-                | GoXLRCommand::NewMicProfile(_)
-                | GoXLRCommand::LoadMicProfile(_, true)
-                | GoXLRCommand::SaveMicProfile()
-                | GoXLRCommand::SaveMicProfileAs(_)
-                | GoXLRCommand::RenameProfile(..)
-                | GoXLRCommand::DuplicateProfile(..)
-                | GoXLRCommand::RenameMicProfile(..)
-                | GoXLRCommand::DuplicateMicProfile(..)
-                | GoXLRCommand::SaveScene(..)
-                | GoXLRCommand::DeleteScene(_)
-                // settings.json variables
-                | GoXLRCommand::SetSamplerPreBufferDuration(_)
-                | GoXLRCommand::SetVCMuteAlsoMuteCM(_)
-                | GoXLRCommand::SetMonitorWithFx(_)
-                | GoXLRCommand::SetSamplerResetOnClear(_)
-                | GoXLRCommand::SetLockFaders(_)
-                => {
-                    if !avoid_write {
-                        let _ = self.perform_command(command).await;
-                    } else {
-                        warn!("Unable to Execute, command writes to the disk.");
-                    }
-                }
-
-                _ => {
-                    let _ = self.perform_command(command).await;
-                }
+            // Commands that write to the disk are skipped when asked (shutting down: the disk
+            // may be going away); the list of those is GoXLRCommand::writes_to_disk.
+            if avoid_write && command.writes_to_disk() {
+                warn!("Unable to Execute, command writes to the disk.");
+                continue;
             }
+            let _ = self.perform_command(command).await;
         }
     }
 
@@ -1003,7 +916,7 @@ impl<'a> Device<'a> {
                     self.profile.set_mute_chat_button_on(false);
                     self.profile.set_mute_chat_button_blink(false);
 
-                    if (muted_to_all || (muted_to_x && mute_function == MuteFunction::All))
+                    if (hard_muted(muted_to_x, muted_to_all, mute_function))
                         && !self.mic_muted_by_fader()
                     {
                         self.goxlr.set_channel_state(ChannelName::Mic, Unmuted)?;
@@ -1769,7 +1682,7 @@ impl<'a> Device<'a> {
             let (muted_to_x, muted_to_all, mute_function) =
                 self.profile.get_mute_button_state(fader);
 
-            return muted_to_all || (muted_to_x && mute_function == MuteFunction::All);
+            return hard_muted(muted_to_x, muted_to_all, mute_function);
         }
         false
     }
@@ -1778,7 +1691,7 @@ impl<'a> Device<'a> {
         let (_mute_toggle, muted_to_x, muted_to_all, mute_function) =
             self.profile.get_mute_chat_button_state();
 
-        muted_to_all || (muted_to_x && mute_function == MuteFunction::All)
+        hard_muted(muted_to_x, muted_to_all, mute_function)
     }
 
     async fn update_volumes_to(&mut self, volumes: [u8; 4]) -> Result<bool> {
@@ -2088,9 +2001,15 @@ impl<'a> Device<'a> {
                     return Ok(());
                 }
 
-                // Unmute the channel to prevent weirdness, then set new behaviour
-                //self.unmute_fader(fader).await?;
+                // A mute to X that becomes a mute for everyone takes the channel to 0: keep its
+                // current level as the one to restore on unmute (an older one would be restored).
+                let was_hard_muted = self.profile.is_fader_hard_muted(fader);
                 self.profile.set_mute_button_behaviour(fader, behaviour);
+                if !was_hard_muted && self.profile.is_fader_hard_muted(fader) {
+                    let channel = self.profile.get_fader_assignment(fader);
+                    let volume = self.profile.get_channel_volume(channel);
+                    self.profile.set_mute_previous_volume(fader, volume)?;
+                }
 
                 // We'll pass 'None' into this as there's a guaranteed change..
                 self.apply_mute_from_profile(fader, None)?;
@@ -2892,42 +2811,8 @@ impl<'a> Device<'a> {
                 let profile_path = self.settings.get_profile_directory().await;
                 let backup_path = self.settings.get_backup_directory().await;
 
-                // Attempt to load the profile from the main profile path..
-                let profile = ProfileAdapter::from_named(profile_name.clone(), &profile_path);
-
-                match profile {
-                    Ok(mut profile) => {
-                        if save_change {
-                            // We're persisting this change, so save the backup
-                            debug!("Profile Successfully Loaded, Performing Backup..");
-                            profile.save(&backup_path, true).unwrap_or_else(|e| {
-                                warn!("Unable to Save Backup: {}", e);
-                            });
-                            debug!("Backup Complete");
-                        }
-                        self.profile = profile;
-                    }
-                    Err(e) => {
-                        if !save_change {
-                            // This isn't a persistent profile change, so we'll avoid checking the
-                            // backups as we're likely shutting down.
-                            return Err(e);
-                        }
-                        warn!("Failed to Load Profile: {}, checking for backup..", e);
-                        match ProfileAdapter::from_named(profile_name, &backup_path) {
-                            Ok(profile) => {
-                                info!("Backup Profile Loaded");
-                                self.profile = profile;
-
-                                debug!("Overwriting existing corrupt profile..");
-                                self.profile.save(&profile_path, true)?;
-                            }
-                            Err(e) => {
-                                bail!("Failed to Load backup profile: {}", e);
-                            }
-                        }
-                    }
-                };
+                self.profile =
+                    load_with_backup(&profile_name, &profile_path, &backup_path, save_change)?;
 
                 self.apply_profile(Some(volumes)).await?;
                 if save_change {
@@ -3034,42 +2919,7 @@ impl<'a> Device<'a> {
                 let path = self.settings.get_mic_profile_directory().await;
                 let backup = self.settings.get_backup_directory().await;
 
-                // Attempt to load the profile from the main profile path..
-                let profile = MicProfileAdapter::from_named(name.clone(), &path);
-
-                match profile {
-                    Ok(mut profile) => {
-                        if persist {
-                            // We're persisting this change, so save the backup
-                            debug!("Mic Profile Successfully Loaded, Performing Backup..");
-                            profile.save(&backup, true).unwrap_or_else(|e| {
-                                warn!("Unable to Save Backup: {}", e);
-                            });
-                            debug!("Backup Complete");
-                        }
-                        self.mic_profile = profile;
-                    }
-                    Err(e) => {
-                        if !persist {
-                            // This isn't a persistent profile change, so we'll avoid checking the
-                            // backups as we're likely shutting down.
-                            return Err(e);
-                        }
-                        warn!("Failed to Load Profile: {}, checking for backup..", e);
-                        match MicProfileAdapter::from_named(name, &backup) {
-                            Ok(profile) => {
-                                info!("Backup Mic Profile Loaded");
-                                self.mic_profile = profile;
-
-                                debug!("Overwriting existing corrupt profile..");
-                                self.mic_profile.save(&path, true)?;
-                            }
-                            Err(e) => {
-                                bail!("Failed to Load backup profile: {}", e);
-                            }
-                        }
-                    }
-                };
+                self.mic_profile = load_with_backup(&name, &path, &backup, persist)?;
                 self.apply_mic_profile().await?;
 
                 if persist {
@@ -3565,7 +3415,7 @@ impl<'a> Device<'a> {
                 // Get the Mute State..
                 let (muted_to_x, muted_to_all, mute_function) =
                     self.profile.get_mute_button_state(fader);
-                if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) {
+                if hard_muted(muted_to_x, muted_to_all, mute_function) {
                     let mute_to_chat = self.vc_mute_also_mute_cm;
                     if mute_to_chat {
                         router[BasicOutputDevice::ChatMic] = false;
@@ -3587,7 +3437,7 @@ impl<'a> Device<'a> {
     ) -> Result<()> {
         if !muted_to_x || muted_to_all || mute_function == MuteFunction::All {
             if channel_name == ChannelName::Mic
-                && (muted_to_all || (muted_to_x && mute_function == MuteFunction::All))
+                && (hard_muted(muted_to_x, muted_to_all, mute_function))
             {
                 // In the case of the mic, if we're muted to all, we should drop routing to All other channels..
                 for output in BasicOutputDevice::iter() {
@@ -3686,7 +3536,7 @@ impl<'a> Device<'a> {
         let channel = self.profile.get_fader_assignment(fader);
 
         let (muted_to_x, muted_to_all, mute_function) = self.profile.get_mute_button_state(fader);
-        if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) {
+        if hard_muted(muted_to_x, muted_to_all, mute_function) {
             if let Some(current) = current {
                 if current != Muted {
                     // This channel should be fully muted
@@ -3739,12 +3589,12 @@ impl<'a> Device<'a> {
             let fader = self.profile.get_mic_fader();
             let (muted_to_x, muted_to_all, mute_function) =
                 self.profile.get_mute_button_state(fader);
-            muted_to_all || (muted_to_x && mute_function == MuteFunction::All)
+            hard_muted(muted_to_x, muted_to_all, mute_function)
         } else {
             false
         };
 
-        if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) || muted_by_fader {
+        if hard_muted(muted_to_x, muted_to_all, mute_function) || muted_by_fader {
             debug!("Setting Mic to Muted");
             self.goxlr.set_channel_state(ChannelName::Mic, Muted)?;
         } else {
@@ -4444,7 +4294,8 @@ impl<'a> Device<'a> {
 
         let current = &self.hardware.versions.firmware;
         match self.hardware.device_type {
-            DeviceType::Unknown => true,
+            // An unknown device supports nothing optional, as for submixes
+            DeviceType::Unknown => false,
             DeviceType::Full => version_newer_or_equal_to(current, support_full),
             DeviceType::Mini => version_newer_or_equal_to(current, support_mini),
         }
@@ -4457,7 +4308,8 @@ impl<'a> Device<'a> {
         let current = &self.hardware.versions.firmware;
 
         match self.hardware.device_type {
-            DeviceType::Unknown => true,
+            // An unknown device supports nothing optional, as for submixes
+            DeviceType::Unknown => false,
             DeviceType::Full => version_newer_or_equal_to(current, support_full),
             DeviceType::Mini => version_newer_or_equal_to(current, support_mini),
         }

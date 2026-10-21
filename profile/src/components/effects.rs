@@ -68,7 +68,7 @@ impl Effects {
 
             // Send the rest out for colouring..
             if !self.colour_map.read_colours(attr)? {
-                println!("[EFFECTS] Unparsed Attribute: {}", attr.name);
+                log::warn!("[EFFECTS] Unparsed Attribute: {}", attr.name);
             }
         }
 

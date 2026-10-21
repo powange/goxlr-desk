@@ -320,14 +320,75 @@ pub fn empty_trash(backups: &Path, id: Option<&str>) -> Result<()> {
 }
 
 /// Removes items that have been in the trash for longer than TRASH_RETENTION.
+// Past this size, the oldest items go first (each in place edit keeps a full copy)
+pub const MAX_TRASH_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+// An entry that can't be read (a crash while it was made) is removed after this long
+const DAMAGED_ENTRY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn size_of(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    fs::read_dir(path)
+        .map(|entries| entries.flatten().map(|entry| size_of(&entry.path())).sum())
+        .unwrap_or(0)
+}
+
+/// Removes items kept longer than TRASH_RETENTION, damaged entries, and the oldest items while
+/// the trash is larger than MAX_TRASH_SIZE.
 pub fn purge_trash(backups: &Path) {
-    let limit = now().saturating_sub(TRASH_RETENTION.as_secs());
-    for item in list_trash(backups) {
-        if item.deleted_at < limit
-            && let Err(e) = empty_trash(backups, Some(&item.id))
-        {
-            warn!("Unable to purge {} from the sample trash: {}", item.path, e);
+    purge_trash_with(backups, TRASH_RETENTION, MAX_TRASH_SIZE);
+}
+
+fn purge_trash_with(backups: &Path, retention: Duration, max_size: u64) {
+    // Damaged entries never show in the list, so they'd never be purged otherwise
+    if let Ok(entries) = fs::read_dir(trash_directory(backups)) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > DAMAGED_ENTRY_RETENTION);
+            if old && read_entry(&entry.path()).is_none() {
+                warn!(
+                    "Removing a damaged sample trash entry: {}",
+                    entry.path().display()
+                );
+                let _ = fs::remove_dir_all(entry.path());
+            }
         }
+    }
+
+    let limit = now().saturating_sub(retention.as_secs());
+    let mut kept = Vec::new();
+    for item in list_trash(backups) {
+        if item.deleted_at < limit {
+            if let Err(e) = empty_trash(backups, Some(&item.id)) {
+                warn!("Unable to purge {} from the sample trash: {}", item.path, e);
+            }
+        } else {
+            let size = size_of(&trash_directory(backups).join(&item.id));
+            kept.push((item, size));
+        }
+    }
+
+    // Oldest first, until the trash fits
+    kept.sort_by_key(|(item, _)| item.deleted_at);
+    let mut total: u64 = kept.iter().map(|(_, size)| size).sum();
+    for (item, size) in kept {
+        if total <= max_size {
+            break;
+        }
+        if let Err(e) = empty_trash(backups, Some(&item.id)) {
+            warn!("Unable to purge {} from the sample trash: {}", item.path, e);
+            continue;
+        }
+        total = total.saturating_sub(size);
     }
 }
 
@@ -405,6 +466,41 @@ mod tests {
         empty_trash(&backups, Some(&folder.id)).unwrap();
         assert!(list_trash(&backups).is_empty());
         empty_trash(&backups, None).unwrap();
+    }
+
+    #[test]
+    fn purge_keeps_the_trash_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let (samples, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(&samples).unwrap();
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            fs::write(samples.join(name), vec![0u8; 1000]).unwrap();
+            trash_sample_path(&samples, &backups, name, vec![]).unwrap();
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        // A damaged entry, old enough to go
+        let damaged = trash_directory(&backups).join("damaged");
+        fs::create_dir_all(&damaged).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        fs::File::open(&damaged).unwrap().set_modified(old).ok();
+
+        // At most about two items' worth: the oldest goes
+        purge_trash_with(&backups, TRASH_RETENTION, 2500);
+        let left: Vec<String> = list_trash(&backups)
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert_eq!(left, vec!["c.wav".to_string(), "b.wav".to_string()]);
+        if damaged.exists() {
+            // set_modified isn't available on every file system; the entry is at least listed out
+            assert!(read_entry(&damaged).is_none());
+        }
+
+        // Nothing kept past the retention
+        purge_trash_with(&backups, Duration::ZERO, MAX_TRASH_SIZE);
+        std::thread::sleep(Duration::from_millis(1100));
+        purge_trash_with(&backups, Duration::ZERO, MAX_TRASH_SIZE);
+        assert!(list_trash(&backups).is_empty());
     }
 
     #[test]

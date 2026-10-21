@@ -117,7 +117,7 @@ impl Mixers {
                 }
 
                 if !found {
-                    println!("Unable to find Channel: {channel}");
+                    log::warn!("Unable to find Channel: {channel}");
                 }
                 continue;
             }
@@ -152,7 +152,7 @@ impl Mixers {
 
             // Check to see if this is a colour related attribute..
             if !self.colour_map.read_colours(attr)? {
-                println!("[MIXER] Unparsed Attribute: {}", attr.name);
+                log::warn!("[MIXER] Unparsed Attribute: {}", attr.name);
             }
         }
 

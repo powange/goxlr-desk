@@ -50,6 +50,7 @@ mod mic_profile;
 mod platform;
 mod primary_worker;
 mod profile;
+mod profile_store;
 mod profile_trash;
 mod sample_trash;
 mod servers;

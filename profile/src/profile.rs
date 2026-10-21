@@ -50,6 +50,9 @@ pub struct Attribute {
     pub(crate) value: String,
 }
 
+// A screen image is a few KB; anything this large isn't one
+const MAX_SCRIBBLE_SIZE: u64 = 1024 * 1024;
+
 impl Profile {
     pub fn load<R: Read + std::io::Seek>(read: R) -> Result<Self> {
         debug!("Loading Profile Archive..");
@@ -61,9 +64,15 @@ impl Profile {
         // Load the scribbles if they exist, store them in memory for later fuckery.
         for (i, scribble) in scribbles.iter_mut().enumerate() {
             let filename = format!("scribble{}.png", i + 1);
-            if let Ok(mut file) = archive.by_name(filename.as_str()) {
-                *scribble = vec![0; file.size() as usize];
-                file.read_exact(scribble)?;
+            if let Ok(file) = archive.by_name(filename.as_str()) {
+                // The size comes from the archive itself: read at most a sane amount
+                let mut data = Vec::new();
+                file.take(MAX_SCRIBBLE_SIZE + 1).read_to_end(&mut data)?;
+                if data.len() as u64 > MAX_SCRIBBLE_SIZE {
+                    warn!("Ignoring {}, it's too large for a screen image", filename);
+                    continue;
+                }
+                *scribble = data;
             }
         }
 
@@ -245,6 +254,7 @@ impl ProfileSettings {
 
         let mut buf = Vec::new();
         loop {
+            buf.clear();
             match reader.read_event_into(&mut buf) {
                 // Applies to most tags, represents a tag with no child
                 Ok(Event::Empty(ref e)) => {
@@ -394,9 +404,13 @@ impl ProfileSettings {
                         || name == "globalColour"
                         || name == "logoX"
                     {
-                        // In this case, the tag name, and attribute prefixes are the same..
-                        let element = SimpleElements::from_str(&name)?;
-                        simple_elements[element].parse_simple(&attributes)?;
+                        // In this case, the tag name, and attribute prefixes are the same.. An
+                        // element this version doesn't know (a 'sampleBankD') is skipped rather
+                        // than failing the whole profile.
+                        match SimpleElements::from_str(&name) {
+                            Ok(element) => simple_elements[element].parse_simple(&attributes)?,
+                            Err(_) => warn!("Skipping unknown element {}", name),
+                        }
 
                         continue;
                     }
@@ -548,6 +562,7 @@ impl ProfileSettings {
         let current = self.context().selected_effects();
         let mut buf = Vec::new();
         loop {
+            buf.clear();
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Empty(ref e)) => {
                     let (name, attributes) = wrap_start_event(e)?;
@@ -778,7 +793,8 @@ impl ProfileSettings {
             .last()
             .map(|s| u8::from_str(&s.to_string()))
             .transpose()?
-            && let Some(preset) = Preset::iter().nth((id - 1) as usize)
+            && let Some(index) = id.checked_sub(1)
+            && let Some(preset) = Preset::iter().nth(index as usize)
         {
             return Ok(preset);
         }

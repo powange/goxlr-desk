@@ -64,7 +64,7 @@ impl GenderEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[GenderEncoder] Unparsed Attribute: {}", attr.name);
+                log::warn!("[GenderEncoder] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -98,7 +98,7 @@ impl GenderEncoderBase {
                 continue;
             }
 
-            println!("[GenderEncoder] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[GenderEncoder] Unparsed Child Attribute: {}", attr.name);
         }
 
         self.preset_map[preset_enum] = preset;

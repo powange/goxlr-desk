@@ -60,7 +60,7 @@ impl MegaphoneEffectBase {
     pub fn parse_megaphone_root(&mut self, attributes: &Vec<Attribute>) -> Result<(), ParseError> {
         for attr in attributes {
             if !self.colour_map.read_colours(attr)? {
-                println!("[megaphoneEffect] Unparsed Attribute: {}", attr.name);
+                log::warn!("[megaphoneEffect] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -151,7 +151,7 @@ impl MegaphoneEffectBase {
                 preset.trans_drive_pot_gain_comp_max = attr.value.parse::<c_float>()? as u8;
                 continue;
             }
-            println!("[MegaphoneEffect] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[MegaphoneEffect] Unparsed Child Attribute: {}", attr.name);
         }
         self.preset_map[preset_enum] = preset;
         Ok(())

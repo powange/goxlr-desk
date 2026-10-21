@@ -74,14 +74,14 @@ impl SampleBase {
         for attr in attributes {
             if attr.name.ends_with("state") && self.element_name != "sampleClear" {
                 if attr.value != "Empty" && attr.value != "Stopped" {
-                    println!("[Sampler] Unknown State: {}", attr.value);
+                    log::warn!("[Sampler] Unknown State: {}", attr.value);
                 }
                 self.state.clone_from(&attr.value);
                 continue;
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[Sampler] Unparsed Attribute: {}", attr.name);
+                log::warn!("[Sampler] Unparsed Attribute: {}", attr.name);
             }
         }
 

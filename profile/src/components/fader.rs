@@ -75,14 +75,14 @@ impl Fader {
                 }
 
                 if !found {
-                    println!("Cannot Find Fader Index: {}", attr.value);
+                    log::warn!("Cannot Find Fader Index: {}", attr.value);
                 }
                 continue;
             }
 
             // Send the rest out for colouring..
             if !self.colour_map.read_colours(attr)? {
-                println!("[FADER] Unparsed Attribute: {}", attr.name);
+                log::warn!("[FADER] Unparsed Attribute: {}", attr.name);
             }
         }
 

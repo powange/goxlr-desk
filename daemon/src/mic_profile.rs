@@ -1,10 +1,9 @@
 use crate::files::{can_create_new_file, named_file_path, new_named_file_path};
-use crate::profile::ProfileAdapter;
+use crate::profile::{ProfileAdapter, hard_muted};
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
 use enum_map::EnumMap;
 use goxlr_ipc::{Compressor, Equaliser, EqualiserMini, NoiseGate};
-use goxlr_profile_loader::components::mute::MuteFunction;
 use goxlr_profile_loader::mic_profile::MicProfileSettings;
 use goxlr_types::{
     CompressorAttackTime, CompressorRatio, CompressorReleaseTime, DisplayMode, EffectKey,
@@ -12,7 +11,7 @@ use goxlr_types::{
 };
 use log::warn;
 use ritelinked::LinkedHashSet;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
@@ -775,13 +774,13 @@ impl MicProfileAdapter {
             let (muted_to_x, muted_to_all, mute_function) = profile.get_mute_button_state(fader);
 
             // Return whether we're muted or not by the fader
-            muted_to_all || (muted_to_x && mute_function == MuteFunction::All)
+            hard_muted(muted_to_x, muted_to_all, mute_function)
         } else {
             false
         };
 
         // Check all the cases where we might be muted to all, and return.
-        if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) || muted_by_fader {
+        if hard_muted(muted_to_x, muted_to_all, mute_function) || muted_by_fader {
             1
         } else {
             0
@@ -1071,8 +1070,10 @@ impl MicProfileAdapter {
         GATE_ATTENUATION[index as usize]
     }
 
-    pub fn get_mic_keys(&self) -> HashSet<EffectKey> {
-        let mut keys = HashSet::new();
+    /// The microphone's keys, always in this order (like get_fx_keys, the order they're sent in
+    /// can matter to the device).
+    pub fn get_mic_keys(&self) -> LinkedHashSet<EffectKey> {
+        let mut keys = LinkedHashSet::new();
         keys.insert(EffectKey::DeEsser);
         keys.insert(EffectKey::GateThreshold);
         keys.insert(EffectKey::GateAttack);

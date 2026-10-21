@@ -70,7 +70,7 @@ impl HardtuneEffectBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[hardTuneEffect] Unparsed Attribute: {}", attr.name);
+                log::warn!("[hardTuneEffect] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -127,7 +127,7 @@ impl HardtuneEffectBase {
                 continue;
             }
 
-            println!("[HardTuneEffect] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[HardTuneEffect] Unparsed Child Attribute: {}", attr.name);
         }
 
         self.preset_map[preset_enum] = preset;

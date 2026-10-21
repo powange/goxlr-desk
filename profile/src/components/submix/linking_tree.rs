@@ -65,7 +65,7 @@ impl LinkingTree {
                 }
 
                 if !found {
-                    println!("Unable to find Channel: {channel}");
+                    log::warn!("Unable to find Channel: {channel}");
                 }
                 continue;
             }
@@ -89,7 +89,7 @@ impl LinkingTree {
                 }
 
                 if !found {
-                    println!("Unable to find Channel: {channel}");
+                    log::warn!("Unable to find Channel: {channel}");
                 }
                 continue;
             }

@@ -65,7 +65,7 @@ impl ReverbEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[ReverbEncoder] Unparsed Attribute: {}", attr.name);
+                log::warn!("[ReverbEncoder] Unparsed Attribute: {}", attr.name);
             }
         }
 
@@ -151,7 +151,7 @@ impl ReverbEncoderBase {
                 continue;
             }
 
-            println!("[ReverbEncoder] Unparsed Child Attribute: {}", attr.name);
+            log::warn!("[ReverbEncoder] Unparsed Child Attribute: {}", attr.name);
         }
 
         // Ok, we should be able to store this now..
