@@ -1,11 +1,11 @@
 use crate::FIRMWARE_PATHS;
+use crate::firmware::device_hash::device_hash;
 use crate::firmware::firmware_file::check_firmware;
-use crate::firmware::hash_probe;
 use anyhow::{Result, bail};
 use futures_util::StreamExt;
 use goxlr_ipc::{FirmwareInfo, FirmwareSource, UpdateState};
 use goxlr_types::{DeviceType, VersionNumber};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use reqwest::ClientBuilder;
 use std::cmp::min;
 use std::fs;
@@ -97,7 +97,7 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
     let device = settings.device;
 
     // Ok, when we get here we should be good to go, grab the firmware bytes from disk..
-    let firmware = match fs::read(file_info.path) {
+    let firmware = match fs::read(&file_info.path) {
         Ok(bytes) => bytes,
         Err(e) => {
             let error = format!("Unable to load firmware from disk: {e}");
@@ -105,6 +105,8 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
             return;
         }
     };
+    // Flashed from memory from here: a downloaded file isn't needed any more
+    remove_downloaded_firmware(&file_info.path);
 
     info!("Entering DFU Mode");
     if let Err(e) = enter_dfu(&device.serial, sender.clone()).await {
@@ -416,9 +418,6 @@ async fn validate_upload(serial: &str, sender: Sender, firmware: &[u8]) -> Resul
     set_update_state(serial, sender.clone(), UpdateState::ValidateUpload).await?;
     let firmware_size = firmware.len() as u32;
 
-    // Which way of computing the device's hash fits every chunk (only logged for now, see
-    // hash_probe): None until the first chunk.
-    let mut fitting: Option<Vec<&'static str>> = None;
     let mut chunks = 0;
 
     let mut last_percent = 0;
@@ -452,26 +451,18 @@ async fn validate_upload(serial: &str, sender: Sender, firmware: &[u8]) -> Resul
         }
         let chunk =
             &firmware[processed_bytes as usize..(processed_bytes + response.count) as usize];
-        let matches = hash_probe::matching(hash_in, chunk, response.hash);
-        chunks += 1;
-        if chunks <= 3 {
-            info!(
-                "Firmware validation chunk {}: {} bytes from {}, hash in {:08x}, device {:08x}, matching: {:?}",
-                chunks, response.count, processed_bytes, hash_in, response.hash, matches
-            );
-        } else {
-            debug!(
-                "Firmware validation chunk {}: {} bytes from {}, hash in {:08x}, device {:08x}, matching: {:?}",
-                chunks, response.count, processed_bytes, hash_in, response.hash, matches
+        // The device's hash of what it received, against the one of the file: different bytes
+        // stop the update here, before anything is written.
+        let expected = device_hash(hash_in, chunk);
+        if response.hash != expected {
+            bail!(
+                "Error Validating Firmware, the device received different data at byte {} (hash {:08x}, expected {:08x})",
+                processed_bytes,
+                response.hash,
+                expected
             );
         }
-        fitting = Some(match fitting {
-            None => matches,
-            Some(previous) => previous
-                .into_iter()
-                .filter(|name| matches.contains(name))
-                .collect(),
-        });
+        chunks += 1;
 
         processed_bytes += response.count;
 
@@ -486,10 +477,8 @@ async fn validate_upload(serial: &str, sender: Sender, firmware: &[u8]) -> Resul
     }
 
     info!(
-        "Firmware validation: {} chunks, final hash {:08x}, computed the same way on every chunk: {:?}",
-        chunks,
-        hash_in,
-        fitting.unwrap_or_default()
+        "Firmware upload validated: {} chunks, hash {:08x} as computed here",
+        chunks, hash_in
     );
 
     Ok(())
@@ -569,6 +558,25 @@ async fn hardware_write(serial: &str, sender: Sender) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Removes a firmware this daemon downloaded, with its private folder (see private_download_dir).
+/// A file picked or uploaded by the user isn't one.
+pub fn remove_downloaded_firmware(path: &std::path::Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let downloaded = dir.parent() == Some(std::env::temp_dir().as_path())
+        && dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("goxlr-firmware-"));
+    if downloaded && let Err(e) = fs::remove_dir_all(dir) {
+        warn!(
+            "Unable to remove the downloaded firmware {}: {}",
+            dir.display(),
+            e
+        );
+    }
 }
 
 /// A new folder only this user can use, for the downloaded firmware: the shared temporary

@@ -7,7 +7,7 @@ use crate::files::{
 };
 use crate::firmware::firmware_update::{
     FirmwareMessages, FirmwareRequest, FirmwareUpdateDevice, FirmwareUpdateSettings,
-    do_firmware_update, start_firmware_update,
+    do_firmware_update, remove_downloaded_firmware, start_firmware_update,
 };
 use crate::platform::{get_ui_app_path, has_autostart, set_autostart};
 use crate::profile::{
@@ -946,6 +946,10 @@ pub async fn spawn_usb_handler(
                                     // We're at a point where this update can be stopped, nuke it from the firmware list..
                                     if let Some(state) = devices_firmware.remove(&serial) {
                                         remove_uploaded_firmware(&state.settings.file);
+                                        // A download waiting for confirmation, never flashed
+                                        if let UpdateState::Pause(info) = &state.status.state {
+                                            remove_downloaded_firmware(&info.path);
+                                        }
                                     }
                                     change_found = true;
 
