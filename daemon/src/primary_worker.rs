@@ -190,6 +190,9 @@ pub async fn spawn_usb_handler(
     // Samples being edited, so the same file isn't edited twice at once.
     let mut busy_samples: HashSet<String> = HashSet::new();
     let mut attaching = false;
+    // Input from a device still having its profiles applied (moving the motorised faders sends
+    // some): read once it's ready, rather than lost.
+    let mut early_input: HashSet<String> = HashSet::new();
 
     let mut files = get_files(&mut file_manager, &settings).await;
     let mut daemon_status = get_daemon_status(
@@ -350,12 +353,19 @@ pub async fn spawn_usb_handler(
             },
             Some((key, loaded)) = loaded_rx.recv() => {
                 attaching = false;
+                if loaded.is_err() {
+                    early_input.clear();
+                }
                 match loaded {
                     Ok(device) => {
                         let serial = String::from(device.serial());
 
                         mixers.insert(serial.clone(), device.status().await);
-                        devices.insert(serial.clone(), DeviceActor::spawn(device, update_tx.clone()));
+                        let actor = DeviceActor::spawn(device, update_tx.clone());
+                        if early_input.remove(&serial) {
+                            actor.input_event();
+                        }
+                        devices.insert(serial.clone(), actor);
                         ignore_list.remove(&key);
                         change_found = true;
 
@@ -420,6 +430,9 @@ pub async fn spawn_usb_handler(
             Some(serial) = event_receiver.recv() => {
                 if let Some(device) = devices.get(&serial) {
                     device.input_event();
+                } else if attaching {
+                    debug!("Input from {} while it's loading, read once it's ready", serial);
+                    early_input.insert(serial);
                 } else {
                     warn!("Cannot find registered device with serial: {}", serial);
                 }
