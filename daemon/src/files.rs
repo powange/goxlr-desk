@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 // use futures::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 
-use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
+use crate::sample_trash::{list_trash, restore_trash_item, trash_replaced_sample};
 use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
@@ -756,7 +756,14 @@ pub fn edit_sample_file(
     // Keep the original in the trash when replacing it, the edit can then be undone.
     let replacing = save_as.is_none();
     if replacing {
-        trash_sample_path(base, backups, relative, vec![])?;
+        // Noting where the edit goes, so restoring the original undoes it
+        let mut edited: Vec<&str> = relative
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .collect();
+        edited.pop();
+        edited.push(&new_name);
+        trash_replaced_sample(base, backups, relative, &edited.join("/"))?;
     }
 
     let written = atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)));
@@ -1185,6 +1192,45 @@ mod sample_edit_tests {
         assert!(import_sample_target(&base, "", "virus.exe").is_err());
         assert!(import_sample_target(&base, "Missing", "new.wav").is_err());
         assert!(import_sample_target(&base, "../..", "new.wav").is_err());
+    }
+}
+
+#[cfg(test)]
+mod edit_undo_tests {
+    use super::*;
+    use crate::sample_trash::list_trash;
+
+    #[test]
+    fn restoring_the_original_undoes_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(&base).unwrap();
+        let audio = DecodedAudio {
+            sample_rate: 8000,
+            channels: 1,
+            samples: (0..8000).map(|i| (i % 40) as f32 / 100.0).collect(),
+            bits_per_sample: Some(16),
+        };
+        atomic_write(base.join("intro.wav"), |file| {
+            audio.write_wav(BufWriter::new(file))
+        })
+        .unwrap();
+        let original = fs::read(base.join("intro.wav")).unwrap();
+
+        let edit = SampleEdit {
+            remove: vec![(0.0, 0.5)],
+            normalize: false,
+        };
+        edit_sample_file(&base, &backups, "intro.wav", &edit, None).unwrap();
+        assert_ne!(fs::read(base.join("intro.wav")).unwrap(), original);
+
+        // The original is in the trash; restoring it puts it back and trashes the edit
+        let id = list_trash(&backups)[0].id.clone();
+        let restored = restore_trash_item(&base, &backups, &id).unwrap();
+        assert_eq!(restored.path, "intro.wav");
+        assert!(restored.renamed.is_none());
+        assert_eq!(fs::read(base.join("intro.wav")).unwrap(), original);
+        assert_eq!(list_trash(&backups).len(), 1);
     }
 }
 

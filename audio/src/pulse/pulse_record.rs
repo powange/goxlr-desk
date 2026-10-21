@@ -5,7 +5,8 @@ use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
 
-const BUFFER_SIZE: usize = 1024;
+// 10 ms of 48 kHz stereo f32 per read, rather than ~2.7 ms (fewer allocations and lock rounds)
+const BUFFER_SIZE: usize = 3840;
 
 pub struct PulseRecord {
     pulse_simple: Simple,
@@ -35,9 +36,9 @@ impl OpenInputStream for PulseRecord {
             }
         };
 
-        // Super small buffer to prevent latency..
+        // Small, to keep latency low, but 20 ms so a scheduling delay doesn't overrun it
         let pulse_buffer_attributes = BufferAttr {
-            maxlength: 1024,
+            maxlength: pulse_spec.rate * pulse_spec.channels as u32 * 4 * 20 / 1000,
             tlength: u32::MAX,
             prebuf: 0,
             minreq: u32::MAX,
@@ -79,7 +80,7 @@ impl AudioInput for PulseRecord {
         // Convert the buffer into f32 samples..
         let mut samples = vec![];
         for chunk in self.buffer.chunks(4) {
-            samples.push(f32::from_le_bytes(<[u8; 4]>::try_from(chunk)?));
+            samples.push(f32::from_ne_bytes(<[u8; 4]>::try_from(chunk)?));
         }
 
         // Throw back the samples.

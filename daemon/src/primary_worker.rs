@@ -599,10 +599,16 @@ pub async fn spawn_usb_handler(
                             DaemonCommand::RestoreSampleTrash(id) => {
                                 let base = settings.get_samples_directory().await;
                                 let backups = settings.get_backup_directory().await;
+                                let profiles = settings.get_profile_directory().await;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
-                                    let (path, tracks) = restore_trash_item(&base, &backups, &id)?;
-                                    info!("Restored sample path {} from the trash", path);
-                                    Ok(SampleJobOutput { tracks, ..Default::default() })
+                                    let restored = restore_trash_item(&base, &backups, &id)?;
+                                    info!("Restored sample path {} from the trash", restored.path);
+                                    // Undoing an edit that renamed the sample: profiles go back to it
+                                    let renamed = restored.renamed.map(|(old_name, new_name)| RenamedSample { old_name, new_name });
+                                    if let Some(renamed) = &renamed {
+                                        rename_in_saved_profiles(&profiles, renamed);
+                                    }
+                                    Ok(SampleJobOutput { renamed, tracks: restored.tracks, ..Default::default() })
                                 });
                             }
                             DaemonCommand::RestoreProfileTrash(id) => {
@@ -669,7 +675,13 @@ pub async fn spawn_usb_handler(
                                             rename_in_saved_profiles(&profiles, renamed);
                                         }
                                         info!("Edited sample {} ({} part(s) removed, normalized: {})", path, edit.remove.len(), edit.normalize);
-                                        Ok(SampleJobOutput { renamed, ..Default::default() })
+                                        // A copy saved under a new name keeps the original's gain
+                                        let copied_gain = save_as.as_deref().map(|name| {
+                                            let name = name.trim();
+                                            let new_name = if name.to_ascii_lowercase().ends_with(".wav") { name.to_string() } else { format!("{name}.wav") };
+                                            (path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string(), new_name)
+                                        });
+                                        Ok(SampleJobOutput { renamed, copied_gain, ..Default::default() })
                                     });
                                 }
                             }
@@ -870,6 +882,11 @@ pub async fn spawn_usb_handler(
                             settings.rename_sample_gain(&renamed.old_name, &renamed.new_name).await;
                             settings.save().await;
                         }
+                        if let Some((original, copy)) = &output.copied_gain {
+                            let gain = settings.get_sample_gain_percent(original.clone()).await;
+                            settings.set_sample_gain_percent(copy.clone(), gain).await;
+                            settings.save().await;
+                        }
                         for device in devices.values_mut() {
                             if let Err(e) = device.restore_trashed_tracks(&output.tracks).await {
                                 warn!("Unable to put the restored sample back on the sampler: {}", e);
@@ -1053,6 +1070,8 @@ struct SampleJobOutput {
     renamed: Option<RenamedSample>,
     // Sampler tracks to put back (a sample restored from the trash)
     tracks: Vec<TrashedTrack>,
+    // A copy saved by the editor: (original name, copy name), the copy gets the same gain
+    copied_gain: Option<(String, String)>,
 }
 
 struct SampleJobDone {

@@ -33,6 +33,19 @@ struct TrashEntry {
     // The sampler tracks that played it in the loaded profiles, put back on restore
     #[serde(default)]
     tracks: Vec<TrashedTrack>,
+    // For an original replaced by an edit: where the edited version went (it may have a new
+    // name, an MP3 becomes a WAV). Restoring the original undoes the edit.
+    #[serde(default)]
+    replaced_by: Option<String>,
+}
+
+/// What a restore put back.
+#[derive(Debug)]
+pub struct RestoredSample {
+    pub path: String,
+    pub tracks: Vec<TrashedTrack>,
+    // Undoing an edit that renamed the sample: (edited name, original name), for the profiles
+    pub renamed: Option<(String, String)>,
 }
 
 /// A sampler track removed from a loaded profile because its file went to the trash.
@@ -112,6 +125,27 @@ pub fn trash_sample_path(
     relative: &str,
     tracks: Vec<TrashedTrack>,
 ) -> Result<()> {
+    trash_entry(samples, backups, relative, tracks, None)
+}
+
+/// Moves an original that an edit is about to replace, noting where the edited version goes.
+pub fn trash_replaced_sample(
+    samples: &Path,
+    backups: &Path,
+    relative: &str,
+    replaced_by: &str,
+) -> Result<()> {
+    let replaced_by = replaced_by.replace('\\', "/").trim_matches('/').to_string();
+    trash_entry(samples, backups, relative, vec![], Some(replaced_by))
+}
+
+fn trash_entry(
+    samples: &Path,
+    backups: &Path,
+    relative: &str,
+    tracks: Vec<TrashedTrack>,
+    replaced_by: Option<String>,
+) -> Result<()> {
     if is_recorded_folder(relative) {
         bail!(
             "The {} folder is where recordings go, it can't be deleted",
@@ -140,6 +174,7 @@ pub fn trash_sample_path(
         path: relative.replace('\\', "/").trim_matches('/').to_string(),
         deleted_at,
         tracks,
+        replaced_by,
     };
     fs::write(entry.join(ENTRY_FILE), serde_json::to_vec_pretty(&record)?)?;
 
@@ -210,15 +245,27 @@ fn entry_path(backups: &Path, id: &str) -> Result<PathBuf> {
 
 /// Puts a trashed item back where it was (its parent folders are recreated if needed), and
 /// returns its path with the sampler tracks to put back.
-pub fn restore_trash_item(
-    samples: &Path,
-    backups: &Path,
-    id: &str,
-) -> Result<(String, Vec<TrashedTrack>)> {
+pub fn restore_trash_item(samples: &Path, backups: &Path, id: &str) -> Result<RestoredSample> {
     let entry = entry_path(backups, id)?;
     let Some((record, item)) = read_entry(&entry) else {
         bail!("This trash item is damaged");
     };
+
+    // Restoring an original that an edit replaced undoes the edit: the edited version goes to
+    // the trash (so it can be brought back too), and profiles follow if its name was different.
+    let mut renamed = None;
+    if let Some(edited) = &record.replaced_by
+        && let Ok(edited_path) = sample_path(samples, edited)
+        && edited_path.is_file()
+    {
+        trash_sample_path(samples, backups, edited, vec![])
+            .context("Unable to move the edited version to the trash")?;
+        let name_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let (edited_name, original_name) = (name_of(edited), name_of(&record.path));
+        if edited_name != original_name {
+            renamed = Some((edited_name, original_name));
+        }
+    }
 
     let target = sample_path(samples, &record.path)?;
     if target.exists() {
@@ -251,7 +298,11 @@ pub fn restore_trash_item(
     }
     move_path(&item, &target).context(format!("Unable to restore {}", record.path))?;
     let _ = fs::remove_dir_all(&entry);
-    Ok((record.path, record.tracks))
+    Ok(RestoredSample {
+        path: record.path,
+        tracks: record.tracks,
+        renamed,
+    })
 }
 
 /// Deletes an item from the trash for good, or everything when `id` is None.
@@ -315,7 +366,9 @@ mod tests {
         assert!(restore_trash_item(&samples, &backups, &file.id).is_err());
         fs::remove_file(samples.join("intro.wav")).unwrap();
         assert_eq!(
-            restore_trash_item(&samples, &backups, &file.id).unwrap().0,
+            restore_trash_item(&samples, &backups, &file.id)
+                .unwrap()
+                .path,
             "intro.wav"
         );
         assert_eq!(fs::read(samples.join("intro.wav")).unwrap(), b"intro");
@@ -342,7 +395,7 @@ mod tests {
             .find(|item| !item.folder)
             .unwrap()
             .id;
-        let (_, tracks) = restore_trash_item(&samples, &backups, &id).unwrap();
+        let tracks = restore_trash_item(&samples, &backups, &id).unwrap().tracks;
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             (tracks[0].bank, tracks[0].index, tracks[0].start),

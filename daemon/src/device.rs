@@ -1643,9 +1643,13 @@ impl<'a> Device<'a> {
         sample_path = sample_path.join(file_name);
 
         if let Some(audio_handler) = &mut self.audio_handler {
-            let result = audio_handler.record_for_button(sample_path, sample_bank, button);
-            if result.is_ok() {
-                self.profile.set_sample_button_blink(button, true);
+            match audio_handler.record_for_button(sample_path, sample_bank, button) {
+                Ok(_) => self.profile.set_sample_button_blink(button, true),
+                // Shown to the user like the other sampler errors
+                Err(e) => {
+                    warn!("Unable to start recording on {:?}: {}", button, e);
+                    self.last_sample_error = Some(format!("Unable to start recording: {e}"));
+                }
             }
         }
 

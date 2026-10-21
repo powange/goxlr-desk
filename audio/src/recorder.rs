@@ -135,12 +135,16 @@ impl BufferedRecorder {
                 // Read the latest samples from the input...
                 match input.as_mut().unwrap().read() {
                     Ok(samples) => {
+                        // The pre-record buffer and the recordings are fed under the same lock a
+                        // new recording takes to copy the buffer and join: no block is missed or
+                        // written twice in between.
+                        let producers = self.producers.lock().unwrap();
                         if self.buffer_size > 0
                             && let Err(e) = self.buffer.write_into(&samples)
                         {
                             warn!("Error writing samples to buffer: {}", e);
                         }
-                        for producer in self.producers.lock().unwrap().iter() {
+                        for producer in producers.iter() {
                             let result = producer.producer.write(&samples);
                             if let Err(e) = result {
                                 match e {
@@ -165,6 +169,9 @@ impl BufferedRecorder {
 
                         // Clear the Buffer
                         self.buffer.clear();
+
+                        // Back to looking for the device; nothing below applies without one.
+                        continue;
                     }
                 }
             }
@@ -199,8 +206,9 @@ impl BufferedRecorder {
                 }
 
                 // If we get here, nothing has stopped us, tear down the audio handler, and sleep..
-                input.unwrap().flush();
-                input = None;
+                if let Some(mut stale) = input.take() {
+                    stale.flush();
+                }
                 self.is_ready.store(false, Ordering::Relaxed);
                 self.buffer.clear();
             }
@@ -246,18 +254,21 @@ impl BufferedRecorder {
 
         let producer_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-        // Add the producer to our handler, the guard removes it however this function returns.
-        self.add_producer(RingProducer {
-            id: producer_id,
-            producer: ring_buf_producer,
-        });
+        // Copy the pre-record buffer and join the live audio in one step (see listen), the guard
+        // removes the producer however this function returns.
+        let pre_samples = {
+            let mut producers = self.producers.lock().unwrap();
+            let pre_samples = self.get_samples_from_buffer();
+            producers.push(RingProducer {
+                id: producer_id,
+                producer: ring_buf_producer,
+            });
+            pre_samples
+        };
         let _producer = ProducerGuard {
             recorder: self,
             id: producer_id,
         };
-
-        // Grab the contents of the buffer, and push it into a simple vec
-        let pre_samples = self.get_samples_from_buffer();
 
         // Get the read buffer to pull a quarter of a second at a time..
         let mut read_buffer: [f32; 24000] = [0.0; 24000];
@@ -325,6 +336,26 @@ impl BufferedRecorder {
             }
             if state.stop.load(Ordering::Relaxed) {
                 break;
+            }
+        }
+
+        // Write what was still waiting in the ring buffer when the button was released
+        while let Ok(samples) = ring_buf_consumer.read(&mut read_buffer)
+            && samples > 0
+        {
+            let samples: Vec<f32> = Vec::from(&read_buffer[0..samples]);
+            match self.handle_samples(
+                samples,
+                &mut ebu_prep_r128,
+                &mut ebu_rec_r128,
+                writing,
+                &mut writer,
+            ) {
+                Ok(result) => writing = result,
+                Err(error) => {
+                    error!("Error Writing Samples: {}", error);
+                    break;
+                }
             }
         }
 
