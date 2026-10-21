@@ -36,6 +36,23 @@ pub trait AttachGoXLR {
     fn set_is_polling(&mut self, polling: bool);
 }
 
+/// The largest request body the GoXLR takes.
+pub const MAX_REQUEST_BODY: usize = 1024;
+
+/// Builds a request for either backend: the 16 byte header (command, body length, command
+/// index) then the body. The length is never truncated: a body that doesn't fit is an error.
+pub fn encode_request(command: Command, index: u16, body: &[u8]) -> Result<Vec<u8>> {
+    if body.len() > MAX_REQUEST_BODY {
+        bail!("Request body too large ({} bytes)", body.len());
+    }
+    let mut request = vec![0; 16];
+    LittleEndian::write_u32(&mut request[0..4], command.command_id());
+    LittleEndian::write_u16(&mut request[4..6], body.len() as u16);
+    LittleEndian::write_u16(&mut request[6..8], index);
+    request.extend(body);
+    Ok(request)
+}
+
 pub trait ExecutableGoXLR {
     fn request_data(&mut self, command: Command, body: &[u8]) -> Result<Vec<u8>> {
         self.perform_request(command, body, false)
@@ -309,7 +326,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         waterfall: WaterFallDir,
     ) -> Result<()> {
         if modifier1 > 100 || modifier2 > 100 {
-            bail!("Modifiers should be < 100");
+            bail!("Modifiers should be between 0 and 100");
         }
 
         // Build the command..
@@ -320,7 +337,7 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         command[3] = modifier2;
         command[4] = waterfall as u8;
 
-        let _ = self.request_data(Command::SetAnimationMode, &command);
+        self.request_data(Command::SetAnimationMode, &command)?;
         Ok(())
     }
 
@@ -468,11 +485,11 @@ pub trait GoXLRCommands: ExecutableGoXLR {
         */
 
         bail!(
-            "Unexpected Packet: {} {} {} {}",
+            "Unexpected Packet: op {} stage {} state {} error {}",
             op,
             stage,
             state,
-            read_done
+            error_code
         );
     }
 
@@ -609,5 +626,26 @@ impl UsbData {
     }
     pub fn product_name(&self) -> String {
         self.product_name.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requests_are_encoded_and_never_truncated() {
+        let request = encode_request(Command::ResetCommandIndex, 7, &[1, 2, 3]).unwrap();
+        assert_eq!(request.len(), 19);
+        assert_eq!(
+            LittleEndian::read_u32(&request[0..4]),
+            Command::ResetCommandIndex.command_id()
+        );
+        assert_eq!(LittleEndian::read_u16(&request[4..6]), 3);
+        assert_eq!(LittleEndian::read_u16(&request[6..8]), 7);
+        assert_eq!(&request[16..], &[1, 2, 3]);
+
+        assert!(encode_request(Command::ResetCommandIndex, 0, &[0; MAX_REQUEST_BODY]).is_ok());
+        assert!(encode_request(Command::ResetCommandIndex, 0, &[0; MAX_REQUEST_BODY + 1]).is_err());
     }
 }

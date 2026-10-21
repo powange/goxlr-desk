@@ -1172,7 +1172,10 @@ impl<'a> Device<'a> {
                 || (channel == ChannelName::Mic && !self.mic_muted_by_cough())
             {
                 self.goxlr.set_channel_state(channel, Unmuted)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::MicInputMute]))?;
+                // The mic input mute only concerns the microphone
+                if channel == ChannelName::Mic {
+                    self.apply_effects(LinkedHashSet::from_iter([EffectKey::MicInputMute]))?;
+                }
             }
 
             // As with mute, the mini doesn't modify volumes on mute / unmute
@@ -1863,11 +1866,6 @@ impl<'a> Device<'a> {
                 value_changed = true;
                 self.encoder_states[encoder] = encoders[encoder as usize];
             }
-        }
-
-        if self.encoder_states[EncoderName::Pitch] != encoders[0] {
-            value_changed = true;
-            self.encoder_states[EncoderName::Pitch] = encoders[0];
         }
 
         if self.profile.calculate_pitch_knob_position(encoders[0])

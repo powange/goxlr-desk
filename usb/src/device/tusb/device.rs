@@ -1,10 +1,11 @@
 use crate::commands::Command;
 use crate::device::base::{
     AttachGoXLR, ExecutableGoXLR, FullGoXLRDevice, GoXLRCommands, GoXLRDevice, UsbData,
+    encode_request,
 };
 use crate::device::tusb::tusbaudio::{
     DeviceHandle, EventChannelReceiver, EventChannelSender, TUSB_INTERFACE, get_devices,
-    get_version,
+    get_version, is_invalid_handle,
 };
 use anyhow::{Result, bail};
 use byteorder::{ByteOrder, LittleEndian};
@@ -257,15 +258,11 @@ impl ExecutableGoXLR for TUSBAudioGoXLR {
         }
 
         let command_index = self.command_count;
-        let mut full_request = vec![0; 16];
-        LittleEndian::write_u32(&mut full_request[0..4], command.command_id());
-        LittleEndian::write_u16(&mut full_request[4..6], body.len() as u16);
-        LittleEndian::write_u16(&mut full_request[6..8], command_index);
-        full_request.extend(body);
+        let full_request = encode_request(command, command_index, body)?;
 
         self.discard_stale_data();
         if let Err(error) = self.write_control(2, 0, 0, &full_request) {
-            if error.to_string() == "TSTATUS_INVALID_HANDLE" {
+            if is_invalid_handle(&error) {
                 if self.is_connected() {
                     // Try again..
                     if let Err(error) = self.write_control(2, 0, 0, &full_request) {
@@ -294,7 +291,7 @@ impl ExecutableGoXLR for TUSBAudioGoXLR {
 
         let mut response_value = self.read_control(3, 0, 0, 1040);
         if let Err(error) = response_value {
-            if error.to_string() == "TSTATUS_INVALID_HANDLE" {
+            if is_invalid_handle(&error) {
                 if self.is_connected() {
                     response_value = self.read_control(3, 0, 0, 1040);
                     if let Err(error) = response_value {
@@ -369,7 +366,7 @@ impl ExecutableGoXLR for TUSBAudioGoXLR {
         Ok(UsbData {
             vendor_id: properties.vendor_id() as u16,
             product_id: properties.product_id() as u16,
-            device_version: (2, 0, 0),
+            device_version: properties.revision(),
             device_manufacturer: properties.manufacturer()?,
             product_name: properties.model()?,
         })

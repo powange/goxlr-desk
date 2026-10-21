@@ -1,6 +1,7 @@
 use crate::commands::Command;
 use crate::device::base::{
     AttachGoXLR, ExecutableGoXLR, FullGoXLRDevice, GoXLRCommands, GoXLRDevice, UsbData,
+    encode_request,
 };
 use crate::{PID_GOXLR_FULL, PID_GOXLR_MINI, VID_GOXLR};
 use anyhow::{Error, Result, anyhow, bail};
@@ -39,6 +40,13 @@ pub struct GoXLRUSB {
     timeout: Duration,
 }
 
+// The polling task stops with the device
+impl Drop for GoXLRUSB {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+    }
+}
+
 impl GoXLRUSB {
     fn find_device(device: GoXLRDevice) -> Result<(Device<GlobalContext>, DeviceDescriptor)> {
         if let Ok(devices) = rusb::devices() {
@@ -54,7 +62,15 @@ impl GoXLRUSB {
         bail!("Specified Device not Found!")
     }
 
-    fn trigger_disconnect(&mut self) -> Result<()> {
+    /// Tells the daemon the device is gone (when it is). Problems here are only logged: the
+    /// caller returns the USB error that led here, which is the one that matters.
+    fn trigger_disconnect(&mut self) {
+        if let Err(e) = self.try_disconnect() {
+            warn!("Unable to report the device's disconnection: {}", e);
+        }
+    }
+
+    fn try_disconnect(&mut self) -> Result<()> {
         // If this function has already been called further up the stack, don't run it.
         if self.disconnecting {
             return Ok(());
@@ -71,10 +87,16 @@ impl GoXLRUSB {
         }
 
         if let Some(identifier) = &self.identifier {
+            // Polling only stops once the daemon has been told, otherwise the device would be
+            // left half gone (no polling, still listed).
+            if let Err(e) = self.disconnect_sender.try_send(identifier.clone()) {
+                self.disconnecting = false;
+                bail!("{}", e);
+            }
             self.stopping.store(true, Ordering::Relaxed);
-            self.disconnect_sender.try_send(identifier.clone())?;
             return Ok(());
         }
+        self.disconnecting = false;
         bail!("Unable to Disconnect, Identifier not Found!");
     }
 
@@ -206,11 +228,22 @@ impl AttachGoXLR for GoXLRUSB {
             // Reset the device, so ALSA can pick it up again..
             goxlr.handle.reset()?;
 
-            // Now release the interface, so ALSA doesn't catch it mid reset..
-            goxlr.handle.release_interface(0)?;
+            // The reset can make the device enumerate again: this handle is then gone
+            // (NotFound). That's expected, the device is found again on the next detection.
+            match goxlr.handle.release_interface(0) {
+                Err(rusb::Error::NotFound) | Err(rusb::Error::NoDevice) => {
+                    bail!("The GoXLR is re-enumerating after its initialisation, retrying shortly");
+                }
+                result => result?,
+            }
 
             // Reattempt the reset..
-            goxlr.write_control(1, 0, 0, &[])?;
+            match goxlr.write_control(1, 0, 0, &[]) {
+                Err(rusb::Error::NotFound) | Err(rusb::Error::NoDevice) => {
+                    bail!("The GoXLR is re-enumerating after its initialisation, retrying shortly");
+                }
+                result => result?,
+            }
 
             warn!(
                 "Initialisation complete. If you are using the JACK script, you may need to reboot for audio to work."
@@ -226,8 +259,13 @@ impl AttachGoXLR for GoXLRUSB {
     }
 
     fn set_unique_identifier(&mut self, identifier: String) {
+        // One polling task per device
+        let first = self.identifier.is_none();
         let event_id = identifier.clone();
         self.identifier = Some(identifier);
+        if !first {
+            return;
+        }
 
         let sender = self.event_sender.clone();
         let stopping = self.stopping.clone();
@@ -248,14 +286,11 @@ impl AttachGoXLR for GoXLRUSB {
 
                 let event = event_id.clone();
 
-                // Only send an event if we have the capacity to do so..
-                if sender.capacity() > 0 {
-                    if !sender.is_closed() {
-                        sender.send(event).await.expect("Error Sending Event");
-                    } else {
-                        warn!("Sender Closed for {}", event);
-                        break;
-                    }
+                // Only send an event if we have the capacity to do so; the daemon closing its end
+                // (shutting down) ends this task.
+                if sender.capacity() > 0 && sender.send(event).await.is_err() {
+                    warn!("Sender Closed for {}", event_id);
+                    break;
                 }
 
                 tokio::time::sleep(Duration::from_millis(poll_millis)).await;
@@ -303,16 +338,18 @@ impl ExecutableGoXLR for GoXLRUSB {
         }
 
         let command_index = self.command_count;
-        let mut full_request = vec![0; 16];
-        LittleEndian::write_u32(&mut full_request[0..4], command.command_id());
-        LittleEndian::write_u16(&mut full_request[4..6], body.len() as u16);
-        LittleEndian::write_u16(&mut full_request[6..8], command_index);
-        full_request.extend(body);
+        let full_request = match encode_request(command, command_index, body) {
+            Ok(request) => request,
+            Err(e) => {
+                self.pause_polling.store(false, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
 
         if let Err(error) = self.write_control(2, 0, 0, &full_request) {
             debug!("Error when attempting to write control.");
             self.pause_polling.store(false, Ordering::Relaxed);
-            self.trigger_disconnect()?;
+            self.trigger_disconnect();
             bail!(error);
         }
 
@@ -346,9 +383,10 @@ impl ExecutableGoXLR for GoXLRUSB {
                 if i < count - 1 {
                     if !ignore_warn {
                         debug!(
-                            "Response not arrived yet for {:?}, sleeping and retrying (Attempt {} of 20)",
+                            "Response not arrived yet for {:?}, sleeping and retrying (Attempt {} of {})",
                             command,
-                            i + 1
+                            i + 1,
+                            count
                         );
                     }
                     sleep(sleep_time);
@@ -356,8 +394,11 @@ impl ExecutableGoXLR for GoXLRUSB {
                 } else {
                     // We can't read from this GoXLR, flag as disconnected.
                     self.pause_polling.store(false, Ordering::Relaxed);
-                    self.trigger_disconnect()?;
-                    warn!("Failed to receive response (Attempt 20 of 20), possible Dead GoXLR?");
+                    self.trigger_disconnect();
+                    warn!(
+                        "Failed to receive response (Attempt {} of {}), possible Dead GoXLR?",
+                        count, count
+                    );
                     return Err(Error::from(response_value.err().unwrap()));
                 }
             }
@@ -366,7 +407,7 @@ impl ExecutableGoXLR for GoXLRUSB {
                 debug!("Error Occurred during packet read: {}", err);
 
                 self.pause_polling.store(false, Ordering::Relaxed);
-                self.trigger_disconnect()?;
+                self.trigger_disconnect();
                 return Err(Error::from(err));
             }
 
@@ -377,7 +418,7 @@ impl ExecutableGoXLR for GoXLRUSB {
                     response_header.len()
                 );
                 self.pause_polling.store(false, Ordering::Relaxed);
-                self.trigger_disconnect()?;
+                self.trigger_disconnect();
                 return Err(Error::from(Pipe));
             }
 
@@ -412,7 +453,7 @@ impl ExecutableGoXLR for GoXLRUSB {
                 } else {
                     debug!("Resync Failed, Throwing Error..");
                     self.pause_polling.store(false, Ordering::Relaxed);
-                    self.trigger_disconnect()?;
+                    self.trigger_disconnect();
                     Err(Error::from(rusb::Error::Other))
                 };
             }
@@ -436,8 +477,9 @@ impl ExecutableGoXLR for GoXLRUSB {
     }
 
     fn get_descriptor(&self) -> Result<UsbData> {
-        let version = self.descriptor.usb_version();
-        let usb_version = (version.0, version.1, version.2);
+        // The device's own release number (bcdDevice), not the USB specification it follows
+        let version = self.descriptor.device_version();
+        let device_version = (version.0, version.1, version.2);
 
         let device_manufacturer = self.handle.read_manufacturer_string(
             self.language,
@@ -454,7 +496,7 @@ impl ExecutableGoXLR for GoXLRUSB {
         Ok(UsbData {
             vendor_id: self.descriptor.vendor_id(),
             product_id: self.descriptor.product_id(),
-            device_version: usb_version,
+            device_version,
             device_manufacturer,
             product_name,
         })

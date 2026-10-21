@@ -51,6 +51,38 @@ type ReadDeviceNotification = unsafe extern "C" fn(u32, *const u32, *mut u8, u32
 type StatusCodeString = unsafe extern "C" fn(u32) -> *const i8;
 type CloseDevice = unsafe extern "C" fn(u32) -> u32;
 
+/// An error code from the TUSB driver, with its text. Errors are recognised by their code: the
+/// text depends on the driver's version.
+#[derive(Debug)]
+pub struct TStatus {
+    pub code: u32,
+    text: String,
+}
+
+/// The device handle isn't valid any more (TSTATUS_INVALID_HANDLE)
+pub const TSTATUS_INVALID_HANDLE: u32 = 0xEE00_0048;
+
+impl TStatus {
+    fn new(code: u32, text: String) -> Self {
+        Self { code, text }
+    }
+}
+
+impl std::fmt::Display for TStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:#x})", self.text, self.code)
+    }
+}
+
+impl std::error::Error for TStatus {}
+
+/// Whether an error is the driver saying the handle is no longer valid.
+pub fn is_invalid_handle(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<TStatus>()
+        .is_some_and(|status| status.code == TSTATUS_INVALID_HANDLE)
+}
+
 static GOXLR_GUID: GUID = GUID::from_u128(0x024D0372_641F_4B7B_8140_F4DFE458C982);
 lazy_static! {
     // Initialise the Library..
@@ -354,7 +386,7 @@ impl TUSBAudio<'_> {
             // 3992977480 - INVALID HANDLE!
 
             //3992977411
-            bail!("{}", self.get_error(result));
+            return Err(TStatus::new(result, self.get_error(result)).into());
         }
 
         Ok(())
@@ -397,7 +429,7 @@ impl TUSBAudio<'_> {
         };
 
         if result != 0 {
-            bail!("{}", self.get_error(result));
+            return Err(TStatus::new(result, self.get_error(result)).into());
         }
 
         // Ok, Buffer2 contains a u32 containing the length of the returned response..
@@ -414,15 +446,34 @@ impl TUSBAudio<'_> {
         Ok(buffer)
     }
 
+    /// Opens a device by its identifier. The driver opens by position, and the list can change
+    /// in between (another GoXLR plugged, unplugged): the opened device's identifier is checked,
+    /// and on a mismatch the list is read again once.
     pub fn open_device_by_identifier(&self, identifier: String) -> Result<u32> {
-        let device_index = self
-            .discovered_devices
-            .lock()
-            .unwrap()
-            .iter()
-            .position(|id| identifier == id.clone())
-            .ok_or_else(|| anyhow!("Cannot Find Device"))?;
-        self.open_device_by_index(device_index.try_into()?)
+        for attempt in 0..2 {
+            if attempt > 0 {
+                self.detect_devices()?;
+            }
+            let device_index = self
+                .discovered_devices
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|id| identifier == *id)
+                .ok_or_else(|| anyhow!("Cannot Find Device"))?;
+            let handle = self.open_device_by_index(device_index.try_into()?)?;
+            match self.get_device_id_string(handle) {
+                Ok(opened) if opened == identifier => return Ok(handle),
+                _ => {
+                    warn!("Opened another device than {}, looking again", identifier);
+                    let _ = self.close_device(handle);
+                }
+            }
+        }
+        bail!(
+            "Unable to open {}, the device list keeps changing",
+            identifier
+        )
     }
 
     fn open_device_by_index(&self, device_index: u32) -> Result<u32> {
@@ -926,6 +977,16 @@ pub struct Properties {
 }
 
 impl Properties {
+    /// The device's release number (bcdDevice), as major, minor, sub minor.
+    pub fn revision(&self) -> (u8, u8, u8) {
+        let bcd = self.revision_number as u16;
+        (
+            (bcd >> 8) as u8,
+            ((bcd >> 4) & 0x0f) as u8,
+            (bcd & 0x0f) as u8,
+        )
+    }
+
     pub fn vendor_id(&self) -> i32 {
         self.vendor_id
     }
