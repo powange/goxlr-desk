@@ -189,11 +189,17 @@ pub async fn spawn_usb_handler(
     )
     .await;
 
+    // The status as last sent, kept as JSON so a change is diffed without serialising it again
+    let mut status_json = serde_json::to_value(&daemon_status).unwrap_or_default();
+
     let mut shutdown_triggered = false;
     let _ = ready_tx.send(());
 
     loop {
+        // Something changed anywhere (the whole status is rebuilt), or only one device's
+        // inputs moved (only its part is: that's most changes, while faders move)
         let mut change_found = false;
+        let mut device_changed: Option<String> = None;
         tokio::select! {
             Some(version) = firmware_receiver.recv() => {
                 firmware_version = Some(version);
@@ -390,8 +396,8 @@ pub async fn spawn_usb_handler(
             Some(serial) = event_receiver.recv() => {
                 if let Some(device) = devices.get_mut(&serial) {
                     let result = device.monitor_inputs().await;
-                    if let Ok(changed) = result {
-                        change_found = changed;
+                    if let Ok(true) = result {
+                        device_changed = Some(serial.clone());
                     }
 
                     if let Err(error) = result {
@@ -939,22 +945,46 @@ pub async fn spawn_usb_handler(
                 &app_check,
             )
             .await;
-
-            // Convert them to JSON..
-            let json_old = serde_json::to_value(&daemon_status).unwrap();
-            let json_new = serde_json::to_value(&new_status).unwrap();
-
-            let patch = diff(&json_old, &json_new);
-
-            // Only send a patch if something has changed..
-            if !patch.0.is_empty() {
-                let _ = broadcast_tx.send(PatchEvent { data: patch });
-            }
-
-            // Send the patch to the tokio broadcaster, for handling by clients..
-            daemon_status = new_status;
+            publish_status(
+                new_status,
+                &mut daemon_status,
+                &mut status_json,
+                &broadcast_tx,
+            );
+        } else if let Some(serial) = device_changed
+            && let Some(device) = devices.get(&serial)
+        {
+            let mut new_status = daemon_status.clone();
+            new_status.mixers.insert(serial, device.status().await);
+            crate::tray::update_tray_state(&new_status);
+            publish_status(
+                new_status,
+                &mut daemon_status,
+                &mut status_json,
+                &broadcast_tx,
+            );
         }
     }
+}
+
+/// Sends what changed between the status as last sent and the new one (nothing when they're the
+/// same), then keeps the new one.
+fn publish_status(
+    new_status: DaemonStatus,
+    daemon_status: &mut DaemonStatus,
+    status_json: &mut serde_json::Value,
+    broadcast_tx: &tokio::sync::broadcast::Sender<PatchEvent>,
+) {
+    let Ok(json_new) = serde_json::to_value(&new_status) else {
+        warn!("Unable to serialise the status");
+        return;
+    };
+    let patch = diff(status_json, &json_new);
+    if !patch.0.is_empty() {
+        let _ = broadcast_tx.send(PatchEvent { data: patch });
+    }
+    *status_json = json_new;
+    *daemon_status = new_status;
 }
 
 // Whether autostart is set looks at the disk (shortcut, task, desktop file): it's checked at

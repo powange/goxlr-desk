@@ -109,6 +109,11 @@ impl BufferedRecorder {
 
         let mut now = Instant::now();
 
+        // The input is reopened once after a silent minute (a stale stream recovers), not again
+        // until audio is heard: closing it for longer would leave the pre-record buffer empty
+        // when someone starts talking, which is what it's there to catch.
+        let mut refreshed_while_silent = false;
+
         while !self.stop.load(Ordering::Relaxed) {
             if input.is_none() {
                 // Try and locate the matching input device name..
@@ -199,13 +204,20 @@ impl BufferedRecorder {
 
                     // Push out and let it continue..
                     if received_audio {
+                        refreshed_while_silent = false;
                         continue;
                     }
                 } else {
                     continue;
                 }
 
-                // If we get here, nothing has stopped us, tear down the audio handler, and sleep..
+                if refreshed_while_silent {
+                    continue;
+                }
+                refreshed_while_silent = true;
+
+                // A silent minute: reopen the input (picked up again on the next pass)
+                debug!("No audio for a minute, reopening the input");
                 if let Some(mut stale) = input.take() {
                     stale.flush();
                 }

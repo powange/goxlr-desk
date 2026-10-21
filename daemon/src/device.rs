@@ -1983,957 +1983,131 @@ impl<'a> Device<'a> {
             | GoXLRCommand::SetHardTuneStyle(_)
             | GoXLRCommand::SetHardTuneAmount(_)
             | GoXLRCommand::SetHardTuneRate(_)
-            | GoXLRCommand::SetHardTuneWindow(_)) => {
-                self.perform_effect_command(command)?;
-            }
-
-            GoXLRCommand::SetShutdownCommands(commands) => {
-                self.settings
-                    .set_device_shutdown_commands(self.serial(), commands)
-                    .await;
-                self.settings.save().await;
-            }
-            GoXLRCommand::SaveScene(name, commands) => {
-                let name = name.trim().to_string();
-                if name.is_empty() || name.chars().count() > 64 {
-                    bail!("A scene needs a name of 1 to 64 characters");
-                }
-                if let Some(command) = commands.iter().find(|c| !scene_command_allowed(c)) {
-                    bail!("A scene can't contain {:?}", command);
-                }
-                self.settings
-                    .set_device_scene(self.serial(), &name, Some(commands))
-                    .await;
-                self.settings.save().await;
-            }
-            GoXLRCommand::RunScene(name) => {
-                let scenes = self.settings.get_device_scenes(self.serial()).await;
-                let Some(commands) = scenes.get(&name) else {
-                    bail!("There is no scene named {}", name);
-                };
-                for command in commands.clone() {
-                    // Stored scenes were checked when saved, but the settings file can be edited.
-                    if !scene_command_allowed(&command) {
-                        warn!("Skipping {:?} in scene {}", command, name);
-                        continue;
-                    }
-                    if let Err(e) = Box::pin(self.perform_command(command)).await {
-                        warn!("Scene {}: {}", name, e);
-                    }
-                }
-            }
-            GoXLRCommand::DeleteScene(name) => {
-                self.settings
-                    .set_device_scene(self.serial(), &name, None)
-                    .await;
-                self.settings.save().await;
-            }
-            GoXLRCommand::SetSleepCommands(commands) => {
-                self.settings
-                    .set_device_sleep_commands(self.serial(), commands)
-                    .await;
-                self.settings.save().await;
-            }
-            GoXLRCommand::SetWakeCommands(commands) => {
-                self.settings
-                    .set_device_wake_commands(self.serial(), commands)
-                    .await;
-                self.settings.save().await;
-            }
-            GoXLRCommand::SetSamplerPreBufferDuration(duration) => {
-                if duration > 30000 {
-                    bail!("Buffer must be below 30seconds");
-                }
-
-                self.settings
-                    .set_device_sampler_pre_buffer(self.serial(), duration)
-                    .await;
-                self.settings.save().await;
-
-                // Reload the Audio Handler...
-                self.stop_all_samples(false, true).await?;
-
-                // Drop the Audio Handler..
-                if let Some(handler) = &mut self.audio_handler {
-                    handler.update_record_buffer(duration)?;
-                }
-            }
-
-            GoXLRCommand::SetFader(fader, channel) => {
-                self.set_fader(fader, channel).await?;
-            }
-            GoXLRCommand::SetFaderMuteFunction(fader, behaviour) => {
-                if self.profile.get_mute_button_behaviour(fader) == behaviour {
-                    // Settings are the same..
-                    return Ok(());
-                }
-
-                // A mute to X that becomes a mute for everyone takes the channel to 0: keep its
-                // current level as the one to restore on unmute (an older one would be restored).
-                let was_hard_muted = self.profile.is_fader_hard_muted(fader);
-                self.profile.set_mute_button_behaviour(fader, behaviour);
-                if !was_hard_muted && self.profile.is_fader_hard_muted(fader) {
-                    let channel = self.profile.get_fader_assignment(fader);
-                    let volume = self.profile.get_channel_volume(channel);
-                    self.profile.set_mute_previous_volume(fader, volume)?;
-                }
-
-                // We'll pass 'None' into this as there's a guaranteed change..
-                self.apply_mute_from_profile(fader, None)?;
-
-                let channel = self.profile.get_fader_assignment(fader);
-                if let Ok(input) = BasicInputDevice::try_from(channel) {
-                    self.apply_routing(input).await?;
-
-                    if input == BasicInputDevice::Chat && self.vc_mute_also_mute_cm {
-                        // Reapply the Mic routing in case we need to mute / unmute to Voice Chat
-                        self.apply_routing(BasicInputDevice::Microphone).await?;
-                    }
-                }
-            }
-
-            GoXLRCommand::SetVolume(channel, volume) => {
-                debug!("Setting Mix volume for {} to {}", channel, volume);
-                self.goxlr.set_volume(channel, volume)?;
-                self.profile.set_channel_volume(channel, volume)?;
-
-                // Update the Submix when volume changes via IPC
-                self.update_submix_for(channel, volume)?;
-
-                if let Some(fader) = self.profile.get_fader_from_channel(channel) {
-                    self.fader_pause_until[fader].paused = true;
-                    self.fader_pause_until[fader].until = volume;
-                }
-            }
-
-            GoXLRCommand::SetCoughMuteFunction(mute_function) => {
-                if self.profile.get_chat_mute_button_behaviour() == mute_function {
-                    // Settings are the same..
-                    return Ok(());
-                }
-
-                // Unmute the channel to prevent weirdness, then set new behaviour
-                self.unmute_chat_if_muted().await?;
-                self.profile.set_chat_mute_button_behaviour(mute_function);
-
-                // Reapply the Cough settings from the profile
-                self.apply_cough_from_profile()?;
-                self.apply_routing(BasicInputDevice::Microphone).await?;
-            }
-            GoXLRCommand::SetCoughIsHold(is_hold) => {
-                self.unmute_chat_if_muted().await?;
-                self.profile.set_chat_mute_button_is_held(is_hold);
-            }
-            GoXLRCommand::SetSwearButtonVolume(volume) => {
-                self.mic_profile.set_bleep_level(volume)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::BleepLevel]))?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::BleepLevel]))?;
-            }
-            GoXLRCommand::SetMicrophoneType(mic_type) => {
-                self.mic_profile.set_mic_type(mic_type)?;
-                self.apply_mic_gain()?;
-            }
-            GoXLRCommand::SetMicrophoneGain(mic_type, gain) => {
-                // Sets that type's gain, without making it the active type (SetMicrophoneType
-                // does that): the gain is applied now only if it's the one in use.
-                self.mic_profile.set_mic_gain(mic_type, gain)?;
-                if self.mic_profile.mic_type() == mic_type {
-                    self.apply_mic_gain()?;
-                }
-            }
-            GoXLRCommand::SetRouter(input, output, enabled) => {
-                debug!("Setting Routing: {:?} {:?} {}", input, output, enabled);
-                self.profile.set_routing(input, output, enabled)?;
-
-                // Apply the change..
-                self.apply_routing(input).await?;
-            }
-
-            GoXLRCommand::SetElementDisplayMode(element, display) => match element {
-                DisplayModeComponents::NoiseGate => {
-                    self.mic_profile.set_gate_display_mode(display);
-                }
-                DisplayModeComponents::Equaliser => {
-                    self.mic_profile.set_eq_display_mode(display);
-                }
-                DisplayModeComponents::Compressor => {
-                    // TODO: Apply 'Simple' compressor values..
-                    self.mic_profile.set_compressor_display_mode(display);
-                }
-                DisplayModeComponents::EqFineTune => {
-                    self.mic_profile.set_eq_fine_display_mode(display);
-                }
-            },
-
-            // Equaliser
-            GoXLRCommand::SetEqMiniGain(gain, value) => {
-                let param = self.mic_profile.set_mini_eq_gain(gain, value)?;
-                self.apply_mic_params(HashSet::from([param]))?;
-            }
-            GoXLRCommand::SetEqMiniFreq(freq, value) => {
-                let param = self.mic_profile.set_mini_eq_freq(freq, value)?;
-                self.apply_mic_params(HashSet::from([param]))?;
-            }
-            GoXLRCommand::SetEqGain(gain, value) => {
-                let param = self.mic_profile.set_eq_gain(gain, value)?;
-                self.apply_effects(LinkedHashSet::from_iter([param]))?;
-            }
-            GoXLRCommand::SetEqFreq(freq, value) => {
-                let param = self.mic_profile.set_eq_freq(freq, value)?;
-                self.apply_effects(LinkedHashSet::from_iter([param]))?;
-            }
-            GoXLRCommand::SetGateThreshold(value) => {
-                self.mic_profile.set_gate_threshold(value)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateThreshold]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateThreshold]))?;
-            }
-
-            // Noise Gate
-            GoXLRCommand::SetGateAttenuation(percentage) => {
-                self.mic_profile.set_gate_attenuation(percentage)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateAttenuation]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateAttenuation]))?;
-            }
-            GoXLRCommand::SetGateAttack(attack_time) => {
-                self.mic_profile.set_gate_attack(attack_time)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateAttack]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateAttack]))?;
-            }
-            GoXLRCommand::SetGateRelease(release_time) => {
-                self.mic_profile.set_gate_release(release_time)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateRelease]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateRelease]))?;
-            }
-            GoXLRCommand::SetGateActive(active) => {
-                self.mic_profile.set_gate_active(active)?;
-
-                // GateEnabled appears to only be an effect key.
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateEnabled]))?;
-            }
-
-            // Compressor
-            GoXLRCommand::SetCompressorThreshold(value) => {
-                self.mic_profile.set_compressor_threshold(value)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorThreshold]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorThreshold]))?;
-            }
-            GoXLRCommand::SetCompressorRatio(ratio) => {
-                self.mic_profile.set_compressor_ratio(ratio)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorRatio]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorRatio]))?;
-            }
-            GoXLRCommand::SetCompressorAttack(value) => {
-                self.mic_profile.set_compressor_attack(value)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorAttack]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorAttack]))?;
-            }
-            GoXLRCommand::SetCompressorReleaseTime(value) => {
-                self.mic_profile.set_compressor_release(value)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorRelease]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorRelease]))?;
-            }
-            GoXLRCommand::SetCompressorMakeupGain(value) => {
-                self.mic_profile.set_compressor_makeup(value)?;
-                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorMakeUpGain]))?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorMakeUpGain]))?;
-            }
-
-            GoXLRCommand::SetDeeser(percentage) => {
-                self.mic_profile.set_deesser(percentage)?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::DeEsser]))?;
-            }
-
-            // Colouring..
-            GoXLRCommand::SetAnimationMode(mode) => {
-                if !self.device_supports_animations() {
-                    bail!("Animations not supported on this firmware.");
-                }
-
-                if mode == goxlr_types::AnimationMode::Ripple && self.is_device_mini() {
-                    bail!("Ripple Mode not supported on the GoXLR Mini");
-                }
-
-                self.profile.set_animation_mode(mode)?;
-                self.load_animation(false).await?;
-            }
-            GoXLRCommand::SetAnimationMod1(value) => {
-                if !self.device_supports_animations() {
-                    bail!("Animations not supported on this firmware.");
-                }
-
-                self.profile.set_animation_mod1(value)?;
-                self.load_animation(false).await?;
-            }
-            GoXLRCommand::SetAnimationMod2(value) => {
-                if !self.device_supports_animations() {
-                    bail!("Animations not supported on this firmware.");
-                }
-
-                self.profile.set_animation_mod2(value)?;
-                self.load_animation(false).await?;
-            }
-            GoXLRCommand::SetAnimationWaterfall(direction) => {
-                if !self.device_supports_animations() {
-                    bail!("Animations not supported on this firmware.");
-                }
-
-                self.profile.set_animation_waterfall(direction)?;
-                self.load_animation(false).await?;
-            }
-
-            GoXLRCommand::SetGlobalColour(colour) => {
-                self.profile.set_global_colour(colour)?;
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-                self.set_all_fader_display_from_profile()?;
-            }
-            GoXLRCommand::SetFaderDisplayStyle(fader, display) => {
-                self.profile.set_fader_display(fader, display);
-                self.set_fader_display_from_profile(fader)?;
-            }
-            GoXLRCommand::SetFaderColours(fader, top, bottom) => {
-                // Need to get the fader colour map, and set values..
-                self.profile.set_fader_colours(fader, top, bottom)?;
-                self.load_colour_map().await?;
-            }
-            GoXLRCommand::SetAllFaderColours(top, bottom) => {
-                // I considered this as part of SetFaderColours, but spamming a new colour map
-                // for every fader change seemed excessive, this allows us to set them all before
-                // reloading.
-                for fader in FaderName::iter() {
-                    self.profile
-                        .set_fader_colours(fader, top.to_owned(), bottom.to_owned())?;
-                }
-                self.load_colour_map().await?;
-            }
-            GoXLRCommand::SetAllFaderDisplayStyle(display_style) => {
-                for fader in FaderName::iter() {
-                    self.profile.set_fader_display(fader, display_style);
-                    self.set_fader_display_from_profile(fader)?;
-                }
-            }
-            GoXLRCommand::SetButtonColours(target, colour, colour2) => {
-                self.profile
-                    .set_button_colours(target, colour, colour2.as_ref())?;
-
-                // Reload the colour map and button states..
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetButtonOffStyle(target, off_style) => {
-                self.profile.set_button_off_style(target, off_style);
-
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetButtonGroupColours(target, colour, colour_2) => {
-                self.profile
-                    .set_group_button_colours(target, colour, colour_2)?;
-
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetButtonGroupOffStyle(target, off_style) => {
-                self.profile.set_group_button_off_style(target, off_style)?;
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetSimpleColour(target, colour) => {
-                self.profile.set_simple_colours(target, colour)?;
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetEncoderColour(target, colour, colour_2, colour_3) => {
-                self.profile
-                    .set_encoder_colours(target, colour, colour_2, colour_3)?;
-                self.load_colour_map().await?;
-            }
-            GoXLRCommand::SetSampleColour(target, colour, colour_2, colour_3) => {
-                self.profile
-                    .set_sampler_colours(target, colour, colour_2, colour_3)?;
-                self.profile.sync_sample_if_active(target)?;
-                self.load_colour_map().await?;
-            }
-            GoXLRCommand::SetSampleOffStyle(target, style) => {
-                self.profile.set_sampler_off_style(target, style);
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-
-            // Effects
-            GoXLRCommand::LoadEffectPreset(name) => {
-                let presets_directory = self.settings.get_presets_directory().await;
-                self.profile.load_preset(name, vec![&presets_directory])?;
-
-                let current_effect_bank = self.profile.get_active_effect_bank();
-
-                // Force a reload of this effect bank..
-                // TODO: This is slightly sloppy, as it will make unneeded changes.
-                // TODO: Loading a profile should be separate from an 'event'.
-                self.load_effect_bank(current_effect_bank).await?;
-                self.update_button_states()?;
-            }
-
-            GoXLRCommand::RenameActivePreset(name) => {
-                let current_bank = self
-                    .profile
-                    .profile()
-                    .settings()
-                    .context()
-                    .selected_effects();
-                self.profile
-                    .profile_mut()
-                    .settings_mut()
-                    .effects_mut(current_bank)
-                    .set_name(name)?;
-            }
-
-            GoXLRCommand::SaveActivePreset() => {
-                let preset_directory = self.settings.get_presets_directory().await;
-                let current = self
-                    .profile
-                    .profile()
-                    .settings()
-                    .context()
-                    .selected_effects();
-                let mut name =
-                    String::from(self.profile.profile().settings().effects(current).name());
-                name = name.replace(' ', "_");
-
-                self.profile.write_preset(name, &preset_directory)?;
-            }
-
-            GoXLRCommand::SetHardTuneSource(value) => {
-                if self.profile.get_hardtune_source() == value {
-                    // Do nothing, we're already there.
-                    return Ok(());
-                }
-
-                // We need to update the Routing table to reflect this change..
-                if value == HardTuneSource::All || self.profile.is_active_hardtune_source_all() {
-                    self.profile.set_hardtune_source(value)?;
-
-                    // One way or another, we need to update all the inputs..
-                    self.apply_routing(BasicInputDevice::Music).await?;
-                    self.apply_routing(BasicInputDevice::Game).await?;
-                    self.apply_routing(BasicInputDevice::LineIn).await?;
-                    self.apply_routing(BasicInputDevice::System).await?;
-                } else {
-                    let current = self.profile.get_active_hardtune_source();
-                    self.profile.set_hardtune_source(value)?;
-                    let new = self.profile.get_active_hardtune_source();
-
-                    // Remove from current, add to New.
-                    self.apply_routing(current).await?;
-                    self.apply_routing(new).await?;
-                }
-
-                // TODO: Check this..
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::HardTuneKeySource]))?;
-            }
-
-            // Sampler..
-            GoXLRCommand::ClearSampleProcessError() => {
-                self.last_sample_error = None;
-            }
-            GoXLRCommand::SetSamplerFunction(bank, button, function) => {
-                self.profile.set_sampler_function(bank, button, function);
-            }
-            GoXLRCommand::SetSamplerOrder(bank, button, order) => {
-                self.profile.set_sampler_play_order(bank, button, order);
-            }
-            GoXLRCommand::AddSample(bank, button, filename) => {
-                let path = self
-                    .get_path_for_sample(PathBuf::from(filename.clone()))
-                    .await?;
-
-                // If we have an audio handler, try to calcuate the Gain..
-                if let Some(audio_handler) = &mut self.audio_handler {
-                    if audio_handler.is_calculating() {
-                        bail!("Gain Calculation already in progress..");
-                    }
-
-                    // V2 Here, this technically still blocks in it's current state, however, it
-                    // doesn't have to anymore.
-                    audio_handler.calculate_gain_thread(path, bank, button)?;
-                }
-
-                // Update the lighting..
-                self.load_colour_map().await?;
-            }
-            GoXLRCommand::SetSampleStartPercent(bank, button, index, percent) => {
-                self.profile
-                    .set_sample_start_pct(bank, button, index, percent)?;
-            }
-            GoXLRCommand::SetSampleStopPercent(bank, button, index, percent) => {
-                self.profile
-                    .set_sample_stop_pct(bank, button, index, percent)?;
-            }
-            GoXLRCommand::RemoveSampleByIndex(bank, button, index) => {
-                let remaining = self
-                    .profile
-                    .remove_sample_file_by_index(bank, button, index)?;
-
-                if remaining == 0 {
-                    self.load_colour_map().await?;
-                }
-            }
-            GoXLRCommand::PlaySampleByIndex(bank, button, index) => {
-                self.play_audio_file(
-                    bank,
-                    button,
-                    self.profile.get_track_by_index(bank, button, index)?,
-                    false,
-                )
-                .await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::PlayNextSample(bank, button) => {
-                let track = self.profile.get_track_by_bank_button(bank, button)?;
-                self.play_audio_file(bank, button, track, false).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::StartSampleRecording(bank, button) => {
-                if bank != self.profile.get_active_sample_bank() {
-                    bail!("Recording is only possible on the active bank");
-                }
-                let Some(audio) = &self.audio_handler else {
-                    bail!("The sampler isn't available");
-                };
-                if audio.is_sample_recording() {
-                    bail!("A sample is already being recorded");
-                }
-                if self.profile.current_sample_bank_has_samples(button) {
-                    bail!("Only an empty button can record");
-                }
-                let file_date = Local::now().format("%Y-%m-%dT%H%M%S").to_string();
-                self.record_audio_file(button, format!("Recording_{file_date}.wav"))
-                    .await?;
-                self.load_colour_map().await?;
-            }
-            GoXLRCommand::StopSampleRecording(bank, button) => {
-                if bank != self.profile.get_active_sample_bank() {
-                    bail!("Recording is only possible on the active bank");
-                }
-                self.finish_recording(button).await?;
-            }
-            GoXLRCommand::StopSamplePlayback(bank, button) => {
-                self.stop_sample_playback(bank, button).await?;
-                self.update_button_states()?;
-            }
-
-            GoXLRCommand::SetScribbleIcon(fader, icon) => {
-                self.profile.set_scribble_icon(fader, icon);
-                self.apply_scribble(fader).await?;
-            }
-            GoXLRCommand::SetScribbleText(fader, text) => {
-                self.profile.set_scribble_text(fader, text);
-                self.apply_scribble(fader).await?;
-            }
-            GoXLRCommand::SetScribbleNumber(fader, number) => {
-                self.profile.set_scribble_number(fader, number);
-                self.apply_scribble(fader).await?;
-            }
-            GoXLRCommand::SetScribbleInvert(fader, inverted) => {
-                self.profile.set_scribble_inverted(fader, inverted);
-                self.apply_scribble(fader).await?;
-            }
-
-            // Profiles
-            GoXLRCommand::NewProfile(profile_name) => {
-                self.stop_all_samples(true, true).await?;
-                let profile_directory = self.settings.get_profile_directory().await;
-                let volumes = self.profile.get_current_state();
-
-                // Do a new file verification check..
-                ProfileAdapter::can_create_new_file(profile_name.clone(), &profile_directory)?;
-
-                // Force load the default embedded profile..
-                self.profile = ProfileAdapter::default();
-                self.apply_profile(Some(volumes)).await?;
-
-                // Save the profile under a new name (although, don't overwrite if exists!)
-                let path = self.settings.get_profile_directory().await;
-                self.profile.save_as(profile_name.clone(), &path, false)?;
-
-                // Save the profile in the settings
-                self.settings
-                    .set_device_profile_name(self.serial(), profile_name.as_str())
-                    .await;
-                self.settings.save().await;
-            }
-            GoXLRCommand::LoadProfile(profile_name, save_change) => {
-                self.stop_all_samples(true, true).await?;
-                let volumes = self.profile.get_current_state();
-
-                // Grab the needed Paths..
-                let profile_path = self.settings.get_profile_directory().await;
-                let backup_path = self.settings.get_backup_directory().await;
-
-                self.profile =
-                    load_with_backup(&profile_name, &profile_path, &backup_path, save_change)?;
-
-                self.apply_profile(Some(volumes)).await?;
-                if save_change {
-                    self.settings
-                        .set_device_profile_name(self.serial(), self.profile.name())
-                        .await;
-                    self.settings.save().await;
-                }
-            }
-            GoXLRCommand::LoadProfileColours(profile_name) => {
-                debug!("Loading Colours For Profile: {}", profile_name);
-                let profile_path = self.settings.get_profile_directory().await;
-                let profile = ProfileAdapter::from_named(profile_name, &profile_path)?;
-                debug!("Profile Loaded, Applying Colours..");
-                self.profile.load_colour_profile(profile);
-
-                if self.device_supports_animations() {
-                    self.load_animation(false).await?;
-                } else {
-                    self.load_colour_map().await?;
-                }
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SaveProfile() => {
-                let profile_directory = self.settings.get_profile_directory().await;
-                let backups = self.settings.get_backup_directory().await;
-                let file = named_file_path(&profile_directory, self.profile.name(), "goxlr")?;
-                keep_history(&file, &backups);
-                self.profile.save(&profile_directory, true)?;
-            }
-            GoXLRCommand::SaveProfileAs(profile_name) => {
-                let path = self.settings.get_profile_directory().await;
-
-                // Do a new file verification check..
-                ProfileAdapter::can_create_new_file(profile_name.clone(), &path)?;
-                self.profile.save_as(profile_name.clone(), &path, false)?;
-
-                // Save the new name in the settings
-                self.settings
-                    .set_device_profile_name(self.serial(), profile_name.as_str())
-                    .await;
-
-                self.settings.save().await;
-            }
-            GoXLRCommand::DeleteProfile(name) => {
-                if self.profile.name() == name {
-                    bail!("Unable to Remove Active Profile!");
-                }
-
-                let profiles = self.settings.get_profile_directory().await;
-                let backups = self.settings.get_backup_directory().await;
-                // Kept in the profile trash, so it can be restored.
-                trash_profile(&profiles, &backups, &name, false)?;
-                self.profile.delete_profile(name.clone(), &backups)?;
-            }
-            GoXLRCommand::RenameProfile(from, to) => {
-                let profiles = self.settings.get_profile_directory().await;
-                rename_named_file(&profiles, &from, &to, "goxlr")?;
-                // The backup copy follows, it's only a convenience
-                let backups = self.settings.get_backup_directory().await;
-                let _ = rename_named_file(&backups, &from, &to, "goxlr");
-                if self.profile.name() == from {
-                    self.profile.set_name(to.clone());
-                    self.settings
-                        .set_device_profile_name(self.serial(), to.as_str())
-                        .await;
-                    self.settings.save().await;
-                }
-            }
-            GoXLRCommand::DuplicateProfile(from, to) => {
-                let profiles = self.settings.get_profile_directory().await;
-                duplicate_named_file(&profiles, &from, &to, "goxlr")?;
-            }
-            GoXLRCommand::ReloadSettings() => {
-                // This is a simple command that will reload the current profile settings
-                self.apply_profile(None).await?;
-            }
-            GoXLRCommand::NewMicProfile(mic_profile_name) => {
-                let mic_profile_directory = self.settings.get_mic_profile_directory().await;
-
-                // Verify we can create this file..
-                MicProfileAdapter::can_create_new_file(
-                    mic_profile_name.clone(),
-                    &mic_profile_directory,
-                )?;
-
-                // As above, load the default profile, then save as a new profile.
-                self.mic_profile = MicProfileAdapter::default();
-                self.mic_profile.save_as(
-                    mic_profile_name.clone(),
-                    &mic_profile_directory,
-                    false,
-                )?;
-
-                // Send the default mic settings to the device, so it matches the new profile.
-                self.apply_mic_profile().await?;
-
-                // Save the new name in the settings
-                self.settings
-                    .set_device_mic_profile_name(self.serial(), mic_profile_name.as_str())
-                    .await;
-
-                self.settings.save().await;
-            }
-            GoXLRCommand::LoadMicProfile(name, persist) => {
-                // Grab the needed Paths..
-                let path = self.settings.get_mic_profile_directory().await;
-                let backup = self.settings.get_backup_directory().await;
-
-                self.mic_profile = load_with_backup(&name, &path, &backup, persist)?;
-                self.apply_mic_profile().await?;
-
-                if persist {
-                    self.settings
-                        .set_device_mic_profile_name(self.serial(), self.mic_profile.name())
-                        .await;
-                    self.settings.save().await;
-                }
-            }
-            GoXLRCommand::SaveMicProfile() => {
-                let mic_profile_directory = self.settings.get_mic_profile_directory().await;
-                let backups = self.settings.get_backup_directory().await;
-                let name = self.mic_profile.name();
-                let file = named_file_path(&mic_profile_directory, name, "goxlrMicProfile")?;
-                keep_history(&file, &backups);
-                self.mic_profile.save(&mic_profile_directory, true)?;
-            }
-            GoXLRCommand::SaveMicProfileAs(name) => {
-                let path = self.settings.get_mic_profile_directory().await;
-                MicProfileAdapter::can_create_new_file(name.clone(), &path)?;
-
-                self.mic_profile.save_as(name.clone(), &path, false)?;
-
-                // Save the new name in the settings
-                self.settings
-                    .set_device_mic_profile_name(self.serial(), &name)
-                    .await;
-
-                self.settings.save().await;
-            }
-            GoXLRCommand::DeleteMicProfile(profile_name) => {
-                if self.mic_profile.name() == profile_name {
-                    bail!("Unable to Remove Active Profile!");
-                }
-
-                let profile_directory = self.settings.get_mic_profile_directory().await;
-                let backups = self.settings.get_backup_directory().await;
-                // Kept in the profile trash, so it can be restored.
-                trash_profile(&profile_directory, &backups, &profile_name, true)?;
-            }
-            GoXLRCommand::RenameMicProfile(from, to) => {
-                let profiles = self.settings.get_mic_profile_directory().await;
-                rename_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
-                let backups = self.settings.get_backup_directory().await;
-                let _ = rename_named_file(&backups, &from, &to, "goxlrMicProfile");
-                if self.mic_profile.name() == from {
-                    self.mic_profile.set_name(to.clone());
-                    self.settings
-                        .set_device_mic_profile_name(self.serial(), to.as_str())
-                        .await;
-                    self.settings.save().await;
-                }
-            }
-            GoXLRCommand::DuplicateMicProfile(from, to) => {
-                let profiles = self.settings.get_mic_profile_directory().await;
-                duplicate_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
-            }
-
-            GoXLRCommand::SetMuteHoldDuration(duration) => {
-                self.hold_time = Duration::from_millis(duration.into());
-                self.settings
-                    .set_device_mute_hold_duration(self.serial(), duration)
-                    .await;
-                self.settings.save().await;
-            }
-
-            GoXLRCommand::SetVCMuteAlsoMuteCM(value) => {
-                self.vc_mute_also_mute_cm = value;
-                self.settings
-                    .set_device_vc_mute_also_mute_cm(self.serial(), value)
-                    .await;
-                self.settings.save().await;
-
-                // Re-run the Microphone Routing to update if needed..
-                self.apply_routing(BasicInputDevice::Microphone).await?;
-            }
-
-            GoXLRCommand::SetMonitorWithFx(value) => {
-                self.settings
-                    .set_enable_monitor_with_fx(self.serial(), value)
-                    .await;
-                self.cached.monitor_with_fx = value;
-                self.settings.save().await;
-                self.apply_routing(BasicInputDevice::Microphone).await?;
-            }
-
-            GoXLRCommand::SetSamplerResetOnClear(value) => {
-                self.settings
-                    .set_sampler_reset_on_clear(self.serial(), value)
-                    .await;
-                self.settings.save().await;
-            }
-
-            GoXLRCommand::SetSamplerFadeDuration(value) => {
-                if value > 20000 {
-                    bail!("Sampler Fade Duration cannot be greater than 20 seconds");
-                }
-
-                self.settings
-                    .set_sampler_fade_duration(self.serial(), value)
-                    .await;
-                self.settings.save().await;
-            }
-
-            GoXLRCommand::SetLockFaders(value) => {
-                let current = self.cached.lock_faders;
-
-                if current != value {
-                    self.settings
-                        .set_device_lock_faders(self.serial(), value)
-                        .await;
-                    self.cached.lock_faders = value;
-
-                    self.settings.save().await;
-
-                    if value {
-                        self.lock_faders()?;
-                    } else {
-                        self.unlock_faders()?;
-                    }
-                    self.load_colour_map().await?;
-                }
-            }
-
-            GoXLRCommand::SetVodMode(value) => {
-                if !self.device_supports_vod_mode().await {
-                    warn!("Not Supported?");
-                    bail!("Device doesn't support VOD Mode");
-                }
-
-                let serial = self.serial();
-
-                // Get the current mode..
-                let current = self.cached.vod_mode;
-                debug!("Current: {}, New: {}", current, value);
-
-                if current != value {
-                    self.settings.set_device_vod_mode(serial, value).await;
-                    self.cached.vod_mode = value;
-                    self.load_submix_settings(false).await?;
-
-                    // We need to reapply all routing to reconfigure as needed
-                    for input in BasicInputDevice::iter() {
-                        self.apply_routing(input).await?;
-                    }
-                    self.settings.save().await;
-                }
-            }
-
-            GoXLRCommand::SetActiveEffectPreset(preset) => {
-                self.load_effect_bank(preset).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetActiveSamplerBank(bank) => {
-                self.load_sample_bank(bank).await?;
-                self.load_colour_map().await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetMegaphoneEnabled(enabled) => {
-                self.set_megaphone(enabled).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetRobotEnabled(enabled) => {
-                self.set_robot(enabled).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetHardTuneEnabled(enabled) => {
-                self.set_hardtune(enabled).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetFXEnabled(enabled) => {
-                self.set_effects(enabled).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetFaderMuteState(fader, state) => match state {
-                MuteState::Unmuted => self.unmute_fader(fader).await?,
-                MuteState::MutedToX => self.mute_fader_to_x(fader).await?,
-                MuteState::MutedToAll => self.mute_fader_to_all(fader, true).await?,
-            },
-            GoXLRCommand::SetCoughMuteState(state) => {
-                // This is more complicated because the 'state' of the mute can come from
-                // various different locations, so what we're going to do is simply update
-                // the profile, and re-apply the Mute settings from there.
-                if !self.profile.is_mute_chat_button_toggle() {
-                    bail!("Cannot Set state when Mute button is in 'Hold' Mode");
-                }
-                match state {
-                    MuteState::Unmuted => {
-                        self.profile.set_mute_chat_button_on(false);
-                        self.profile.set_mute_chat_button_blink(false);
-                    }
-                    MuteState::MutedToX => {
-                        self.profile.set_mute_chat_button_on(true);
-                        self.profile.set_mute_chat_button_blink(false);
-                    }
-                    MuteState::MutedToAll => {
-                        self.profile.set_mute_chat_button_on(true);
-                        self.profile.set_mute_chat_button_blink(true);
-                    }
-                }
-                self.apply_cough_from_profile()?;
-                self.apply_effects(LinkedHashSet::from_iter([EffectKey::MicInputMute]))?;
-                self.apply_routing(BasicInputDevice::Microphone).await?;
-                self.update_button_states()?;
-            }
-            GoXLRCommand::SetSubMixEnabled(enabled) => {
-                let headphones = goxlr_types::OutputDevice::Headphones;
-                if self.profile.is_submix_enabled() != enabled {
-                    if !enabled {
-                        // Submixes are being disabled, we need to revert the monitor..
-                        self.profile.set_monitor_mix(headphones)?;
-                        for device in BasicInputDevice::iter() {
-                            self.apply_routing(device).await?;
-                        }
-                    }
-
-                    self.profile.set_submix_enabled(enabled)?;
-                    self.load_submix_settings(true).await?;
-                }
-            }
-            GoXLRCommand::SetSubMixVolume(channel, volume) => {
-                self.apply_submix_volume(channel, volume)?;
-            }
-            GoXLRCommand::SetSubMixLinked(channel, linked) => {
-                self.link_submix_channel(channel, linked)?;
-            }
-            GoXLRCommand::SetSubMixOutputMix(device, mix) => {
-                self.profile.set_mix_output(device, mix)?;
-                self.load_submix_settings(false).await?;
-            }
-            GoXLRCommand::SetMonitorMix(device) => {
-                if self.is_stream_no_music().await {
-                    if !self.device_supports_mix2() && self.is_device_mini() {
-                        // In this case, we're bound to the Sampler channel, make sure we're not trying to monitor it..
-                        if device == BasicOutputDevice::Sampler {
-                            bail!("Channel is controlled by Stream Mix 1");
-                        }
-                    }
-                    if self.device_supports_mix2() && device == BasicOutputDevice::StreamMix2 {
-                        bail!("Channel is controled by Stream Mix 1");
-                    }
-                }
-
-                self.profile.set_monitor_mix(device)?;
-
-                // Might be a cleaner way to do this, we only need to handle 1 output..
-                for device in BasicInputDevice::iter() {
-                    self.apply_routing(device).await?;
-                }
-
-                // Make sure to switch Headphones from A to B if needed.
-                self.load_submix_settings(false).await?;
+            | GoXLRCommand::SetHardTuneWindow(_)
+            | GoXLRCommand::LoadEffectPreset(..)
+            | GoXLRCommand::RenameActivePreset(..)
+            | GoXLRCommand::SaveActivePreset(..)
+            | GoXLRCommand::SetActiveEffectPreset(..)
+            | GoXLRCommand::SetMegaphoneEnabled(..)
+            | GoXLRCommand::SetRobotEnabled(..)
+            | GoXLRCommand::SetHardTuneEnabled(..)
+            | GoXLRCommand::SetFXEnabled(..)) => {
+                self.perform_effect_command(command).await?;
+            }
+            // Utility settings for this device: scenes, power commands, hold times, VOD mode..
+            command @ (GoXLRCommand::SetShutdownCommands(..)
+            | GoXLRCommand::SaveScene(..)
+            | GoXLRCommand::RunScene(..)
+            | GoXLRCommand::DeleteScene(..)
+            | GoXLRCommand::SetSleepCommands(..)
+            | GoXLRCommand::SetWakeCommands(..)
+            | GoXLRCommand::SetSamplerPreBufferDuration(..)
+            | GoXLRCommand::ReloadSettings(..)
+            | GoXLRCommand::SetMuteHoldDuration(..)
+            | GoXLRCommand::SetVCMuteAlsoMuteCM(..)
+            | GoXLRCommand::SetMonitorWithFx(..)
+            | GoXLRCommand::SetSamplerResetOnClear(..)
+            | GoXLRCommand::SetSamplerFadeDuration(..)
+            | GoXLRCommand::SetLockFaders(..)
+            | GoXLRCommand::SetVodMode(..)) => {
+                self.perform_settings_command(command).await?;
+            }
+            // The microphone: type, gain, equaliser, gate, compressor and de-esser.
+            command @ (GoXLRCommand::SetMicrophoneType(..)
+            | GoXLRCommand::SetMicrophoneGain(..)
+            | GoXLRCommand::SetEqMiniGain(..)
+            | GoXLRCommand::SetEqMiniFreq(..)
+            | GoXLRCommand::SetEqGain(..)
+            | GoXLRCommand::SetEqFreq(..)
+            | GoXLRCommand::SetGateThreshold(..)
+            | GoXLRCommand::SetGateAttenuation(..)
+            | GoXLRCommand::SetGateAttack(..)
+            | GoXLRCommand::SetGateRelease(..)
+            | GoXLRCommand::SetGateActive(..)
+            | GoXLRCommand::SetCompressorThreshold(..)
+            | GoXLRCommand::SetCompressorRatio(..)
+            | GoXLRCommand::SetCompressorAttack(..)
+            | GoXLRCommand::SetCompressorReleaseTime(..)
+            | GoXLRCommand::SetCompressorMakeupGain(..)
+            | GoXLRCommand::SetDeeser(..)) => {
+                self.perform_mic_command(command).await?;
+            }
+            // Faders, volumes, mutes, routing and submixes.
+            command @ (GoXLRCommand::SetFader(..)
+            | GoXLRCommand::SetFaderMuteFunction(..)
+            | GoXLRCommand::SetVolume(..)
+            | GoXLRCommand::SetCoughMuteFunction(..)
+            | GoXLRCommand::SetCoughIsHold(..)
+            | GoXLRCommand::SetSwearButtonVolume(..)
+            | GoXLRCommand::SetRouter(..)
+            | GoXLRCommand::SetHardTuneSource(..)
+            | GoXLRCommand::SetFaderMuteState(..)
+            | GoXLRCommand::SetCoughMuteState(..)
+            | GoXLRCommand::SetSubMixEnabled(..)
+            | GoXLRCommand::SetSubMixVolume(..)
+            | GoXLRCommand::SetSubMixLinked(..)
+            | GoXLRCommand::SetSubMixOutputMix(..)
+            | GoXLRCommand::SetMonitorMix(..)) => {
+                self.perform_mixer_command(command).await?;
+            }
+            // Lighting, animations and scribbles.
+            command @ (GoXLRCommand::SetElementDisplayMode(..)
+            | GoXLRCommand::SetAnimationMode(..)
+            | GoXLRCommand::SetAnimationMod1(..)
+            | GoXLRCommand::SetAnimationMod2(..)
+            | GoXLRCommand::SetAnimationWaterfall(..)
+            | GoXLRCommand::SetGlobalColour(..)
+            | GoXLRCommand::SetFaderDisplayStyle(..)
+            | GoXLRCommand::SetFaderColours(..)
+            | GoXLRCommand::SetAllFaderColours(..)
+            | GoXLRCommand::SetAllFaderDisplayStyle(..)
+            | GoXLRCommand::SetButtonColours(..)
+            | GoXLRCommand::SetButtonOffStyle(..)
+            | GoXLRCommand::SetButtonGroupColours(..)
+            | GoXLRCommand::SetButtonGroupOffStyle(..)
+            | GoXLRCommand::SetSimpleColour(..)
+            | GoXLRCommand::SetEncoderColour(..)
+            | GoXLRCommand::SetSampleColour(..)
+            | GoXLRCommand::SetSampleOffStyle(..)
+            | GoXLRCommand::SetScribbleIcon(..)
+            | GoXLRCommand::SetScribbleText(..)
+            | GoXLRCommand::SetScribbleNumber(..)
+            | GoXLRCommand::SetScribbleInvert(..)) => {
+                self.perform_lighting_command(command).await?;
+            }
+            // The sampler: samples, playback and recording.
+            command @ (GoXLRCommand::ClearSampleProcessError(..)
+            | GoXLRCommand::SetSamplerFunction(..)
+            | GoXLRCommand::SetSamplerOrder(..)
+            | GoXLRCommand::AddSample(..)
+            | GoXLRCommand::SetSampleStartPercent(..)
+            | GoXLRCommand::SetSampleStopPercent(..)
+            | GoXLRCommand::RemoveSampleByIndex(..)
+            | GoXLRCommand::PlaySampleByIndex(..)
+            | GoXLRCommand::PlayNextSample(..)
+            | GoXLRCommand::StartSampleRecording(..)
+            | GoXLRCommand::StopSampleRecording(..)
+            | GoXLRCommand::StopSamplePlayback(..)
+            | GoXLRCommand::SetActiveSamplerBank(..)) => {
+                self.perform_sampler_command(command).await?;
+            }
+            // Profiles and mic profiles: create, load, save, rename, delete.
+            command @ (GoXLRCommand::NewProfile(..)
+            | GoXLRCommand::LoadProfile(..)
+            | GoXLRCommand::LoadProfileColours(..)
+            | GoXLRCommand::SaveProfile(..)
+            | GoXLRCommand::SaveProfileAs(..)
+            | GoXLRCommand::DeleteProfile(..)
+            | GoXLRCommand::RenameProfile(..)
+            | GoXLRCommand::DuplicateProfile(..)
+            | GoXLRCommand::NewMicProfile(..)
+            | GoXLRCommand::LoadMicProfile(..)
+            | GoXLRCommand::SaveMicProfile(..)
+            | GoXLRCommand::SaveMicProfileAs(..)
+            | GoXLRCommand::DeleteMicProfile(..)
+            | GoXLRCommand::RenameMicProfile(..)
+            | GoXLRCommand::DuplicateMicProfile(..)) => {
+                self.perform_profile_command(command).await?;
             }
         }
         Ok(())
@@ -2941,7 +2115,7 @@ impl<'a> Device<'a> {
 
     /// The effect settings (reverb, echo, pitch, gender, megaphone, robot, hard tune): change the
     /// value in the active profile, then send it.
-    fn perform_effect_command(&mut self, command: GoXLRCommand) -> Result<()> {
+    async fn perform_effect_command(&mut self, command: GoXLRCommand) -> Result<()> {
         match command {
             // Reverb
             GoXLRCommand::SetReverbStyle(style) => {
@@ -3170,7 +2344,978 @@ impl<'a> Device<'a> {
             GoXLRCommand::SetHardTuneWindow(v) => {
                 set_effect!(self.hardtune.set_window(v) => HardTuneWindow)
             }
+            // Effects
+            GoXLRCommand::LoadEffectPreset(name) => {
+                let presets_directory = self.settings.get_presets_directory().await;
+                self.profile.load_preset(name, vec![&presets_directory])?;
+
+                let current_effect_bank = self.profile.get_active_effect_bank();
+
+                // Force a reload of this effect bank..
+                // TODO: This is slightly sloppy, as it will make unneeded changes.
+                // TODO: Loading a profile should be separate from an 'event'.
+                self.load_effect_bank(current_effect_bank).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::RenameActivePreset(name) => {
+                let current_bank = self
+                    .profile
+                    .profile()
+                    .settings()
+                    .context()
+                    .selected_effects();
+                self.profile
+                    .profile_mut()
+                    .settings_mut()
+                    .effects_mut(current_bank)
+                    .set_name(name)?;
+            }
+            GoXLRCommand::SaveActivePreset() => {
+                let preset_directory = self.settings.get_presets_directory().await;
+                let current = self
+                    .profile
+                    .profile()
+                    .settings()
+                    .context()
+                    .selected_effects();
+                let mut name =
+                    String::from(self.profile.profile().settings().effects(current).name());
+                name = name.replace(' ', "_");
+
+                self.profile.write_preset(name, &preset_directory)?;
+            }
+            GoXLRCommand::SetActiveEffectPreset(preset) => {
+                self.load_effect_bank(preset).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetMegaphoneEnabled(enabled) => {
+                self.set_megaphone(enabled).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetRobotEnabled(enabled) => {
+                self.set_robot(enabled).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetHardTuneEnabled(enabled) => {
+                self.set_hardtune(enabled).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetFXEnabled(enabled) => {
+                self.set_effects(enabled).await?;
+                self.update_button_states()?;
+            }
             other => bail!("Not an effect command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// Utility settings for this device: scenes, power commands, hold times, VOD mode..
+    async fn perform_settings_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            GoXLRCommand::SetShutdownCommands(commands) => {
+                self.settings
+                    .set_device_shutdown_commands(self.serial(), commands)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SaveScene(name, commands) => {
+                let name = name.trim().to_string();
+                if name.is_empty() || name.chars().count() > 64 {
+                    bail!("A scene needs a name of 1 to 64 characters");
+                }
+                if let Some(command) = commands.iter().find(|c| !scene_command_allowed(c)) {
+                    bail!("A scene can't contain {:?}", command);
+                }
+                self.settings
+                    .set_device_scene(self.serial(), &name, Some(commands))
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::RunScene(name) => {
+                let scenes = self.settings.get_device_scenes(self.serial()).await;
+                let Some(commands) = scenes.get(&name) else {
+                    bail!("There is no scene named {}", name);
+                };
+                for command in commands.clone() {
+                    // Stored scenes were checked when saved, but the settings file can be edited.
+                    if !scene_command_allowed(&command) {
+                        warn!("Skipping {:?} in scene {}", command, name);
+                        continue;
+                    }
+                    if let Err(e) = Box::pin(self.perform_command(command)).await {
+                        warn!("Scene {}: {}", name, e);
+                    }
+                }
+            }
+            GoXLRCommand::DeleteScene(name) => {
+                self.settings
+                    .set_device_scene(self.serial(), &name, None)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SetSleepCommands(commands) => {
+                self.settings
+                    .set_device_sleep_commands(self.serial(), commands)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SetWakeCommands(commands) => {
+                self.settings
+                    .set_device_wake_commands(self.serial(), commands)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SetSamplerPreBufferDuration(duration) => {
+                if duration > 30000 {
+                    bail!("Buffer must be below 30seconds");
+                }
+
+                self.settings
+                    .set_device_sampler_pre_buffer(self.serial(), duration)
+                    .await;
+                self.settings.save().await;
+
+                // Reload the Audio Handler...
+                self.stop_all_samples(false, true).await?;
+
+                // Drop the Audio Handler..
+                if let Some(handler) = &mut self.audio_handler {
+                    handler.update_record_buffer(duration)?;
+                }
+            }
+            GoXLRCommand::ReloadSettings() => {
+                // This is a simple command that will reload the current profile settings
+                self.apply_profile(None).await?;
+            }
+            GoXLRCommand::SetMuteHoldDuration(duration) => {
+                self.hold_time = Duration::from_millis(duration.into());
+                self.settings
+                    .set_device_mute_hold_duration(self.serial(), duration)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SetVCMuteAlsoMuteCM(value) => {
+                self.vc_mute_also_mute_cm = value;
+                self.settings
+                    .set_device_vc_mute_also_mute_cm(self.serial(), value)
+                    .await;
+                self.settings.save().await;
+
+                // Re-run the Microphone Routing to update if needed..
+                self.apply_routing(BasicInputDevice::Microphone).await?;
+            }
+            GoXLRCommand::SetMonitorWithFx(value) => {
+                self.settings
+                    .set_enable_monitor_with_fx(self.serial(), value)
+                    .await;
+                self.cached.monitor_with_fx = value;
+                self.settings.save().await;
+                self.apply_routing(BasicInputDevice::Microphone).await?;
+            }
+            GoXLRCommand::SetSamplerResetOnClear(value) => {
+                self.settings
+                    .set_sampler_reset_on_clear(self.serial(), value)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SetSamplerFadeDuration(value) => {
+                if value > 20000 {
+                    bail!("Sampler Fade Duration cannot be greater than 20 seconds");
+                }
+
+                self.settings
+                    .set_sampler_fade_duration(self.serial(), value)
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::SetLockFaders(value) => {
+                let current = self.cached.lock_faders;
+
+                if current != value {
+                    self.settings
+                        .set_device_lock_faders(self.serial(), value)
+                        .await;
+                    self.cached.lock_faders = value;
+
+                    self.settings.save().await;
+
+                    if value {
+                        self.lock_faders()?;
+                    } else {
+                        self.unlock_faders()?;
+                    }
+                    self.load_colour_map().await?;
+                }
+            }
+            GoXLRCommand::SetVodMode(value) => {
+                if !self.device_supports_vod_mode().await {
+                    warn!("Not Supported?");
+                    bail!("Device doesn't support VOD Mode");
+                }
+
+                let serial = self.serial();
+
+                // Get the current mode..
+                let current = self.cached.vod_mode;
+                debug!("Current: {}, New: {}", current, value);
+
+                if current != value {
+                    self.settings.set_device_vod_mode(serial, value).await;
+                    self.cached.vod_mode = value;
+                    self.load_submix_settings(false).await?;
+
+                    // We need to reapply all routing to reconfigure as needed
+                    for input in BasicInputDevice::iter() {
+                        self.apply_routing(input).await?;
+                    }
+                    self.settings.save().await;
+                }
+            }
+            other => bail!("Not a settings command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// The microphone: type, gain, equaliser, gate, compressor and de-esser.
+    async fn perform_mic_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            GoXLRCommand::SetMicrophoneType(mic_type) => {
+                self.mic_profile.set_mic_type(mic_type)?;
+                self.apply_mic_gain()?;
+            }
+            GoXLRCommand::SetMicrophoneGain(mic_type, gain) => {
+                // Sets that type's gain, without making it the active type (SetMicrophoneType
+                // does that): the gain is applied now only if it's the one in use.
+                self.mic_profile.set_mic_gain(mic_type, gain)?;
+                if self.mic_profile.mic_type() == mic_type {
+                    self.apply_mic_gain()?;
+                }
+            }
+            // Equaliser
+            GoXLRCommand::SetEqMiniGain(gain, value) => {
+                let param = self.mic_profile.set_mini_eq_gain(gain, value)?;
+                self.apply_mic_params(HashSet::from([param]))?;
+            }
+            GoXLRCommand::SetEqMiniFreq(freq, value) => {
+                let param = self.mic_profile.set_mini_eq_freq(freq, value)?;
+                self.apply_mic_params(HashSet::from([param]))?;
+            }
+            GoXLRCommand::SetEqGain(gain, value) => {
+                let param = self.mic_profile.set_eq_gain(gain, value)?;
+                self.apply_effects(LinkedHashSet::from_iter([param]))?;
+            }
+            GoXLRCommand::SetEqFreq(freq, value) => {
+                let param = self.mic_profile.set_eq_freq(freq, value)?;
+                self.apply_effects(LinkedHashSet::from_iter([param]))?;
+            }
+            GoXLRCommand::SetGateThreshold(value) => {
+                self.mic_profile.set_gate_threshold(value)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateThreshold]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateThreshold]))?;
+            }
+            // Noise Gate
+            GoXLRCommand::SetGateAttenuation(percentage) => {
+                self.mic_profile.set_gate_attenuation(percentage)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateAttenuation]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateAttenuation]))?;
+            }
+            GoXLRCommand::SetGateAttack(attack_time) => {
+                self.mic_profile.set_gate_attack(attack_time)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateAttack]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateAttack]))?;
+            }
+            GoXLRCommand::SetGateRelease(release_time) => {
+                self.mic_profile.set_gate_release(release_time)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::GateRelease]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateRelease]))?;
+            }
+            GoXLRCommand::SetGateActive(active) => {
+                self.mic_profile.set_gate_active(active)?;
+
+                // GateEnabled appears to only be an effect key.
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::GateEnabled]))?;
+            }
+            // Compressor
+            GoXLRCommand::SetCompressorThreshold(value) => {
+                self.mic_profile.set_compressor_threshold(value)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorThreshold]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorThreshold]))?;
+            }
+            GoXLRCommand::SetCompressorRatio(ratio) => {
+                self.mic_profile.set_compressor_ratio(ratio)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorRatio]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorRatio]))?;
+            }
+            GoXLRCommand::SetCompressorAttack(value) => {
+                self.mic_profile.set_compressor_attack(value)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorAttack]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorAttack]))?;
+            }
+            GoXLRCommand::SetCompressorReleaseTime(value) => {
+                self.mic_profile.set_compressor_release(value)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorRelease]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorRelease]))?;
+            }
+            GoXLRCommand::SetCompressorMakeupGain(value) => {
+                self.mic_profile.set_compressor_makeup(value)?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::CompressorMakeUpGain]))?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::CompressorMakeUpGain]))?;
+            }
+            GoXLRCommand::SetDeeser(percentage) => {
+                self.mic_profile.set_deesser(percentage)?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::DeEsser]))?;
+            }
+            other => bail!("Not a mic command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// Faders, volumes, mutes, routing and submixes.
+    async fn perform_mixer_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            GoXLRCommand::SetFader(fader, channel) => {
+                self.set_fader(fader, channel).await?;
+            }
+            GoXLRCommand::SetFaderMuteFunction(fader, behaviour) => {
+                if self.profile.get_mute_button_behaviour(fader) == behaviour {
+                    // Settings are the same..
+                    return Ok(());
+                }
+
+                // A mute to X that becomes a mute for everyone takes the channel to 0: keep its
+                // current level as the one to restore on unmute (an older one would be restored).
+                let was_hard_muted = self.profile.is_fader_hard_muted(fader);
+                self.profile.set_mute_button_behaviour(fader, behaviour);
+                if !was_hard_muted && self.profile.is_fader_hard_muted(fader) {
+                    let channel = self.profile.get_fader_assignment(fader);
+                    let volume = self.profile.get_channel_volume(channel);
+                    self.profile.set_mute_previous_volume(fader, volume)?;
+                }
+
+                // We'll pass 'None' into this as there's a guaranteed change..
+                self.apply_mute_from_profile(fader, None)?;
+
+                let channel = self.profile.get_fader_assignment(fader);
+                if let Ok(input) = BasicInputDevice::try_from(channel) {
+                    self.apply_routing(input).await?;
+
+                    if input == BasicInputDevice::Chat && self.vc_mute_also_mute_cm {
+                        // Reapply the Mic routing in case we need to mute / unmute to Voice Chat
+                        self.apply_routing(BasicInputDevice::Microphone).await?;
+                    }
+                }
+            }
+            GoXLRCommand::SetVolume(channel, volume) => {
+                debug!("Setting Mix volume for {} to {}", channel, volume);
+                self.goxlr.set_volume(channel, volume)?;
+                self.profile.set_channel_volume(channel, volume)?;
+
+                // Update the Submix when volume changes via IPC
+                self.update_submix_for(channel, volume)?;
+
+                if let Some(fader) = self.profile.get_fader_from_channel(channel) {
+                    self.fader_pause_until[fader].paused = true;
+                    self.fader_pause_until[fader].until = volume;
+                }
+            }
+            GoXLRCommand::SetCoughMuteFunction(mute_function) => {
+                if self.profile.get_chat_mute_button_behaviour() == mute_function {
+                    // Settings are the same..
+                    return Ok(());
+                }
+
+                // Unmute the channel to prevent weirdness, then set new behaviour
+                self.unmute_chat_if_muted().await?;
+                self.profile.set_chat_mute_button_behaviour(mute_function);
+
+                // Reapply the Cough settings from the profile
+                self.apply_cough_from_profile()?;
+                self.apply_routing(BasicInputDevice::Microphone).await?;
+            }
+            GoXLRCommand::SetCoughIsHold(is_hold) => {
+                self.unmute_chat_if_muted().await?;
+                self.profile.set_chat_mute_button_is_held(is_hold);
+            }
+            GoXLRCommand::SetSwearButtonVolume(volume) => {
+                self.mic_profile.set_bleep_level(volume)?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::BleepLevel]))?;
+                self.apply_mic_params(HashSet::from([MicrophoneParamKey::BleepLevel]))?;
+            }
+            GoXLRCommand::SetRouter(input, output, enabled) => {
+                debug!("Setting Routing: {:?} {:?} {}", input, output, enabled);
+                self.profile.set_routing(input, output, enabled)?;
+
+                // Apply the change..
+                self.apply_routing(input).await?;
+            }
+            GoXLRCommand::SetHardTuneSource(value) => {
+                if self.profile.get_hardtune_source() == value {
+                    // Do nothing, we're already there.
+                    return Ok(());
+                }
+
+                // We need to update the Routing table to reflect this change..
+                if value == HardTuneSource::All || self.profile.is_active_hardtune_source_all() {
+                    self.profile.set_hardtune_source(value)?;
+
+                    // One way or another, we need to update all the inputs..
+                    self.apply_routing(BasicInputDevice::Music).await?;
+                    self.apply_routing(BasicInputDevice::Game).await?;
+                    self.apply_routing(BasicInputDevice::LineIn).await?;
+                    self.apply_routing(BasicInputDevice::System).await?;
+                } else {
+                    let current = self.profile.get_active_hardtune_source();
+                    self.profile.set_hardtune_source(value)?;
+                    let new = self.profile.get_active_hardtune_source();
+
+                    // Remove from current, add to New.
+                    self.apply_routing(current).await?;
+                    self.apply_routing(new).await?;
+                }
+
+                // TODO: Check this..
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::HardTuneKeySource]))?;
+            }
+            GoXLRCommand::SetFaderMuteState(fader, state) => match state {
+                MuteState::Unmuted => self.unmute_fader(fader).await?,
+                MuteState::MutedToX => self.mute_fader_to_x(fader).await?,
+                MuteState::MutedToAll => self.mute_fader_to_all(fader, true).await?,
+            },
+            GoXLRCommand::SetCoughMuteState(state) => {
+                // This is more complicated because the 'state' of the mute can come from
+                // various different locations, so what we're going to do is simply update
+                // the profile, and re-apply the Mute settings from there.
+                if !self.profile.is_mute_chat_button_toggle() {
+                    bail!("Cannot Set state when Mute button is in 'Hold' Mode");
+                }
+                match state {
+                    MuteState::Unmuted => {
+                        self.profile.set_mute_chat_button_on(false);
+                        self.profile.set_mute_chat_button_blink(false);
+                    }
+                    MuteState::MutedToX => {
+                        self.profile.set_mute_chat_button_on(true);
+                        self.profile.set_mute_chat_button_blink(false);
+                    }
+                    MuteState::MutedToAll => {
+                        self.profile.set_mute_chat_button_on(true);
+                        self.profile.set_mute_chat_button_blink(true);
+                    }
+                }
+                self.apply_cough_from_profile()?;
+                self.apply_effects(LinkedHashSet::from_iter([EffectKey::MicInputMute]))?;
+                self.apply_routing(BasicInputDevice::Microphone).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetSubMixEnabled(enabled) => {
+                let headphones = goxlr_types::OutputDevice::Headphones;
+                if self.profile.is_submix_enabled() != enabled {
+                    if !enabled {
+                        // Submixes are being disabled, we need to revert the monitor..
+                        self.profile.set_monitor_mix(headphones)?;
+                        for device in BasicInputDevice::iter() {
+                            self.apply_routing(device).await?;
+                        }
+                    }
+
+                    self.profile.set_submix_enabled(enabled)?;
+                    self.load_submix_settings(true).await?;
+                }
+            }
+            GoXLRCommand::SetSubMixVolume(channel, volume) => {
+                self.apply_submix_volume(channel, volume)?;
+            }
+            GoXLRCommand::SetSubMixLinked(channel, linked) => {
+                self.link_submix_channel(channel, linked)?;
+            }
+            GoXLRCommand::SetSubMixOutputMix(device, mix) => {
+                self.profile.set_mix_output(device, mix)?;
+                self.load_submix_settings(false).await?;
+            }
+            GoXLRCommand::SetMonitorMix(device) => {
+                if self.is_stream_no_music().await {
+                    if !self.device_supports_mix2() && self.is_device_mini() {
+                        // In this case, we're bound to the Sampler channel, make sure we're not trying to monitor it..
+                        if device == BasicOutputDevice::Sampler {
+                            bail!("Channel is controlled by Stream Mix 1");
+                        }
+                    }
+                    if self.device_supports_mix2() && device == BasicOutputDevice::StreamMix2 {
+                        bail!("Channel is controled by Stream Mix 1");
+                    }
+                }
+
+                self.profile.set_monitor_mix(device)?;
+
+                // Might be a cleaner way to do this, we only need to handle 1 output..
+                for device in BasicInputDevice::iter() {
+                    self.apply_routing(device).await?;
+                }
+
+                // Make sure to switch Headphones from A to B if needed.
+                self.load_submix_settings(false).await?;
+            }
+            other => bail!("Not a mixer command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// Lighting, animations and scribbles.
+    async fn perform_lighting_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            GoXLRCommand::SetElementDisplayMode(element, display) => match element {
+                DisplayModeComponents::NoiseGate => {
+                    self.mic_profile.set_gate_display_mode(display);
+                }
+                DisplayModeComponents::Equaliser => {
+                    self.mic_profile.set_eq_display_mode(display);
+                }
+                DisplayModeComponents::Compressor => {
+                    // TODO: Apply 'Simple' compressor values..
+                    self.mic_profile.set_compressor_display_mode(display);
+                }
+                DisplayModeComponents::EqFineTune => {
+                    self.mic_profile.set_eq_fine_display_mode(display);
+                }
+            },
+            // Colouring..
+            GoXLRCommand::SetAnimationMode(mode) => {
+                if !self.device_supports_animations() {
+                    bail!("Animations not supported on this firmware.");
+                }
+
+                if mode == goxlr_types::AnimationMode::Ripple && self.is_device_mini() {
+                    bail!("Ripple Mode not supported on the GoXLR Mini");
+                }
+
+                self.profile.set_animation_mode(mode)?;
+                self.load_animation(false).await?;
+            }
+            GoXLRCommand::SetAnimationMod1(value) => {
+                if !self.device_supports_animations() {
+                    bail!("Animations not supported on this firmware.");
+                }
+
+                self.profile.set_animation_mod1(value)?;
+                self.load_animation(false).await?;
+            }
+            GoXLRCommand::SetAnimationMod2(value) => {
+                if !self.device_supports_animations() {
+                    bail!("Animations not supported on this firmware.");
+                }
+
+                self.profile.set_animation_mod2(value)?;
+                self.load_animation(false).await?;
+            }
+            GoXLRCommand::SetAnimationWaterfall(direction) => {
+                if !self.device_supports_animations() {
+                    bail!("Animations not supported on this firmware.");
+                }
+
+                self.profile.set_animation_waterfall(direction)?;
+                self.load_animation(false).await?;
+            }
+            GoXLRCommand::SetGlobalColour(colour) => {
+                self.profile.set_global_colour(colour)?;
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+                self.set_all_fader_display_from_profile()?;
+            }
+            GoXLRCommand::SetFaderDisplayStyle(fader, display) => {
+                self.profile.set_fader_display(fader, display);
+                self.set_fader_display_from_profile(fader)?;
+            }
+            GoXLRCommand::SetFaderColours(fader, top, bottom) => {
+                // Need to get the fader colour map, and set values..
+                self.profile.set_fader_colours(fader, top, bottom)?;
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::SetAllFaderColours(top, bottom) => {
+                // I considered this as part of SetFaderColours, but spamming a new colour map
+                // for every fader change seemed excessive, this allows us to set them all before
+                // reloading.
+                for fader in FaderName::iter() {
+                    self.profile
+                        .set_fader_colours(fader, top.to_owned(), bottom.to_owned())?;
+                }
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::SetAllFaderDisplayStyle(display_style) => {
+                for fader in FaderName::iter() {
+                    self.profile.set_fader_display(fader, display_style);
+                    self.set_fader_display_from_profile(fader)?;
+                }
+            }
+            GoXLRCommand::SetButtonColours(target, colour, colour2) => {
+                self.profile
+                    .set_button_colours(target, colour, colour2.as_ref())?;
+
+                // Reload the colour map and button states..
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetButtonOffStyle(target, off_style) => {
+                self.profile.set_button_off_style(target, off_style);
+
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetButtonGroupColours(target, colour, colour_2) => {
+                self.profile
+                    .set_group_button_colours(target, colour, colour_2)?;
+
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetButtonGroupOffStyle(target, off_style) => {
+                self.profile.set_group_button_off_style(target, off_style)?;
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetSimpleColour(target, colour) => {
+                self.profile.set_simple_colours(target, colour)?;
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetEncoderColour(target, colour, colour_2, colour_3) => {
+                self.profile
+                    .set_encoder_colours(target, colour, colour_2, colour_3)?;
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::SetSampleColour(target, colour, colour_2, colour_3) => {
+                self.profile
+                    .set_sampler_colours(target, colour, colour_2, colour_3)?;
+                self.profile.sync_sample_if_active(target)?;
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::SetSampleOffStyle(target, style) => {
+                self.profile.set_sampler_off_style(target, style);
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetScribbleIcon(fader, icon) => {
+                self.profile.set_scribble_icon(fader, icon);
+                self.apply_scribble(fader).await?;
+            }
+            GoXLRCommand::SetScribbleText(fader, text) => {
+                self.profile.set_scribble_text(fader, text);
+                self.apply_scribble(fader).await?;
+            }
+            GoXLRCommand::SetScribbleNumber(fader, number) => {
+                self.profile.set_scribble_number(fader, number);
+                self.apply_scribble(fader).await?;
+            }
+            GoXLRCommand::SetScribbleInvert(fader, inverted) => {
+                self.profile.set_scribble_inverted(fader, inverted);
+                self.apply_scribble(fader).await?;
+            }
+            other => bail!("Not a lighting command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// The sampler: samples, playback and recording.
+    async fn perform_sampler_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            // Sampler..
+            GoXLRCommand::ClearSampleProcessError() => {
+                self.last_sample_error = None;
+            }
+            GoXLRCommand::SetSamplerFunction(bank, button, function) => {
+                self.profile.set_sampler_function(bank, button, function);
+            }
+            GoXLRCommand::SetSamplerOrder(bank, button, order) => {
+                self.profile.set_sampler_play_order(bank, button, order);
+            }
+            GoXLRCommand::AddSample(bank, button, filename) => {
+                let path = self
+                    .get_path_for_sample(PathBuf::from(filename.clone()))
+                    .await?;
+
+                // If we have an audio handler, try to calcuate the Gain..
+                if let Some(audio_handler) = &mut self.audio_handler {
+                    if audio_handler.is_calculating() {
+                        bail!("Gain Calculation already in progress..");
+                    }
+
+                    // V2 Here, this technically still blocks in it's current state, however, it
+                    // doesn't have to anymore.
+                    audio_handler.calculate_gain_thread(path, bank, button)?;
+                }
+
+                // Update the lighting..
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::SetSampleStartPercent(bank, button, index, percent) => {
+                self.profile
+                    .set_sample_start_pct(bank, button, index, percent)?;
+            }
+            GoXLRCommand::SetSampleStopPercent(bank, button, index, percent) => {
+                self.profile
+                    .set_sample_stop_pct(bank, button, index, percent)?;
+            }
+            GoXLRCommand::RemoveSampleByIndex(bank, button, index) => {
+                let remaining = self
+                    .profile
+                    .remove_sample_file_by_index(bank, button, index)?;
+
+                if remaining == 0 {
+                    self.load_colour_map().await?;
+                }
+            }
+            GoXLRCommand::PlaySampleByIndex(bank, button, index) => {
+                self.play_audio_file(
+                    bank,
+                    button,
+                    self.profile.get_track_by_index(bank, button, index)?,
+                    false,
+                )
+                .await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::PlayNextSample(bank, button) => {
+                let track = self.profile.get_track_by_bank_button(bank, button)?;
+                self.play_audio_file(bank, button, track, false).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::StartSampleRecording(bank, button) => {
+                if bank != self.profile.get_active_sample_bank() {
+                    bail!("Recording is only possible on the active bank");
+                }
+                let Some(audio) = &self.audio_handler else {
+                    bail!("The sampler isn't available");
+                };
+                if audio.is_sample_recording() {
+                    bail!("A sample is already being recorded");
+                }
+                if self.profile.current_sample_bank_has_samples(button) {
+                    bail!("Only an empty button can record");
+                }
+                let file_date = Local::now().format("%Y-%m-%dT%H%M%S").to_string();
+                self.record_audio_file(button, format!("Recording_{file_date}.wav"))
+                    .await?;
+                self.load_colour_map().await?;
+            }
+            GoXLRCommand::StopSampleRecording(bank, button) => {
+                if bank != self.profile.get_active_sample_bank() {
+                    bail!("Recording is only possible on the active bank");
+                }
+                self.finish_recording(button).await?;
+            }
+            GoXLRCommand::StopSamplePlayback(bank, button) => {
+                self.stop_sample_playback(bank, button).await?;
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SetActiveSamplerBank(bank) => {
+                self.load_sample_bank(bank).await?;
+                self.load_colour_map().await?;
+                self.update_button_states()?;
+            }
+            other => bail!("Not a sampler command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// Profiles and mic profiles: create, load, save, rename, delete.
+    async fn perform_profile_command(&mut self, command: GoXLRCommand) -> Result<()> {
+        match command {
+            // Profiles
+            GoXLRCommand::NewProfile(profile_name) => {
+                self.stop_all_samples(true, true).await?;
+                let profile_directory = self.settings.get_profile_directory().await;
+                let volumes = self.profile.get_current_state();
+
+                // Do a new file verification check..
+                ProfileAdapter::can_create_new_file(profile_name.clone(), &profile_directory)?;
+
+                // Force load the default embedded profile..
+                self.profile = ProfileAdapter::default();
+                self.apply_profile(Some(volumes)).await?;
+
+                // Save the profile under a new name (although, don't overwrite if exists!)
+                let path = self.settings.get_profile_directory().await;
+                self.profile.save_as(profile_name.clone(), &path, false)?;
+
+                // Save the profile in the settings
+                self.settings
+                    .set_device_profile_name(self.serial(), profile_name.as_str())
+                    .await;
+                self.settings.save().await;
+            }
+            GoXLRCommand::LoadProfile(profile_name, save_change) => {
+                self.stop_all_samples(true, true).await?;
+                let volumes = self.profile.get_current_state();
+
+                // Grab the needed Paths..
+                let profile_path = self.settings.get_profile_directory().await;
+                let backup_path = self.settings.get_backup_directory().await;
+
+                self.profile =
+                    load_with_backup(&profile_name, &profile_path, &backup_path, save_change)?;
+
+                self.apply_profile(Some(volumes)).await?;
+                if save_change {
+                    self.settings
+                        .set_device_profile_name(self.serial(), self.profile.name())
+                        .await;
+                    self.settings.save().await;
+                }
+            }
+            GoXLRCommand::LoadProfileColours(profile_name) => {
+                debug!("Loading Colours For Profile: {}", profile_name);
+                let profile_path = self.settings.get_profile_directory().await;
+                let profile = ProfileAdapter::from_named(profile_name, &profile_path)?;
+                debug!("Profile Loaded, Applying Colours..");
+                self.profile.load_colour_profile(profile);
+
+                if self.device_supports_animations() {
+                    self.load_animation(false).await?;
+                } else {
+                    self.load_colour_map().await?;
+                }
+                self.update_button_states()?;
+            }
+            GoXLRCommand::SaveProfile() => {
+                let profile_directory = self.settings.get_profile_directory().await;
+                let backups = self.settings.get_backup_directory().await;
+                let file = named_file_path(&profile_directory, self.profile.name(), "goxlr")?;
+                keep_history(&file, &backups);
+                self.profile.save(&profile_directory, true)?;
+            }
+            GoXLRCommand::SaveProfileAs(profile_name) => {
+                let path = self.settings.get_profile_directory().await;
+
+                // Do a new file verification check..
+                ProfileAdapter::can_create_new_file(profile_name.clone(), &path)?;
+                self.profile.save_as(profile_name.clone(), &path, false)?;
+
+                // Save the new name in the settings
+                self.settings
+                    .set_device_profile_name(self.serial(), profile_name.as_str())
+                    .await;
+
+                self.settings.save().await;
+            }
+            GoXLRCommand::DeleteProfile(name) => {
+                if self.profile.name() == name {
+                    bail!("Unable to Remove Active Profile!");
+                }
+
+                let profiles = self.settings.get_profile_directory().await;
+                let backups = self.settings.get_backup_directory().await;
+                // Kept in the profile trash, so it can be restored.
+                trash_profile(&profiles, &backups, &name, false)?;
+                self.profile.delete_profile(name.clone(), &backups)?;
+            }
+            GoXLRCommand::RenameProfile(from, to) => {
+                let profiles = self.settings.get_profile_directory().await;
+                rename_named_file(&profiles, &from, &to, "goxlr")?;
+                // The backup copy follows, it's only a convenience
+                let backups = self.settings.get_backup_directory().await;
+                let _ = rename_named_file(&backups, &from, &to, "goxlr");
+                if self.profile.name() == from {
+                    self.profile.set_name(to.clone());
+                    self.settings
+                        .set_device_profile_name(self.serial(), to.as_str())
+                        .await;
+                    self.settings.save().await;
+                }
+            }
+            GoXLRCommand::DuplicateProfile(from, to) => {
+                let profiles = self.settings.get_profile_directory().await;
+                duplicate_named_file(&profiles, &from, &to, "goxlr")?;
+            }
+            GoXLRCommand::NewMicProfile(mic_profile_name) => {
+                let mic_profile_directory = self.settings.get_mic_profile_directory().await;
+
+                // Verify we can create this file..
+                MicProfileAdapter::can_create_new_file(
+                    mic_profile_name.clone(),
+                    &mic_profile_directory,
+                )?;
+
+                // As above, load the default profile, then save as a new profile.
+                self.mic_profile = MicProfileAdapter::default();
+                self.mic_profile.save_as(
+                    mic_profile_name.clone(),
+                    &mic_profile_directory,
+                    false,
+                )?;
+
+                // Send the default mic settings to the device, so it matches the new profile.
+                self.apply_mic_profile().await?;
+
+                // Save the new name in the settings
+                self.settings
+                    .set_device_mic_profile_name(self.serial(), mic_profile_name.as_str())
+                    .await;
+
+                self.settings.save().await;
+            }
+            GoXLRCommand::LoadMicProfile(name, persist) => {
+                // Grab the needed Paths..
+                let path = self.settings.get_mic_profile_directory().await;
+                let backup = self.settings.get_backup_directory().await;
+
+                self.mic_profile = load_with_backup(&name, &path, &backup, persist)?;
+                self.apply_mic_profile().await?;
+
+                if persist {
+                    self.settings
+                        .set_device_mic_profile_name(self.serial(), self.mic_profile.name())
+                        .await;
+                    self.settings.save().await;
+                }
+            }
+            GoXLRCommand::SaveMicProfile() => {
+                let mic_profile_directory = self.settings.get_mic_profile_directory().await;
+                let backups = self.settings.get_backup_directory().await;
+                let name = self.mic_profile.name();
+                let file = named_file_path(&mic_profile_directory, name, "goxlrMicProfile")?;
+                keep_history(&file, &backups);
+                self.mic_profile.save(&mic_profile_directory, true)?;
+            }
+            GoXLRCommand::SaveMicProfileAs(name) => {
+                let path = self.settings.get_mic_profile_directory().await;
+                MicProfileAdapter::can_create_new_file(name.clone(), &path)?;
+
+                self.mic_profile.save_as(name.clone(), &path, false)?;
+
+                // Save the new name in the settings
+                self.settings
+                    .set_device_mic_profile_name(self.serial(), &name)
+                    .await;
+
+                self.settings.save().await;
+            }
+            GoXLRCommand::DeleteMicProfile(profile_name) => {
+                if self.mic_profile.name() == profile_name {
+                    bail!("Unable to Remove Active Profile!");
+                }
+
+                let profile_directory = self.settings.get_mic_profile_directory().await;
+                let backups = self.settings.get_backup_directory().await;
+                // Kept in the profile trash, so it can be restored.
+                trash_profile(&profile_directory, &backups, &profile_name, true)?;
+            }
+            GoXLRCommand::RenameMicProfile(from, to) => {
+                let profiles = self.settings.get_mic_profile_directory().await;
+                rename_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
+                let backups = self.settings.get_backup_directory().await;
+                let _ = rename_named_file(&backups, &from, &to, "goxlrMicProfile");
+                if self.mic_profile.name() == from {
+                    self.mic_profile.set_name(to.clone());
+                    self.settings
+                        .set_device_mic_profile_name(self.serial(), to.as_str())
+                        .await;
+                    self.settings.save().await;
+                }
+            }
+            GoXLRCommand::DuplicateMicProfile(from, to) => {
+                let profiles = self.settings.get_mic_profile_directory().await;
+                duplicate_named_file(&profiles, &from, &to, "goxlrMicProfile")?;
+            }
+            other => bail!("Not a profile command: {:?}", other),
         }
         Ok(())
     }
