@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod audio;
+pub mod editor;
 pub mod player;
 pub mod recorder;
 mod ringbuffer;

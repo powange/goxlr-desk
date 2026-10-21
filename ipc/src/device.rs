@@ -435,13 +435,37 @@ pub struct Files {
     pub mic_profiles: Vec<String>,
     pub presets: Vec<String>,
     pub samples: BTreeMap<String, SampleFile>,
+    // Every folder below the samples directory, so empty ones can be shown too.
+    #[serde(default)]
+    pub sample_folders: Vec<String>,
+    // Deleted samples and folders, which can be restored.
+    #[serde(default)]
+    pub sample_trash: Vec<SampleTrashItem>,
     pub icons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleTrashItem {
+    pub id: String,
+    // Where it was, relative to the samples directory ('/' separated)
+    pub path: String,
+    // When it was deleted (seconds since the epoch)
+    pub deleted_at: u64,
+    pub folder: bool,
+    // How many samples it contains (1 for a file)
+    pub files: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SampleFile {
     pub name: String,
     pub gain_pct: u8,
+    // File size in bytes
+    #[serde(default)]
+    pub size: u64,
+    // Length in seconds, when the file says it
+    #[serde(default)]
+    pub duration: Option<f32>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]

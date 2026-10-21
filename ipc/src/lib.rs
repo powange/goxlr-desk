@@ -29,6 +29,10 @@ pub enum DaemonRequest {
     RunFirmwareUpdate(String, Option<PathBuf>, bool),
     ContinueFirmwareUpdate(String),
     ClearFirmwareState(String),
+
+    // Which profiles use the sample file(s) at this path (a file, or a folder's content),
+    // relative to the samples directory. Answered with SampleUsage.
+    GetSampleUsage(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +43,15 @@ pub enum DaemonResponse {
     MicLevel(f64),
     Status(DaemonStatus),
     Patch(Patch),
+    SampleUsage(SampleUsage),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleUsage {
+    // How many sample files are at the path (1 for a file, the content of a folder)
+    pub files: usize,
+    // The profiles using any of them
+    pub profiles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +144,33 @@ pub enum DaemonCommand {
     SetSampleGainPct(String, u8),
     ApplySampleChange,
 
+    // Sample file management, paths are relative to the samples directory ('/' separated).
+    CreateSampleFolder(String),
+    // Moves or renames a sample file or folder: (from, to)
+    MoveSamplePath(String, String),
+    // Moves a sample file, or a folder and everything in it, to the sample trash
+    DeleteSamplePath(String),
+    // Puts an item from the sample trash back where it was (trash item id)
+    RestoreSampleTrash(String),
+    // Deletes an item from the sample trash for good, or everything when None
+    EmptySampleTrash(Option<String>),
+    // Copies a sample next to itself, with a free name such as 'name (2).wav'
+    DuplicateSample(String),
+    // Edits a sample and saves it as WAV, either replacing the file (the original goes to the
+    // trash), or as a new file with the given name in the same folder: (path, edit, new name)
+    EditSampleFile(String, SampleEdit, Option<String>),
+
     HandleMacOSAggregates(bool),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SampleEdit {
+    // Parts to remove, as (start, end) times in seconds
+    #[serde(default)]
+    pub remove: Vec<(f64, f64)>,
+    // Raise or lower the volume so the loudest peak is at -1dB
+    #[serde(default)]
+    pub normalize: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

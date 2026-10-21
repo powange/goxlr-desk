@@ -440,6 +440,11 @@ impl<'a> Device<'a> {
         }
     }
 
+    /// A sample file was renamed, point the loaded profile's sampler tracks at the new name.
+    pub fn rename_sample_file(&mut self, old: &str, new: &str) -> bool {
+        self.profile.rename_sample_file(old, new)
+    }
+
     pub fn profile(&self) -> &ProfileAdapter {
         &self.profile
     }
