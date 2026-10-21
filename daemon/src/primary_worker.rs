@@ -173,6 +173,8 @@ pub async fn spawn_usb_handler(
     // Devices are opened on a blocking thread (it takes a few seconds), one at a time, so this
     // loop keeps answering requests meanwhile.
     let (attach_tx, mut attach_rx) = mpsc::channel::<AttachResult>(1);
+    // Then their profiles are applied in a task of their own, the device comes back here
+    let (loaded_tx, mut loaded_rx) = mpsc::channel::<(DeviceKey, Result<Device>)>(1);
 
     // Slow sample operations run in the background and report back here.
     let (sample_job_tx, mut sample_job_rx) = mpsc::channel::<SampleJobDone>(16);
@@ -310,23 +312,31 @@ pub async fn spawn_usb_handler(
                 detection_sleep.as_mut().reset(tokio::time::Instant::now() + detection_duration);
             },
             Some((key, started, attached)) = attach_rx.recv() => {
-                attaching = false;
-                let loaded = match attached {
+                match attached {
                     Ok((handled_device, hardware)) => {
+                        // The profiles are applied in their own task (a few seconds of USB
+                        // requests), this loop keeps answering meanwhile
                         info!("Attached GoXLR {} in {:?}, loading profiles..", hardware.serial_number, started.elapsed());
-                        let profile_start = Instant::now();
-                        let loaded = load_device(handled_device, hardware, global_tx.clone(), &settings).await;
-                        if let Ok(device) = &loaded {
-                            info!(
-                                "GoXLR {} ready, profiles applied in {:?} ({:?} after it was found)",
-                                device.serial(), profile_start.elapsed(), started.elapsed()
-                            );
-                        }
-                        loaded
+                        let (settings, global_tx, loaded_tx) = (settings.clone(), global_tx.clone(), loaded_tx.clone());
+                        tokio::spawn(async move {
+                            let profile_start = Instant::now();
+                            let loaded = load_device(handled_device, hardware, global_tx, &settings).await;
+                            if let Ok(device) = &loaded {
+                                info!(
+                                    "GoXLR {} ready, profiles applied in {:?} ({:?} after it was found)",
+                                    device.serial(), profile_start.elapsed(), started.elapsed()
+                                );
+                            }
+                            let _ = loaded_tx.send((key, loaded)).await;
+                        });
                     }
-                    Err(error) => Err(error),
-                };
-
+                    Err(error) => {
+                        let _ = loaded_tx.send((key, Err(error))).await;
+                    }
+                }
+            },
+            Some((key, loaded)) = loaded_rx.recv() => {
+                attaching = false;
                 match loaded {
                     Ok(device) => {
                         let serial = String::from(device.serial());
