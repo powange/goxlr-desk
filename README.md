@@ -41,6 +41,8 @@ the
 * Fedora Atomic or Bazzite users please check the instructions
   [here](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Fedora-Atomic-&-Bazzite)
 * Windows users can also aquire the GoXLR Utility via `winget`
+* On Windows on ARM, spoken messages use Windows' own voice: the NVDA and System Access
+  libraries the Utility talks to screen readers with are only available for x64
 
 <sup>1</sup> Windows requires the official device drivers provided by TC-Helicon. If you have the official app
 installed you don't need to do anything, otherwise download the latest drivers from 

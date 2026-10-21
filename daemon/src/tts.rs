@@ -85,6 +85,12 @@ impl TTS {
                     if cfg!(target_os = "macos") {
                         let _ = tts.set_rate(tts.max_rate());
                     }
+                    if cfg!(all(windows, target_arch = "aarch64")) {
+                        // The screen reader libraries (NVDA, System Access) only exist for x64
+                        info!(
+                            "Windows on ARM: speaking with Windows' own voice, not the screen reader"
+                        );
+                    }
                     tts
                 }
                 Err(e) => {

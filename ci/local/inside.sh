@@ -65,7 +65,9 @@ build_windows() { # target suffix vc_redist_url
                 goxlr-launcher.exe goxlr-utility-ui.exe; do
         cp "$bin/$file" "$stage/target/release/"
     done
-    # Screen reader DLLs (tolk), next to the binaries
+    # Screen reader DLLs (tolk), next to the binaries. They only exist for x64: the ARM installer
+    # carries them too (the installer expects them), the ARM daemon can't load them and speaks
+    # with Windows' own voice (see the README).
     for dll in SAAPI64.dll nvdaControllerClient64.dll; do
         found=$(find "$bin" /cache/cargo/registry/src -name "$dll" -path "*x64*" 2>/dev/null | head -1 || true)
         [ -n "$found" ] || found=$(find "$bin" -name "$dll" | head -1)

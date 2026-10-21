@@ -78,7 +78,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             goxlr-utility/target
-          key: ${{ runner.os }}-${{ matrix.targets }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.targets }}-cargo-release-${{ hashFiles('goxlr-utility/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.targets }}-cargo-release-
 
       - name: "Build Utility"

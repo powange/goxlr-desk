@@ -136,6 +136,11 @@ var UseAppReg
 
 var WebViewInstalled
 
+; The choices of the 'Additional Tasks' page, "1" or "0". Set in .onInit (from what's in place, or
+; the defaults), so a silent install (/S), which shows no page, has them too.
+Var AUTO_START
+Var USE_APP
+
 !macro GetRegKeys un
     Function ${un}GetRegKeys
         ClearErrors
@@ -193,6 +198,48 @@ var WebViewInstalled
 !insertmacro GetRegKeys ""
 !insertmacro GetRegKeys "un."
 
+; The name of the logon task the Utility creates for autostart (daemon/src/platform/windows.rs)
+!define AUTOSTART_TASK "GoXLR Utility"
+
+Function .onInit
+    Call GetRegKeys
+
+    ${If} $InstallDirSet == 1
+    ${AndIf} $InstallDir != ""
+        StrCpy $INSTDIR $InstallDir
+    ${EndIf}
+    ${If} $StartMenuPathSet == 1
+    ${AndIf} $StartMenuPath != ""
+        StrCpy $StartMenuFolder $StartMenuPath
+    ${Else}
+        StrCpy $StartMenuFolder "${PRODUCT_NAME}"
+    ${EndIf}
+
+    ; Autostart: what's really in place (the logon task, or the Startup shortcut of earlier
+    ; versions), whatever was chosen at the last install; the Utility's own setting changes it.
+    ; On a first install, on.
+    StrCpy $AUTO_START 1
+    ${If} $InstallDirSet == 1
+        StrCpy $AUTO_START 0
+        nsExec::Exec 'schtasks /Query /TN "${AUTOSTART_TASK}"'
+        Pop $0
+        ${If} $0 == 0
+            StrCpy $AUTO_START 1
+        ${EndIf}
+        SetShellVarContext current
+        ${If} ${FileExists} "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+            StrCpy $AUTO_START 1
+        ${EndIf}
+    ${EndIf}
+
+    ; The app (instead of the browser): as last time, on by default
+    StrCpy $USE_APP 1
+    ${If} $UseAppRegSet == 1
+    ${AndIf} $UseAppReg == 0
+        StrCpy $USE_APP 0
+    ${EndIf}
+FunctionEnd
+
 Function CheckDirectory
     StrCmp $InstallDirSet 1 0 END
         StrCpy $INSTDIR $InstallDir
@@ -213,21 +260,13 @@ Function PerformActions
 
     !insertmacro INSTALLOPTIONS_EXTRACT "post-install.ini"
 
-    ; Set any cached values..
-    StrCmp $AutoStartRegSet 1 0 USE_APP
-    !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 2" "State" $AutoStartReg
-
-    USE_APP:
-        StrCmp $UseAppRegSet 1 0 END
-        !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 3" "State" $UseAppReg
-
-    END:
+    ; The current choices (see .onInit)
+    !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 2" "State" $AUTO_START
+    !insertmacro INSTALLOPTIONS_WRITE "post-install.ini" "Field 3" "State" $USE_APP
     !insertmacro INSTALLOPTIONS_DISPLAY "post-install.ini"
 FunctionEnd
 
 Function PerformActionsLeave
-    var /GLOBAL AUTO_START
-    var /GLOBAL USE_APP
     !insertmacro INSTALLOPTIONS_READ $AUTO_START "post-install.ini" "Field 2" "State"
     !insertmacro INSTALLOPTIONS_READ $USE_APP "post-install.ini" "Field 3" "State"
 FunctionEnd
@@ -363,6 +402,7 @@ Section "MainSection" SEC01
     File "..\..\target\release\goxlr-defaults.exe"
     File "..\..\target\release\goxlr-launcher.exe"
     File "..\..\target\release\goxlr-utility-ui.exe"
+    ; Screen readers (x64 only: on ARM, Windows' own voice is used, see the README)
     File "..\..\target\release\SAAPI64.dll"
     File "..\..\target\release\nvdaControllerClient64.dll"
     File "..\..\LICENSE"
@@ -372,26 +412,28 @@ Section "MainSection" SEC01
     CreateDirectory "$SMPROGRAMS\$StartMenuFolder"
     CreateShortCut "$SMPROGRAMS\$StartMenuFolder\GoXLR Utility.lnk" "$INSTDIR\goxlr-launcher.exe"
 
-    StrCmp $AUTO_START 0 AUTO_START_OFF
-        ; Switch to Current User..
-        SetShellVarContext current
-        CreateShortCut "$SMPROGRAMS\Startup\GoXLR Utility.lnk" "$INSTDIR\goxlr-daemon.exe"
-        Goto POST_AUTO_START
-
-    AUTO_START_OFF:
-        ; Switch to Current User..
-        SetShellVarContext current
+    ; Autostart, for the current user. The Utility starts from a logon task; when there's none
+    ; yet, a Startup shortcut, which the Utility turns into the task on its first start. Never
+    ; both, or it would be started twice.
+    SetShellVarContext current
+    ${If} $AUTO_START == 1
+        nsExec::Exec 'schtasks /Query /TN "${AUTOSTART_TASK}"'
+        Pop $0
+        ${If} $0 == 0
+            Delete "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+        ${Else}
+            CreateShortCut "$SMPROGRAMS\Startup\GoXLR Utility.lnk" "$INSTDIR\goxlr-daemon.exe"
+        ${EndIf}
+    ${Else}
         Delete "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+        nsExec::Exec 'schtasks /Delete /TN "${AUTOSTART_TASK}" /F'
+    ${EndIf}
 
-    POST_AUTO_START:
-        StrCmp $USE_APP 0 REMOVE_APP
+    ${If} $USE_APP == 1
         nsExec::Exec "$INSTDIR\goxlr-utility-ui.exe --install"
-        Goto POST_OPTION
-
-    REMOVE_APP:
+    ${Else}
         nsExec::Exec "$INSTDIR\goxlr-utility-ui.exe --remove"
-
-    POST_OPTION:
+    ${EndIf}
 SectionEnd
 
 Section -Post
@@ -423,12 +465,29 @@ Section Uninstall
   Call un.StopUtility
   Call un.GetRegKeys
 
-  ; Nuke the directory, and everything in it.
-  RMDir /r $InstallDir
+  ; Only the files installed, then the folders if they're empty: nothing is removed recursively,
+  ; a missing or empty registry value can't point this at a folder holding anything else.
+  Delete "$INSTDIR\goxlr-daemon.exe"
+  Delete "$INSTDIR\goxlr-client.exe"
+  Delete "$INSTDIR\goxlr-client-quiet.exe"
+  Delete "$INSTDIR\goxlr-defaults.exe"
+  Delete "$INSTDIR\goxlr-launcher.exe"
+  Delete "$INSTDIR\goxlr-utility-ui.exe"
+  Delete "$INSTDIR\SAAPI64.dll"
+  Delete "$INSTDIR\nvdaControllerClient64.dll"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\LICENSE-3RD-PARTY"
+  Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR"
 
-  SetShellVarContext all
-  RMDir /r "$SMPROGRAMS\$StartMenuPath"
+  ${If} $StartMenuPath != ""
+      SetShellVarContext all
+      Delete "$SMPROGRAMS\$StartMenuPath\GoXLR Utility.lnk"
+      RMDir "$SMPROGRAMS\$StartMenuPath"
+  ${EndIf}
 
+  ; Autostart: the logon task and the shortcut of earlier versions
+  nsExec::Exec 'schtasks /Delete /TN "${AUTOSTART_TASK}" /F'
   SetShellVarContext current
   Delete "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
 

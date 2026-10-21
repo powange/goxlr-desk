@@ -450,9 +450,9 @@ pub enum NoiseGateCommands {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum CompressorCommands {
-    /// Activation Threshold in dB [-24 - 0]
+    /// Activation Threshold in dB [-40 - 0]
     Threshold {
-        #[arg(allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true, value_parser = value_parser!(i8).range(-40..=0))]
         value: i8,
     },
     /// Set the Compressor Ratio
