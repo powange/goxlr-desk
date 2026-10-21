@@ -49,7 +49,7 @@ use goxlr_usb::colouring::ColourTargets;
 
 use crate::audio::{AudioFile, AudioHandler};
 use crate::device::CurrentState;
-use crate::files::{can_create_new_file, named_file_path};
+use crate::files::{can_create_new_file, named_file_path, new_named_file_path};
 
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
 
@@ -143,13 +143,13 @@ impl ProfileAdapter {
     }
 
     pub fn can_create_new_file(name: String, directory: &Path) -> Result<()> {
-        let path = named_file_path(directory, &name, "goxlr")?;
+        let path = new_named_file_path(directory, &name, "goxlr")?;
         can_create_new_file(path)
     }
 
     pub fn save_as(&mut self, name: String, directory: &Path, overwrite: bool) -> Result<()> {
         // Check the name before adopting it, so a refused name doesn't rename this profile.
-        named_file_path(directory, &name, "goxlr")?;
+        new_named_file_path(directory, &name, "goxlr")?;
         self.name = name;
         self.save(directory, overwrite)
     }
@@ -166,7 +166,7 @@ impl ProfileAdapter {
     }
 
     pub fn write_preset(&mut self, name: String, directory: &Path) -> Result<()> {
-        let path = named_file_path(directory, &name, "preset")?;
+        let path = new_named_file_path(directory, &name, "preset")?;
         self.profile.save_preset(path)?;
         Ok(())
     }

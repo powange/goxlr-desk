@@ -7,6 +7,7 @@ use goxlr_ipc::SampleTrashItem;
 use goxlr_types::{SampleBank, SampleButtons};
 use log::warn;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,13 +77,16 @@ pub(crate) fn move_path(from: &Path, to: &Path) -> Result<()> {
         Err(e) if !crosses_devices(&e) => return Err(e.into()),
         Err(_) => {}
     }
+    move_by_copy(from, to)
+}
 
+fn move_by_copy(from: &Path, to: &Path) -> Result<()> {
     let kind = fs::symlink_metadata(from)?.file_type();
     if kind.is_dir() {
         fs::create_dir_all(to)?;
         for entry in fs::read_dir(from)? {
             let entry = entry?;
-            move_path(&entry.path(), &to.join(entry.file_name()))?;
+            move_by_copy(&entry.path(), &to.join(entry.file_name()))?;
         }
         fs::remove_dir(from)?;
     } else {
@@ -220,6 +224,28 @@ pub fn restore_trash_item(
     if target.exists() {
         bail!("{} already exists, rename or move it first", record.path);
     }
+    // Profiles find a sample by its file name alone, so a name used elsewhere would be ambiguous.
+    let mut names = Vec::new();
+    if item.is_dir() {
+        names.extend(recursive_file_list(item.clone(), SAMPLE_EXTENSIONS.to_vec()).into_values());
+    } else if let Some(name) = item.file_name() {
+        names.push(name.to_string_lossy().to_string());
+    }
+    let used: HashSet<String> =
+        recursive_file_list(samples.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
+            .into_values()
+            .map(|name| name.to_lowercase())
+            .collect();
+    let taken: Vec<String> = names
+        .into_iter()
+        .filter(|name| used.contains(&name.to_lowercase()))
+        .collect();
+    if !taken.is_empty() {
+        bail!(
+            "A sample named {} already exists, rename or move it first",
+            taken.join(", ")
+        );
+    }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -260,7 +286,8 @@ mod tests {
 
     #[test]
     fn trash_restore_and_empty() {
-        let root = std::env::temp_dir().join(format!("goxlr-test-trash-{}", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let samples = root.join("samples");
         let backups = root.join("backups");
         fs::create_dir_all(samples.join("Jingles")).unwrap();
@@ -325,7 +352,27 @@ mod tests {
         empty_trash(&backups, Some(&folder.id)).unwrap();
         assert!(list_trash(&backups).is_empty());
         empty_trash(&backups, None).unwrap();
+    }
 
-        fs::remove_dir_all(&root).unwrap();
+    #[test]
+    fn copies_across_drives_without_losing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        fs::create_dir_all(from.join("Sub")).unwrap();
+        fs::write(from.join("a.wav"), b"a").unwrap();
+        fs::write(from.join("Sub/b.wav"), b"b").unwrap();
+
+        move_by_copy(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(to.join("a.wav")).unwrap(), b"a");
+        assert_eq!(fs::read(to.join("Sub/b.wav")).unwrap(), b"b");
+
+        // A failure part way leaves what wasn't moved where it was
+        let (from, to) = (dir.path().join("from2"), dir.path().join("to2"));
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("a.wav"), b"a").unwrap();
+        fs::create_dir_all(to.join("a.wav")).unwrap(); // the copy of a.wav can't be written
+        assert!(move_by_copy(&from, &to).is_err());
+        assert_eq!(fs::read(from.join("a.wav")).unwrap(), b"a");
     }
 }

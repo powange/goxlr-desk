@@ -2112,6 +2112,7 @@ dependencies = [
  "strum",
  "sys-locale",
  "sysinfo",
+ "tempfile",
  "tokio",
  "tts",
  "which 8.0.6",
