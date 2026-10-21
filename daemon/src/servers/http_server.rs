@@ -344,7 +344,7 @@ async fn check_request_source(
             );
             return Err(ErrorUnauthorized(
                 "This GoXLR Utility needs an access link. On the computer running it, open \
-                 System > Utility Settings and use the network access link shown there.",
+                 System > Integrations and use the network access link shown there.",
             ));
         }
         if let (Some(token), Some((_, true))) = (token, presented) {
