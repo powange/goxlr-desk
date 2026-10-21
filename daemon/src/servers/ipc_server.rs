@@ -104,6 +104,25 @@ pub async fn bind_socket() -> Result<LocalSocketListener> {
     Ok(listener)
 }
 
+/// Whether the client runs as the daemon's user (the IPC can run programs, through the
+/// activator). On Windows the check isn't available, the named pipe's default access applies.
+#[cfg(unix)]
+fn same_user(connection: &LocalSocketStream) -> bool {
+    use interprocess::local_socket::traits::StreamCommon;
+    match connection.peer_creds() {
+        Ok(creds) => creds.euid() == Some(nix::unistd::geteuid().as_raw()),
+        Err(e) => {
+            warn!("Unable to check the IPC client's user: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn same_user(_connection: &LocalSocketStream) -> bool {
+    true
+}
+
 pub async fn spawn_ipc_server(
     listener: LocalSocketListener,
     usb_tx: DeviceSender,
@@ -113,6 +132,10 @@ pub async fn spawn_ipc_server(
     loop {
         tokio::select! {
             Ok(connection) = listener.accept() => {
+                if !same_user(&connection) {
+                    warn!("Refused an IPC connection from another user");
+                    continue;
+                }
                 let socket = Socket::new(connection);
                 let usb_tx = usb_tx.clone();
                 tokio::spawn(async move {

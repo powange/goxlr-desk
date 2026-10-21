@@ -792,7 +792,11 @@ async fn get_scribble(
 }
 
 #[get("/files/samples/{sample}")]
-async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) -> HttpResponse {
+async fn get_sample(
+    sample: web::Path<String>,
+    app_data: Data<RwLock<AppData>>,
+    req: HttpRequest,
+) -> HttpResponse {
     // Get the Base Samples Path..
     let sample_path = {
         let data = app_data.read().await;
@@ -808,29 +812,24 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     }
 
     debug!("Attempting to Find {:?} in {:?}", path, sample_path);
-    // Searching the samples folder and reading the file both block, keep them off the workers.
-    let found = web::block(move || {
-        let path = find_file_in_path(sample_path, path)?;
-        debug!("Found at {:?}", path);
-        // The file may have been removed, or be unreadable, since it was found.
-        match fs::read(&path) {
-            Ok(contents) => Some((path, contents)),
-            Err(error) => {
-                warn!("Unable to read sample {:?}: {}", path, error);
-                None
-            }
-        }
-    })
-    .await;
+    // Searching the samples folder blocks, keep it off the workers.
+    let found = web::block(move || find_file_in_path(sample_path, path)).await;
+    let Ok(Some(path)) = found else {
+        return HttpResponse::NotFound().finish();
+    };
+    debug!("Found at {:?}", path);
 
-    match found {
-        Ok(Some((path, contents))) => {
-            let mime_type = MimeGuess::from_path(path).first_or_octet_stream();
-            let mut builder = HttpResponse::Ok();
-            builder.insert_header(ContentType(mime_type));
-            builder.body(contents)
+    // Streamed from the disk, with Range requests (seeking in a long sample)
+    match actix_files::NamedFile::open_async(&path).await {
+        Ok(file) => file
+            .set_content_type(MimeGuess::from_path(&path).first_or_octet_stream())
+            .disable_content_disposition()
+            .into_response(&req),
+        // The file may have been removed, or be unreadable, since it was found.
+        Err(error) => {
+            warn!("Unable to read sample {:?}: {}", path, error);
+            HttpResponse::NotFound().finish()
         }
-        _ => HttpResponse::NotFound().finish(),
     }
 }
 
@@ -1124,12 +1123,38 @@ async fn import_samples(
     query: web::Query<HashMap<String, String>>,
     mut payload: Multipart,
     app_data: Data<RwLock<AppData>>,
+    req: HttpRequest,
 ) -> HttpResponse {
     let folder = query.get("folder").cloned().unwrap_or_default();
     let (base, mut usb_tx) = {
         let data = app_data.read().await;
         (data.file_paths.samples.clone(), data.usb_tx.clone())
     };
+
+    // Refuse an import that can't fit, rather than fill the disk part way through
+    let size = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(size) = size {
+        let free = {
+            let base = base.clone();
+            web::block(move || available_space(&base))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(free) = free
+            && size + FREE_SPACE_MARGIN > free
+        {
+            return HttpResponse::Ok().json(DaemonResponse::Error(format!(
+                "Not enough free disk space for this import ({} MB needed, {} MB free)",
+                size / (1024 * 1024),
+                free / (1024 * 1024)
+            )));
+        }
+    }
 
     let mut imported = 0;
     let mut total = 0;
@@ -1191,6 +1216,21 @@ async fn import_samples(
     } else {
         HttpResponse::Ok().json(DaemonResponse::Error(errors.join("\n")))
     }
+}
+
+// Space left free on the disk after an import
+const FREE_SPACE_MARGIN: u64 = 100 * 1024 * 1024;
+
+/// The free space of the disk holding a folder (the disk with the longest mount point above it).
+fn available_space(path: &Path) -> Option<u64> {
+    let path = path.canonicalize().ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
 }
 
 static IMPORT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

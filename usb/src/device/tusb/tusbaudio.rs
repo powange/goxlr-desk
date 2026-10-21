@@ -25,7 +25,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use windows::core::GUID;
 use winreg::RegKey;
-use winreg::enums::HKEY_CLASSES_ROOT;
+use winreg::enums::HKEY_LOCAL_MACHINE;
 
 use goxlr_types::VersionNumber;
 
@@ -61,17 +61,34 @@ lazy_static! {
 }
 
 fn locate_library() -> String {
-    let regpath = "CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
-    let classes_root = RegKey::predef(HKEY_CLASSES_ROOT);
-    if let Ok(folders) = classes_root.open_subkey(regpath) {
+    // HKLM only: HKEY_CLASSES_ROOT also reads the user's own classes (HKCU), which any program
+    // run by the user can change to load another DLL here. And only a DLL under Program Files,
+    // which needs an administrator to write.
+    let regpath =
+        "SOFTWARE\\Classes\\CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
+    let program_files: Vec<PathBuf> = ["ProgramW6432", "ProgramFiles"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    let trusted = |path: &PathBuf| {
+        path.canonicalize()
+            .is_ok_and(|real| program_files.iter().any(|base| real.starts_with(base)))
+    };
+    let machine = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(folders) = machine.open_subkey(regpath)
         // Name is blank because we need the default key
-        if let Ok(api) = folders.get_value::<String, &str>("") {
-            // Check the file exists..
-            if PathBuf::from(&api).exists() {
-                debug!("Located API From Registry at  {}", api);
-                return api;
-            }
+        && let Ok(api) = folders.get_value::<String, &str>("")
+    {
+        let path = PathBuf::from(&api);
+        if path.exists() && trusted(&path) {
+            debug!("Located API From Registry at  {}", api);
+            return api;
         }
+        warn!(
+            "Ignoring the GoXLR API registered at {}, it's not under Program Files",
+            api
+        );
     }
     // If we get here, we didn't find it, return a default and hope for the best!
     debug!("GoXLR API not found in registry, using default path.");

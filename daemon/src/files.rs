@@ -20,7 +20,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 
 use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
-use glob::{MatchOptions, Pattern, glob, glob_with};
 use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
@@ -360,31 +359,42 @@ fn create_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Resu
     Ok((watcher, rx))
 }
 
-/// Lists files with the given extensions below a path, keyed by their path relative to it.
+/// Every file below a directory, without following links (a link to a parent folder would loop,
+/// and one leading elsewhere would take files from outside it).
+fn walk_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            walk_files(&entry.path(), files);
+        } else if kind.is_file() {
+            files.push(entry.path());
+        }
+    }
+}
+
+/// Lists files with the given extensions (any case) below a path, keyed by their path relative
+/// to it.
 pub(crate) fn recursive_file_list(
     path: PathBuf,
     extensions: Vec<&str>,
 ) -> BTreeMap<String, String> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-
-    // Escape the directory, so names like '[Bob]' aren't treated as patterns.
-    let base = Pattern::escape(&path.to_string_lossy());
-    // 'Intro.WAV' is a sample too.
-    let options = MatchOptions {
-        case_sensitive: false,
-        ..MatchOptions::new()
-    };
-    for extension in extensions {
-        let format = format!("{base}/**/*.{extension}");
-        if let Ok(files) = glob_with(format.as_str(), options) {
-            // Skip entries that can't be read (eg. a folder without permission).
-            paths.extend(files.filter_map(|file| file.ok()));
-        }
-    }
+    let mut paths = Vec::new();
+    walk_files(&path, &mut paths);
 
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    // Ok, we need to split stuff up..
     for file_path in paths {
+        let wanted = file_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extensions.iter().any(|e| e.eq_ignore_ascii_case(extension)));
+        if !wanted {
+            continue;
+        }
         if let (Ok(relative), Some(name)) = (file_path.strip_prefix(&path), file_path.file_name()) {
             map.insert(
                 relative.to_string_lossy().to_string(),
@@ -402,13 +412,15 @@ fn collect_folders(base: &Path, directory: &Path, folders: &mut Vec<String>) {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Ok(relative) = path.strip_prefix(base) {
-                folders.push(relative.to_string_lossy().to_string());
-            }
-            collect_folders(base, &path, folders);
+        // Links aren't followed: one pointing to a parent folder would loop.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
         }
+        let path = entry.path();
+        if let Ok(relative) = path.strip_prefix(base) {
+            folders.push(relative.to_string_lossy().to_string());
+        }
+        collect_folders(base, &path, folders);
     }
 }
 
@@ -465,7 +477,29 @@ pub(crate) fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
     if parts == 0 {
         bail!("Invalid path: {:?}", relative);
     }
+    if !resolves_inside(base, &path) {
+        bail!("{:?} leads outside of the samples folder", relative);
+    }
     Ok(path)
+}
+
+/// Whether a path, once links are resolved, is still inside `base`. The part that doesn't exist
+/// yet (a file about to be created) is checked through its closest existing parent.
+fn resolves_inside(base: &Path, path: &Path) -> bool {
+    let Ok(base) = base.canonicalize() else {
+        // No samples folder yet: nothing below it can be a link
+        return true;
+    };
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return resolved.starts_with(&base);
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Like `sample_path`, for a path that's about to be created: its last part must be a valid
@@ -839,13 +873,15 @@ pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
         return None;
     }
 
-    // Both parts are escaped, so names like 'Song [Live].wav' are matched literally.
-    let format = format!(
-        "{}/**/{}",
-        Pattern::escape(&path.to_string_lossy()),
-        Pattern::escape(&file.to_string_lossy())
-    );
-    glob(format.as_str()).ok()?.find_map(|file| file.ok())
+    // The first file (in a stable order) whose path ends with the requested one.
+    let mut files = Vec::new();
+    walk_files(&path, &mut files);
+    files.sort();
+    files.into_iter().find(|candidate| {
+        candidate
+            .strip_prefix(&path)
+            .is_ok_and(|relative| relative.ends_with(&file))
+    })
 }
 
 pub fn create_path(path: &Path) -> Result<()> {
@@ -935,15 +971,9 @@ pub fn extract_defaults(file_type: PathTypes, path: &Path) -> Result<()> {
 
     let mut binary_path = None;
 
-    // There are three possible places to check for this, the CWD, the binary WD, and $PATH
-    let cwd = std::env::current_dir()?.join(binary_name.clone());
-    if cwd.exists() {
-        binary_path.replace(cwd);
-    }
-
-    if binary_path.is_none()
-        && let Some(parent) = std::env::current_exe()?.parent()
-    {
+    // Next to the daemon, then on $PATH (not the current folder: this can be asked for remotely,
+    // and would run whatever program of that name sits there)
+    if let Some(parent) = std::env::current_exe()?.parent() {
         let bin = parent.join(binary_name.clone());
         if bin.exists() {
             binary_path.replace(bin);
@@ -1276,6 +1306,34 @@ mod name_tests {
         assert!(exists_exactly(&base.join("Intro.wav")));
         assert!(!exists_exactly(&base.join("intro.wav")));
         assert_eq!(fs::read(base.join("Intro.wav")).unwrap(), b"intro");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let base = dir.path().join("samples");
+        fs::create_dir_all(base.join("Jingles")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(base.join("Jingles/intro.wav"), b"").unwrap();
+        fs::write(outside.join("secret.wav"), b"").unwrap();
+        // A loop back to the samples folder, and a way out of it
+        std::os::unix::fs::symlink(&base, base.join("Jingles/loop")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("away")).unwrap();
+
+        let names: Vec<String> = recursive_file_list(base.clone(), SAMPLE_EXTENSIONS.to_vec())
+            .into_values()
+            .collect();
+        assert_eq!(names, vec!["intro.wav".to_string()]);
+        let mut folders = Vec::new();
+        collect_folders(&base, &base, &mut folders);
+        assert_eq!(folders, vec!["Jingles".to_string()]);
+
+        assert!(sample_path(&base, "away/secret.wav").is_err());
+        assert!(sample_path(&base, "away/new.wav").is_err());
+        assert!(sample_path(&base, "Jingles/new.wav").is_ok());
+        assert!(find_file_in_path(base.clone(), PathBuf::from("secret.wav")).is_none());
     }
 
     #[test]

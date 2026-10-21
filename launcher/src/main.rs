@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{Result, bail};
-use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use goxlr_ipc::client::Client;
@@ -19,7 +18,7 @@ static DAEMON_NAME: &str = "goxlr-daemon";
 #[tokio::main]
 async fn main() -> Result<()> {
     // First thing to do, is check to see if the Daemon is running..
-    if !is_daemon_running() {
+    if !daemon_answers().await {
         launch_daemon()?;
     }
 
@@ -82,17 +81,20 @@ fn launch_daemon() -> Result<()> {
     bail!("Unable to Locate GoXLR Daemon Binary");
 }
 
-fn is_daemon_running() -> bool {
-    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
-
-    let process_refresh_kind = ProcessRefreshKind::everything().without_tasks();
-    let refresh_kind = RefreshKind::nothing().with_processes(process_refresh_kind);
-    let system = System::new_with_specifics(refresh_kind);
-
-    let binding = get_daemon_binary_name();
-    let processes = system.processes_by_exact_name(OsStr::new(&binding));
-
-    processes.count() > 0
+/// Whether this user's daemon is running: it answers on its socket. (Looking for a process of
+/// that name would also find another user's daemon.)
+async fn daemon_answers() -> bool {
+    let Ok(connection) = get_connection().await else {
+        return false;
+    };
+    let mut socket: Socket<DaemonResponse, DaemonRequest> = Socket::new(connection);
+    if socket.send(DaemonRequest::Ping).await.is_err() {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), socket.read()).await,
+        Ok(Some(Ok(_)))
+    )
 }
 
 #[cfg(windows)]
@@ -141,14 +143,10 @@ fn locate_daemon_binary() -> Option<PathBuf> {
     let mut binary_path = None;
     let bin_name = get_daemon_binary_name();
 
-    // There are three possible places to check for this, the CWD, the binary WD, and $PATH
-    let cwd = std::env::current_dir().unwrap().join(bin_name.clone());
-    if cwd.exists() {
-        binary_path.replace(cwd);
-    }
-
-    if binary_path.is_none()
-        && let Some(parent) = std::env::current_exe().unwrap().parent()
+    // Next to this program, then on $PATH. Not the current folder: starting the launcher from
+    // Downloads or a clone would run whatever daemon sits there.
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
     {
         let bin = parent.join(bin_name.clone());
         if bin.exists() {

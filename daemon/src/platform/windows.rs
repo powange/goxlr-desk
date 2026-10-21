@@ -15,7 +15,7 @@ use tokio::{select, time};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
 use winreg::RegKey;
-use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winrt_toast_reborn::content::audio::Sound;
 use winrt_toast_reborn::{Audio, Toast, ToastDuration, ToastManager};
 
@@ -318,15 +318,28 @@ fn get_startup_dir() -> Option<PathBuf> {
 }
 
 fn locate_goxlr_driver() -> bool {
-    let regpath = "CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
-    let classes_root = RegKey::predef(HKEY_CLASSES_ROOT);
-    if let Ok(folders) = classes_root.open_subkey(regpath) {
+    // HKLM only: HKEY_CLASSES_ROOT also reads the user's own classes (HKCU), which any program
+    // run by the user can change to load another DLL here. And only a DLL under Program Files,
+    // which needs an administrator to write.
+    let regpath =
+        "SOFTWARE\\Classes\\CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
+    let program_files: Vec<PathBuf> = ["ProgramW6432", "ProgramFiles"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    let trusted = |path: &PathBuf| {
+        path.canonicalize()
+            .is_ok_and(|real| program_files.iter().any(|base| real.starts_with(base)))
+    };
+    let machine = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(folders) = machine.open_subkey(regpath)
         // Name is blank because we need the default key
-        if let Ok(api) = folders.get_value::<String, &str>("") {
-            // Check the file exists..
-            if PathBuf::from(&api).exists() {
-                return true;
-            }
+        && let Ok(api) = folders.get_value::<String, &str>("")
+    {
+        let path = PathBuf::from(&api);
+        if path.exists() && trusted(&path) {
+            return true;
         }
     }
     // If we get here, we didn't find it, return a default and hope for the best!
