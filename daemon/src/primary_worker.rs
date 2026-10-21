@@ -14,7 +14,7 @@ use crate::profile_trash::{
     empty_profile_trash, list_profile_trash, purge_profile_trash, restore_profile,
 };
 use crate::sample_trash::{
-    empty_trash, list_trash, purge_trash, restore_trash_item, trash_sample_path,
+    TrashedTrack, empty_trash, list_trash, purge_trash, restore_trash_item, trash_sample_path,
 };
 use crate::{
     FIRMWARE_PATHS, FileManager, PatchEvent, SYSTEM_LOCALE, SettingsHandle, Shutdown, VERSION,
@@ -38,7 +38,7 @@ use reqwest::{ClientBuilder, StatusCode};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -162,6 +162,11 @@ pub async fn spawn_usb_handler(
     // Devices are opened on a blocking thread (it takes a few seconds), one at a time, so this
     // loop keeps answering requests meanwhile.
     let (attach_tx, mut attach_rx) = mpsc::channel::<AttachResult>(1);
+
+    // Slow sample operations run in the background and report back here.
+    let (sample_job_tx, mut sample_job_rx) = mpsc::channel::<SampleJobDone>(16);
+    // Samples being edited, so the same file isn't edited twice at once.
+    let mut busy_samples: HashSet<String> = HashSet::new();
     let mut attaching = false;
 
     let mut files = get_files(&mut file_manager, &settings).await;
@@ -538,19 +543,16 @@ pub async fn spawn_usb_handler(
                             }
                             DaemonCommand::MoveSamplePath(from, to) => {
                                 let base = settings.get_samples_directory().await;
-                                let result = match move_sample_path(&base, &from, &to) {
-                                    Ok(Some(renamed)) => {
-                                        apply_sample_rename(&renamed, &mut devices, &settings).await;
-                                        Ok(())
+                                let profiles = settings.get_profile_directory().await;
+                                // Renaming rewrites the saved profiles, which is slow: done in the
+                                // background, the result comes back through sample_job_rx.
+                                spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
+                                    let renamed = move_sample_path(&base, &from, &to)?;
+                                    if let Some(renamed) = &renamed {
+                                        rename_in_saved_profiles(&profiles, renamed);
                                     }
-                                    Ok(None) => Ok(()),
-                                    Err(e) => Err(e),
-                                };
-                                if result.is_ok() {
-                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
-                                    change_found = true;
-                                }
-                                let _ = sender.send(result);
+                                    Ok(SampleJobOutput { renamed, ..Default::default() })
+                                });
                             }
                             DaemonCommand::DeleteSamplePath(path) => {
                                 let base = settings.get_samples_directory().await;
@@ -564,29 +566,21 @@ pub async fn spawn_usb_handler(
                                     .flat_map(|device| device.trashed_tracks(&names))
                                     .collect();
                                 // Kept in the trash (with its gain setting), so it can be restored.
-                                let result = trash_sample_path(&base, &backups, &path, tracks);
-                                if result.is_ok() {
+                                // A move to another drive copies files, so it's done in the background.
+                                spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
+                                    trash_sample_path(&base, &backups, &path, tracks)?;
                                     info!("Moved sample path {} to the trash", path);
-                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
-                                    change_found = true;
-                                }
-                                let _ = sender.send(result);
+                                    Ok(SampleJobOutput::default())
+                                });
                             }
                             DaemonCommand::RestoreSampleTrash(id) => {
                                 let base = settings.get_samples_directory().await;
                                 let backups = settings.get_backup_directory().await;
-                                let result = restore_trash_item(&base, &backups, &id);
-                                if let Ok((path, tracks)) = &result {
+                                spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
+                                    let (path, tracks) = restore_trash_item(&base, &backups, &id)?;
                                     info!("Restored sample path {} from the trash", path);
-                                    for device in devices.values_mut() {
-                                        if let Err(e) = device.restore_trashed_tracks(tracks).await {
-                                            warn!("Unable to put the restored sample back on the sampler: {}", e);
-                                        }
-                                    }
-                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
-                                    change_found = true;
-                                }
-                                let _ = sender.send(result.map(|_| ()));
+                                    Ok(SampleJobOutput { tracks, ..Default::default() })
+                                });
                             }
                             DaemonCommand::RestoreProfileTrash(id) => {
                                 let profiles = settings.get_profile_directory().await;
@@ -639,23 +633,22 @@ pub async fn spawn_usb_handler(
                                 let _ = sender.send(result);
                             }
                             DaemonCommand::EditSampleFile(path, edit, save_as) => {
-                                let base = settings.get_samples_directory().await;
-                                let backups = settings.get_backup_directory().await;
-                                let result = match edit_sample_file(&base, &backups, &path, &edit, save_as.as_deref()) {
-                                    Ok(renamed) => {
-                                        if let Some(renamed) = renamed {
-                                            apply_sample_rename(&renamed, &mut devices, &settings).await;
+                                if !busy_samples.insert(path.clone()) {
+                                    let _ = sender.send(Err(anyhow!("{} is already being edited", path)));
+                                } else {
+                                    let base = settings.get_samples_directory().await;
+                                    let backups = settings.get_backup_directory().await;
+                                    let profiles = settings.get_profile_directory().await;
+                                    // Decoding and writing audio takes a while: done in the background.
+                                    spawn_sample_job(sample_job_tx.clone(), Some(path.clone()), sender, move || {
+                                        let renamed = edit_sample_file(&base, &backups, &path, &edit, save_as.as_deref())?;
+                                        if let Some(renamed) = &renamed {
+                                            rename_in_saved_profiles(&profiles, renamed);
                                         }
                                         info!("Edited sample {} ({} part(s) removed, normalized: {})", path, edit.remove.len(), edit.normalize);
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(e),
-                                };
-                                if result.is_ok() {
-                                    files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
-                                    change_found = true;
+                                        Ok(SampleJobOutput { renamed, ..Default::default() })
+                                    });
                                 }
-                                let _ = sender.send(result);
                             }
                             DaemonCommand::ApplySampleChange => {
                                 // Change is committed, save it..
@@ -711,22 +704,34 @@ pub async fn spawn_usb_handler(
                     DeviceCommand::GetSampleUsage(path, sender) => {
                         let base = settings.get_samples_directory().await;
                         let profile_directory = settings.get_profile_directory().await;
-                        let result = sample_names_at(&base, &path).map(|names| {
-                            let names: HashSet<String> = names.into_iter().collect();
-                            let mut profiles: BTreeSet<String> =
-                                saved_profiles_using_samples(&profile_directory, &names).into_iter().collect();
-                            // The loaded profiles may have changes that aren't saved yet.
-                            for device in devices.values() {
-                                if device.profile().uses_sample_file(&names) {
-                                    profiles.insert(device.profile().name().to_string());
-                                }
+                        match sample_names_at(&base, &path) {
+                            Err(e) => {
+                                let _ = sender.send(Err(e));
                             }
-                            SampleUsage {
-                                files: names.len(),
-                                profiles: profiles.into_iter().collect(),
+                            Ok(names) => {
+                                let names: HashSet<String> = names.into_iter().collect();
+                                // The loaded profiles may have changes that aren't saved yet.
+                                let loaded: BTreeSet<String> = devices
+                                    .values()
+                                    .filter(|device| device.profile().uses_sample_file(&names))
+                                    .map(|device| device.profile().name().to_string())
+                                    .collect();
+                                // Reading every saved profile is slow, so it's done in the background.
+                                tokio::spawn(async move {
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        let mut profiles = loaded;
+                                        profiles.extend(saved_profiles_using_samples(&profile_directory, &names));
+                                        SampleUsage {
+                                            files: names.len(),
+                                            profiles: profiles.into_iter().collect(),
+                                        }
+                                    })
+                                    .await
+                                    .map_err(|e| anyhow!("Unable to check the sample usage: {}", e));
+                                    let _ = sender.send(result);
+                                });
                             }
-                        });
-                        let _ = sender.send(result);
+                        }
                     }
                     DeviceCommand::GetDeviceMicLevel(serial, sender) => {
                         if let Some(device) = devices.get_mut(&serial) {
@@ -825,6 +830,32 @@ pub async fn spawn_usb_handler(
                     }
                 }
             },
+            Some(done) = sample_job_rx.recv() => {
+                if let Some(key) = &done.key {
+                    busy_samples.remove(key);
+                }
+                let result = match done.result {
+                    Ok(output) => {
+                        if let Some(renamed) = &output.renamed {
+                            for device in devices.values_mut() {
+                                device.rename_sample_file(&renamed.old_name, &renamed.new_name);
+                            }
+                            settings.rename_sample_gain(&renamed.old_name, &renamed.new_name).await;
+                            settings.save().await;
+                        }
+                        for device in devices.values_mut() {
+                            if let Err(e) = device.restore_trashed_tracks(&output.tracks).await {
+                                warn!("Unable to put the restored sample back on the sampler: {}", e);
+                            }
+                        }
+                        files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
+                        change_found = true;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = done.sender.send(result);
+            }
             Some(path) = file_rx.recv() => {
                 // Notify devices if Samples have changed..
                 if path == PathTypes::Samples {
@@ -963,24 +994,80 @@ fn get_app_path(app_check: &mut Option<String>) -> bool {
 
 /// A sample file was renamed. Profiles reference samples by file name, so update them all: the
 /// ones loaded on devices and the ones saved on disk, and keep the sample's gain.
-async fn apply_sample_rename(
-    renamed: &RenamedSample,
-    devices: &mut HashMap<String, Device<'_>>,
-    settings: &SettingsHandle,
-) {
-    let (old, new) = (&renamed.old_name, &renamed.new_name);
-    for device in devices.values_mut() {
-        device.rename_sample_file(old, new);
-    }
-    let profiles = settings.get_profile_directory().await;
-    let changed = rename_sample_in_saved_profiles(&profiles, old, new);
+/// What a background sample job changed, applied by the worker loop once it's done.
+#[derive(Default)]
+struct SampleJobOutput {
+    // A sample file renamed: loaded profiles and the gain setting follow it
+    renamed: Option<RenamedSample>,
+    // Sampler tracks to put back (a sample restored from the trash)
+    tracks: Vec<TrashedTrack>,
+}
+
+struct SampleJobDone {
+    // The sample being edited, if the job holds one
+    key: Option<String>,
+    sender: oneshot::Sender<Result<()>>,
+    result: Result<SampleJobOutput>,
+}
+
+/// Runs slow sample work (file I/O, audio decoding, saved profiles) on a blocking thread, so the
+/// worker loop keeps driving the devices; the result is applied when it comes back.
+fn spawn_sample_job<F>(
+    tx: mpsc::Sender<SampleJobDone>,
+    key: Option<String>,
+    sender: oneshot::Sender<Result<()>>,
+    job: F,
+) where
+    F: FnOnce() -> Result<SampleJobOutput> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(job)
+            .await
+            .unwrap_or_else(|e| Err(anyhow!("The sample operation failed: {}", e)));
+        let _ = tx
+            .send(SampleJobDone {
+                key,
+                sender,
+                result,
+            })
+            .await;
+    });
+}
+
+/// Points the saved profiles at a renamed sample file (slow: every profile is read).
+fn rename_in_saved_profiles(profiles: &Path, renamed: &RenamedSample) {
+    let changed = rename_sample_in_saved_profiles(profiles, &renamed.old_name, &renamed.new_name);
     info!(
         "Renamed sample {} to {}, updated profiles: {:?}",
-        old, new, changed
+        renamed.old_name, renamed.new_name, changed
     );
+}
 
-    settings.rename_sample_gain(old, new).await;
-    settings.save().await;
+// Sample durations, kept while a file keeps the same size and modification time, so a rescan
+// doesn't read every file again.
+type DurationCache = HashMap<PathBuf, (u64, Option<std::time::SystemTime>, Option<f32>)>;
+static SAMPLE_DURATIONS: std::sync::Mutex<Option<DurationCache>> = std::sync::Mutex::new(None);
+
+fn sample_size_and_duration(path: &Path) -> (u64, Option<f32>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (0, None);
+    };
+    let (size, modified) = (metadata.len(), metadata.modified().ok());
+    if let Ok(cache) = SAMPLE_DURATIONS.lock()
+        && let Some(cache) = cache.as_ref()
+        && let Some((cached_size, cached_modified, duration)) = cache.get(path)
+        && *cached_size == size
+        && *cached_modified == modified
+    {
+        return (size, *duration);
+    }
+    let duration = probe_duration(path).map(|d| d as f32);
+    if let Ok(mut cache) = SAMPLE_DURATIONS.lock() {
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), (size, modified, duration));
+    }
+    (size, duration)
 }
 
 async fn get_sample_files(
@@ -1001,8 +1088,7 @@ async fn get_sample_files(
         }
 
         let path = base.join(&key);
-        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or_default();
-        let duration = probe_duration(&path).map(|d| d as f32);
+        let (size, duration) = sample_size_and_duration(&path);
         samples.insert(
             key,
             SampleFile {

@@ -20,13 +20,12 @@ use mime_guess::mime::IMAGE_PNG;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use sysinfo::System;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{RwLock, oneshot};
@@ -780,25 +779,30 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     }
 
     debug!("Attempting to Find {:?} in {:?}", path, sample_path);
-    let file = find_file_in_path(sample_path, path);
-    if let Some(path) = file {
+    // Searching the samples folder and reading the file both block, keep them off the workers.
+    let found = web::block(move || {
+        let path = find_file_in_path(sample_path, path)?;
         debug!("Found at {:?}", path);
-        let mime_type = MimeGuess::from_path(path.clone()).first_or_octet_stream();
-        return match fs::read(&path) {
-            Ok(contents) => {
-                let mut builder = HttpResponse::Ok();
-                builder.insert_header(ContentType(mime_type));
-                builder.body(contents)
-            }
-            // The file may have been removed, or be unreadable, since it was found.
+        // The file may have been removed, or be unreadable, since it was found.
+        match fs::read(&path) {
+            Ok(contents) => Some((path, contents)),
             Err(error) => {
                 warn!("Unable to read sample {:?}: {}", path, error);
-                HttpResponse::NotFound().finish()
+                None
             }
-        };
-    }
+        }
+    })
+    .await;
 
-    HttpResponse::NotFound().finish()
+    match found {
+        Ok(Some((path, contents))) => {
+            let mime_type = MimeGuess::from_path(path).first_or_octet_stream();
+            let mut builder = HttpResponse::Ok();
+            builder.insert_header(ContentType(mime_type));
+            builder.body(contents)
+        }
+        _ => HttpResponse::NotFound().finish(),
+    }
 }
 
 /// Imports audio files (multipart, one or more files) into a samples folder, given relative to
@@ -839,7 +843,13 @@ async fn import_samples(
             .unwrap_or_default()
             .to_string();
 
-        let result = match import_sample_target(&base, &folder, &file_name) {
+        let target = {
+            let (base, folder, file_name) = (base.clone(), folder.clone(), file_name.clone());
+            web::block(move || import_sample_target(&base, &folder, &file_name))
+                .await
+                .unwrap_or_else(|e| Err(anyhow!("{e}")))
+        };
+        let result = match target {
             Ok(target) => write_imported_sample(&mut field, &target, MAX_IMPORT_TOTAL - total)
                 .await
                 .map(|size| total += size),
@@ -889,10 +899,11 @@ async fn write_imported_sample(
         std::process::id(),
         IMPORT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let mut file = OpenOptions::new()
+    let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&temp)?;
+        .open(&temp)
+        .await?;
 
     let mut size = 0;
     let written: Result<()> = async {
@@ -907,19 +918,20 @@ async fn write_imported_sample(
                     "The import is too large, import fewer files at once"
                 ));
             }
-            file.write_all(&data)?;
+            file.write_all(&data).await?;
         }
-        file.sync_all()?;
-        if target.exists() {
+        file.sync_all().await?;
+        drop(file);
+        if tokio::fs::try_exists(target).await? {
             return Err(anyhow!("{} already exists", name.to_string_lossy()));
         }
-        fs::rename(&temp, target)?;
+        tokio::fs::rename(&temp, target).await?;
         Ok(())
     }
     .await;
 
     if written.is_err() {
-        let _ = fs::remove_file(&temp);
+        let _ = tokio::fs::remove_file(&temp).await;
     }
     written.map(|_| size)
 }
@@ -957,10 +969,11 @@ async fn upload_firmware(
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let file_path = env::temp_dir().join(format!("goxlr-firmware-{serial}-{timestamp}.bin"));
-    let mut file = match OpenOptions::new()
+    let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&file_path)
+        .await
     {
         Ok(f) => f,
         Err(e) => {
@@ -978,7 +991,7 @@ async fn upload_firmware(
                         HttpResponse::PayloadTooLarge(),
                         "File is too large to be a firmware",
                     ))
-                } else if let Err(e) = file.write_all(&data) {
+                } else if let Err(e) = file.write_all(&data).await {
                     Some(
                         HttpResponse::InternalServerError()
                             .body(format!("Failed to write file: {e}")),
@@ -993,9 +1006,14 @@ async fn upload_firmware(
         };
         if let Some(response) = error {
             drop(file);
-            let _ = fs::remove_file(&file_path);
+            let _ = tokio::fs::remove_file(&file_path).await;
             return response;
         }
+    }
+    if let Err(e) = file.flush().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return HttpResponse::InternalServerError().body(format!("Failed to write file: {e}"));
     }
     drop(file);
 

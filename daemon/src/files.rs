@@ -21,7 +21,7 @@ use log::{debug, info, warn};
 
 use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
 use glob::{Pattern, glob};
-use goxlr_audio::editor::DecodedAudio;
+use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
 use goxlr_profile_loader::atomic::atomic_write;
@@ -231,6 +231,9 @@ impl FileManager {
     }
 }
 
+// How long the file watcher waits for things to settle before reporting a change.
+const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 pub async fn spawn_file_notification_service(
     paths: FilePaths,
     sender: Sender<PathTypes>,
@@ -262,12 +265,22 @@ pub async fn spawn_file_notification_service(
         warn!("Unable to Monitor the Samples Path: {:?}", error);
     }
 
+    // Changes come in bursts (an import, a folder moved, a file written then renamed), so they're
+    // gathered and sent once nothing changed for a short while, rather than once per event.
+    let mut pending: Vec<PathTypes> = Vec::new();
+    let mut deadline = tokio::time::Instant::now();
+
     // Wait for any changes..
     loop {
         tokio::select! {
             () = shutdown_signal.recv() => {
                 debug!("Shutdown Signal Received.");
                 break;
+            },
+            () = tokio::time::sleep_until(deadline), if !pending.is_empty() => {
+                for path_type in pending.drain(..) {
+                    let _ = sender.send(path_type).await;
+                }
             },
             result = rx.recv() => {
                 if let Some(result) = result {
@@ -289,30 +302,32 @@ pub async fn spawn_file_notification_service(
                                 EventKind::Modify(ModifyKind::Name(RenameMode::To)) |
                                 EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
 
-                                    let path = &event.paths[0];
-                                    if path.starts_with(&paths.profiles) {
-                                        let _ = sender.send(PathTypes::Profiles).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.mic_profiles) {
-                                        let _ = sender.send(PathTypes::MicProfiles).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.icons) {
-                                        let _ = sender.send(PathTypes::Icons).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.presets) {
-                                        let _ = sender.send(PathTypes::Presets).await;
-                                        continue;
-                                    }
-
-                                    if path.starts_with(&paths.samples) {
-                                        let _ = sender.send(PathTypes::Samples).await;
-                                        continue;
+                                    for path in &event.paths {
+                                        // Hidden temporary files (.name.tmp, .name.import) come
+                                        // and go during writes, the final rename is what counts.
+                                        let hidden = path
+                                            .file_name()
+                                            .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+                                        if hidden {
+                                            continue;
+                                        }
+                                        let path_type = if path.starts_with(&paths.profiles) {
+                                            PathTypes::Profiles
+                                        } else if path.starts_with(&paths.mic_profiles) {
+                                            PathTypes::MicProfiles
+                                        } else if path.starts_with(&paths.icons) {
+                                            PathTypes::Icons
+                                        } else if path.starts_with(&paths.presets) {
+                                            PathTypes::Presets
+                                        } else if path.starts_with(&paths.samples) {
+                                            PathTypes::Samples
+                                        } else {
+                                            continue;
+                                        };
+                                        if !pending.contains(&path_type) {
+                                            pending.push(path_type);
+                                        }
+                                        deadline = tokio::time::Instant::now() + WATCH_DEBOUNCE;
                                     }
                                 },
 
@@ -598,6 +613,14 @@ pub fn edit_sample_file(
         }
     }
 
+    // Refuse long files before decoding them all into memory.
+    if probe_duration(&source).is_some_and(|seconds| seconds > MAX_EDIT_SECONDS as f64) {
+        bail!(
+            "{} is longer than {} minutes, which is too long to edit",
+            relative,
+            MAX_EDIT_SECONDS / 60
+        );
+    }
     let mut audio =
         DecodedAudio::decode(&source).context(format!("Unable to read {}", relative))?;
     audio.remove_ranges(&edit.remove)?;
