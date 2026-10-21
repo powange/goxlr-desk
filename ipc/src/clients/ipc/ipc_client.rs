@@ -52,6 +52,9 @@ impl Client for IPCClient {
             DaemonResponse::SampleUsage(_usage) => Err(anyhow!(
                 "Received Sample Usage as response, shouldn't happen!"
             )),
+            DaemonResponse::NetworkAccess(_access) => Err(anyhow!(
+                "Received Network Access as response, shouldn't happen!"
+            )),
         }
     }
 

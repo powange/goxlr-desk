@@ -2,7 +2,7 @@ use actix_cors::Cors;
 use actix_multipart::Multipart;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServerHandle, ServiceRequest, ServiceResponse};
-use actix_web::error::ErrorForbidden;
+use actix_web::error::{ErrorForbidden, ErrorUnauthorized};
 use actix_web::http::header;
 use actix_web::http::header::ContentType;
 use actix_web::middleware::{Condition, Next, from_fn};
@@ -50,6 +50,93 @@ const MAX_FIRMWARE_SIZE: usize = 64 * 1024 * 1024;
 
 // The largest audio file that can be imported as a sample.
 const MAX_SAMPLE_SIZE: usize = 512 * 1024 * 1024;
+// Limits for one import request, so a client can't fill the disk in one go.
+const MAX_IMPORT_FILES: usize = 200;
+const MAX_IMPORT_TOTAL: usize = 2 * 1024 * 1024 * 1024;
+
+// The cookie that holds the network access token, set when a link with ?token= is opened.
+const ACCESS_COOKIE: &str = "goxlr_access";
+
+/// Compares without stopping at the first difference, so the time taken doesn't tell how much
+/// of a guessed token was right.
+fn same_token(given: &str, token: &str) -> bool {
+    given.len() == token.len()
+        && given
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+}
+
+/// The token a request presents: its cookie, a `token` query parameter, or a Bearer header.
+/// Returns it with whether it came from the query (the cookie is then set on the response).
+fn presented_token(req: &ServiceRequest) -> Option<(String, bool)> {
+    let cookie = req
+        .headers()
+        .get_all(header::COOKIE)
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == ACCESS_COOKIE).then(|| value.to_string())
+        });
+    if let Some(cookie) = cookie {
+        return Some((cookie, false));
+    }
+    if let Some(value) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some(token) = value.strip_prefix("Bearer ")
+    {
+        return Some((token.trim().to_string(), false));
+    }
+    req.query_string()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+        .map(|token| (token.to_string(), true))
+}
+
+/// Commands a client without an origin (the Stream Deck plugin, but also any web page through
+/// a sandboxed frame) may send: controlling the mixer, nothing that writes to disk. Anything
+/// not listed, including commands added later, is refused.
+fn allowed_without_origin(command: &GoXLRCommand) -> bool {
+    matches!(
+        command,
+        GoXLRCommand::SetFader(..)
+            | GoXLRCommand::SetFaderMuteFunction(..)
+            | GoXLRCommand::SetFaderMuteState(..)
+            | GoXLRCommand::SetVolume(..)
+            | GoXLRCommand::SetRouter(..)
+            | GoXLRCommand::SetCoughMuteFunction(..)
+            | GoXLRCommand::SetCoughIsHold(..)
+            | GoXLRCommand::SetCoughMuteState(..)
+            | GoXLRCommand::SetSwearButtonVolume(..)
+            | GoXLRCommand::SetSubMixEnabled(..)
+            | GoXLRCommand::SetSubMixVolume(..)
+            | GoXLRCommand::SetSubMixLinked(..)
+            | GoXLRCommand::SetSubMixOutputMix(..)
+            | GoXLRCommand::SetMonitorMix(..)
+            | GoXLRCommand::LoadProfile(..)
+            | GoXLRCommand::LoadMicProfile(..)
+            | GoXLRCommand::LoadProfileColours(..)
+            | GoXLRCommand::LoadEffectPreset(..)
+            | GoXLRCommand::SetActiveEffectPreset(..)
+            | GoXLRCommand::SetActiveSamplerBank(..)
+            | GoXLRCommand::SetFXEnabled(..)
+            | GoXLRCommand::SetMegaphoneEnabled(..)
+            | GoXLRCommand::SetRobotEnabled(..)
+            | GoXLRCommand::SetHardTuneEnabled(..)
+            | GoXLRCommand::SetReverbAmount(..)
+            | GoXLRCommand::SetEchoAmount(..)
+            | GoXLRCommand::SetPitchAmount(..)
+            | GoXLRCommand::SetGenderAmount(..)
+            | GoXLRCommand::SetGateActive(..)
+            | GoXLRCommand::PlaySampleByIndex(..)
+            | GoXLRCommand::PlayNextSample(..)
+            | GoXLRCommand::StopSamplePlayback(..)
+    )
+}
 
 /// Decides which requests may reach the HTTP server. Browsers let any web page send requests to
 /// localhost (WebSockets and form posts aren't blocked by CORS), so we check the Host and Origin
@@ -169,14 +256,7 @@ impl RequestSource {
                 DaemonRequest::Ping | DaemonRequest::GetStatus | DaemonRequest::GetMicLevel(_) => {
                     true
                 }
-                DaemonRequest::Command(_, command) => !matches!(
-                    command,
-                    GoXLRCommand::DeleteProfile(_)
-                        | GoXLRCommand::DeleteMicProfile(_)
-                        | GoXLRCommand::SetShutdownCommands(_)
-                        | GoXLRCommand::SetSleepCommands(_)
-                        | GoXLRCommand::SetWakeCommands(_)
-                ),
+                DaemonRequest::Command(_, command) => allowed_without_origin(command),
                 _ => false,
             };
             if !allowed {
@@ -191,6 +271,11 @@ impl RequestSource {
                 }
                 DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
                     return Some("A firmware file on disk can only be flashed from this computer");
+                }
+                DaemonRequest::GetNetworkAccess
+                | DaemonRequest::Daemon(DaemonCommand::RegenerateNetworkToken)
+                | DaemonRequest::Daemon(DaemonCommand::SetAllowNetworkAccess(_)) => {
+                    return Some("Network access can only be managed from this computer");
                 }
                 _ => {}
             }
@@ -234,7 +319,43 @@ async fn check_request_source(
         warn!("Rejected HTTP request to {} ({})", req.path(), details);
         return Err(ErrorForbidden("Request rejected, unknown Host or Origin"));
     }
-    next.call(req).await
+
+    // Other machines (network access) need the access token.
+    let local = req
+        .peer_addr()
+        .is_some_and(|addr| addr.ip().to_canonical().is_loopback());
+    let mut set_cookie = None;
+    if !local {
+        let token = crate::settings::network_token();
+        let presented = presented_token(&req);
+        let valid = match (&token, &presented) {
+            (Some(token), Some((given, _))) => same_token(given, token),
+            _ => false,
+        };
+        if !valid {
+            warn!(
+                "Rejected HTTP request to {} from the network without a valid access token",
+                req.path()
+            );
+            return Err(ErrorUnauthorized(
+                "This GoXLR Utility needs an access link. On the computer running it, open \
+                 System > Utility Settings and use the network access link shown there.",
+            ));
+        }
+        if let (Some(token), Some((_, true))) = (token, presented) {
+            set_cookie = Some(format!(
+                "{ACCESS_COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict"
+            ));
+        }
+    }
+
+    let mut response = next.call(req).await?;
+    if let Some(cookie) = set_cookie
+        && let Ok(value) = header::HeaderValue::from_str(&cookie)
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    Ok(response)
 }
 
 struct AppData {
@@ -258,6 +379,9 @@ pub async fn spawn_http_server(
     settings: HttpSettings,
     file_paths: FilePaths,
 ) {
+    // Imports interrupted by a crash leave hidden temporary files, remove them.
+    crate::files::remove_stale_imports(&file_paths.samples);
+
     // Create the AppData ONCE, outside the closure
     let app_data = Data::new(RwLock::new(AppData {
         broadcast_tx: broadcast_tx.clone(),
@@ -692,8 +816,16 @@ async fn import_samples(
     };
 
     let mut imported = 0;
+    let mut total = 0;
     let mut errors = Vec::new();
     while let Some(field) = payload.next().await {
+        if imported + errors.len() >= MAX_IMPORT_FILES || total >= MAX_IMPORT_TOTAL {
+            errors.push(format!(
+                "Only {MAX_IMPORT_FILES} files or {} MB can be imported at once, import the rest separately",
+                MAX_IMPORT_TOTAL / (1024 * 1024)
+            ));
+            break;
+        }
         let mut field = match field {
             Ok(field) => field,
             Err(e) => {
@@ -708,7 +840,9 @@ async fn import_samples(
             .to_string();
 
         let result = match import_sample_target(&base, &folder, &file_name) {
-            Ok(target) => write_imported_sample(&mut field, &target).await,
+            Ok(target) => write_imported_sample(&mut field, &target, MAX_IMPORT_TOTAL - total)
+                .await
+                .map(|size| total += size),
             Err(e) => {
                 // Read the rest of this file, so the next one can be read.
                 while let Some(Ok(_)) = field.next().await {}
@@ -737,12 +871,24 @@ async fn import_samples(
     }
 }
 
-/// Writes an uploaded file next to its target, then moves it into place.
-async fn write_imported_sample(field: &mut actix_multipart::Field, target: &PathBuf) -> Result<()> {
+static IMPORT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes an uploaded file next to its target, then moves it into place. Returns its size.
+async fn write_imported_sample(
+    field: &mut actix_multipart::Field,
+    target: &PathBuf,
+    remaining: usize,
+) -> Result<usize> {
     let Some(name) = target.file_name() else {
         return Err(anyhow!("Invalid file name"));
     };
-    let temp = target.with_file_name(format!(".{}.import", name.to_string_lossy()));
+    // A unique name, so a file left behind by a crash never blocks importing this name.
+    let temp = target.with_file_name(format!(
+        ".{}.{}-{}.import",
+        name.to_string_lossy(),
+        std::process::id(),
+        IMPORT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -755,6 +901,11 @@ async fn write_imported_sample(field: &mut actix_multipart::Field, target: &Path
             size += data.len();
             if size > MAX_SAMPLE_SIZE {
                 return Err(anyhow!("The file is too large"));
+            }
+            if size > remaining {
+                return Err(anyhow!(
+                    "The import is too large, import fewer files at once"
+                ));
             }
             file.write_all(&data)?;
         }
@@ -770,7 +921,7 @@ async fn write_imported_sample(field: &mut actix_multipart::Field, target: &Path
     if written.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    written
+    written.map(|_| size)
 }
 
 #[post("/firmware-upload/{serial}")]
@@ -946,6 +1097,64 @@ mod tests {
         assert!(policy.is_origin_allowed("file://", host));
         assert!(!policy.is_origin_allowed("file://evil.com", host));
         assert!(!policy.is_origin_allowed("http://localhost:14564", None));
+    }
+
+    #[test]
+    fn writes_to_disk_are_refused_without_origin() {
+        let opaque = RequestSource {
+            local_peer: true,
+            opaque_origin: true,
+        };
+        let refused = |command: GoXLRCommand| {
+            opaque
+                .refused_reason(&DaemonRequest::Command("S1".into(), command))
+                .is_some()
+        };
+        assert!(refused(GoXLRCommand::SaveProfile()));
+        assert!(refused(GoXLRCommand::SaveMicProfile()));
+        assert!(refused(GoXLRCommand::SaveActivePreset()));
+        assert!(refused(GoXLRCommand::RenameActivePreset("x".into())));
+        assert!(refused(GoXLRCommand::NewProfile("x".into())));
+        assert!(refused(GoXLRCommand::DeleteProfile("x".into())));
+        assert!(refused(GoXLRCommand::SetMicrophoneGain(
+            goxlr_types::MicrophoneType::Dynamic,
+            70
+        )));
+        assert!(!refused(GoXLRCommand::SetFXEnabled(true)));
+        assert!(
+            opaque
+                .refused_reason(&DaemonRequest::GetNetworkAccess)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn network_access_is_local_only() {
+        let remote = RequestSource {
+            local_peer: false,
+            opaque_origin: false,
+        };
+        assert!(
+            remote
+                .refused_reason(&DaemonRequest::GetNetworkAccess)
+                .is_some()
+        );
+        assert!(
+            remote
+                .refused_reason(&DaemonRequest::Daemon(
+                    DaemonCommand::RegenerateNetworkToken
+                ))
+                .is_some()
+        );
+        assert!(remote.refused_reason(&DaemonRequest::GetStatus).is_none());
+    }
+
+    #[test]
+    fn tokens_compare() {
+        assert!(same_token("abc123", "abc123"));
+        assert!(!same_token("abc124", "abc123"));
+        assert!(!same_token("abc12", "abc123"));
+        assert!(!same_token("", "abc123"));
     }
 
     #[test]

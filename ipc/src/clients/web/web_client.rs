@@ -46,6 +46,9 @@ impl Client for WebClient {
             DaemonResponse::Patch(_patch) => {
                 bail!("Received Patch as response, shouldn't happen!")
             }
+            DaemonResponse::NetworkAccess(_access) => {
+                bail!("Received Network Access as response, shouldn't happen!")
+            }
             DaemonResponse::SampleUsage(_usage) => {
                 bail!("Received Sample Usage as response, shouldn't happen!")
             }

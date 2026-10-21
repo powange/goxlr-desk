@@ -26,6 +26,34 @@ pub fn take_load_warning() -> Option<String> {
     LOAD_WARNING.lock().ok()?.take()
 }
 
+// The network access token, readable without the async settings lock (the HTTP server checks
+// it on every request from another machine).
+static NETWORK_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn network_token() -> Option<String> {
+    NETWORK_TOKEN.lock().ok()?.clone()
+}
+
+fn publish_token(token: &Option<String>) {
+    if let Ok(mut current) = NETWORK_TOKEN.lock() {
+        current.clone_from(token);
+    }
+}
+
+/// 32 random hex characters.
+fn new_token() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        // No randomness available: still unique, much weaker. Shouldn't happen.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes = nanos.to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// 'settings.json' + 'bak' -> 'settings.json.bak'
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = OsString::from(path.as_os_str());
@@ -80,6 +108,7 @@ impl SettingsHandle {
                 selected_locale: None,
                 tts_enabled: Some(false),
                 allow_network_access: Some(false),
+                network_token: None,
                 macos_handle_aggregates: None,
                 profile_directory: None,
                 mic_profile_directory: None,
@@ -173,6 +202,12 @@ impl SettingsHandle {
             settings.devices = Some(Default::default());
         }
 
+        // Network access needs a token for other machines.
+        if settings.allow_network_access == Some(true) && settings.network_token.is_none() {
+            settings.network_token = Some(new_token());
+        }
+        publish_token(&settings.network_token);
+
         let handle = SettingsHandle {
             path,
             data_dir: data_dir.to_path_buf(),
@@ -254,6 +289,23 @@ impl SettingsHandle {
     pub async fn set_allow_network_access(&self, enabled: bool) {
         let mut settings = self.settings.write().await;
         settings.allow_network_access = Some(enabled);
+        if enabled && settings.network_token.is_none() {
+            settings.network_token = Some(new_token());
+        }
+        publish_token(&settings.network_token);
+    }
+
+    pub async fn get_network_token(&self) -> Option<String> {
+        self.settings.read().await.network_token.clone()
+    }
+
+    /// Replaces the network access token: links given out before stop working.
+    pub async fn regenerate_network_token(&self) -> String {
+        let mut settings = self.settings.write().await;
+        let token = new_token();
+        settings.network_token = Some(token.clone());
+        publish_token(&settings.network_token);
+        token
     }
 
     pub async fn set_macos_handle_aggregates(&self, enabled: bool) {
@@ -735,6 +787,8 @@ pub struct Settings {
     selected_locale: Option<String>,
     tts_enabled: Option<bool>,
     allow_network_access: Option<bool>,
+    // Needed by other machines on the network to use the interface (see network_token())
+    network_token: Option<String>,
     macos_handle_aggregates: Option<bool>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,

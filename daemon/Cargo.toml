@@ -24,6 +24,9 @@ goxlr-scribbles = { path = "../scribbles" }
 # Used to know the machine's hostname (HTTP Host checks), and for process checks under Windows
 sysinfo = { workspace = true }
 
+# Random access tokens for network access
+getrandom = "0.3.4"
+
 # Common Workspace
 log = { workspace = true }
 anyhow = { workspace = true }

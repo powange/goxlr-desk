@@ -24,9 +24,9 @@ use enum_map::EnumMap;
 use goxlr_audio::editor::probe_duration;
 use goxlr_ipc::{
     Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
-    FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale, PathTypes,
-    Paths, ProfileTrashItem, SampleFile, SampleTrashItem, SampleUsage, UpdateState,
-    UsbProductInformation,
+    FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
+    NetworkAccess, PathTypes, Paths, ProfileTrashItem, SampleFile, SampleTrashItem, SampleUsage,
+    UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::{FullGoXLRDevice, GoXLRDevice};
@@ -79,6 +79,7 @@ pub enum DeviceCommand {
     RunDeviceCommand(String, GoXLRCommand, oneshot::Sender<Result<()>>),
     GetDeviceMicLevel(String, oneshot::Sender<Result<f64>>),
     GetSampleUsage(String, oneshot::Sender<Result<SampleUsage>>),
+    GetNetworkAccess(oneshot::Sender<NetworkAccess>),
     RunFirmwareUpdate(String, Option<PathBuf>, bool, oneshot::Sender<Result<()>>),
     ContinueFirmwareUpdate(String, oneshot::Sender<Result<()>>),
     ClearFirmwareState(String, oneshot::Sender<Result<()>>),
@@ -505,6 +506,12 @@ pub async fn spawn_usb_handler(
                                 change_found = true;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::RegenerateNetworkToken => {
+                                settings.regenerate_network_token().await;
+                                settings.save().await;
+                                info!("A new network access token was made, older links stop working");
+                                let _ = sender.send(Ok(()));
+                            }
                             DaemonCommand::SetAllowNetworkAccess(enabled) => {
                                 settings.set_allow_network_access(enabled).await;
                                 settings.save().await;
@@ -698,6 +705,9 @@ pub async fn spawn_usb_handler(
                         }
                     },
 
+                    DeviceCommand::GetNetworkAccess(sender) => {
+                        let _ = sender.send(network_access(&http_settings, settings.get_network_token().await));
+                    }
                     DeviceCommand::GetSampleUsage(path, sender) => {
                         let base = settings.get_samples_directory().await;
                         let profile_directory = settings.get_profile_directory().await;
@@ -1017,6 +1027,31 @@ async fn get_files(file_manager: &mut FileManager, settings: &SettingsHandle) ->
         profile_trash: get_profile_trash(settings).await,
         icons: file_manager.get_icons(),
     }
+}
+
+/// The links other machines use: the interface on each address of this machine, with the token.
+fn network_access(http: &HttpSettings, token: Option<String>) -> NetworkAccess {
+    let enabled = http.enabled
+        && http
+            .bind_address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| !ip.is_loopback());
+    let mut urls = vec![];
+    if enabled && let Some(token) = token {
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        let mut addresses: BTreeSet<String> = BTreeSet::new();
+        for (_, network) in &networks {
+            for ip in network.ip_networks() {
+                if ip.addr.is_ipv4() && !ip.addr.is_loopback() && !ip.addr.is_unspecified() {
+                    addresses.insert(ip.addr.to_string());
+                }
+            }
+        }
+        for address in addresses {
+            urls.push(format!("http://{}:{}/?token={}", address, http.port, token));
+        }
+    }
+    NetworkAccess { enabled, urls }
 }
 
 async fn get_profile_trash(settings: &SettingsHandle) -> Vec<ProfileTrashItem> {

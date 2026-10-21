@@ -497,6 +497,35 @@ pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<Rena
 }
 
 /// The names of the sample files at a path: the file itself, or every sample inside a folder.
+/// Removes the hidden '.<name>.<id>.import' files an interrupted import leaves behind. Links
+/// aren't followed.
+pub fn remove_stale_imports(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            remove_stale_imports(&path);
+        } else if kind.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                && name.ends_with(".import")
+                && let Err(e) = fs::remove_file(&path)
+            {
+                warn!(
+                    "Unable to remove the leftover import {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
 pub fn sample_names_at(base: &Path, relative: &str) -> Result<Vec<String>> {
     let path = sample_path(base, relative)?;
     if path.is_dir() {

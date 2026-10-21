@@ -2076,6 +2076,7 @@ dependencies = [
  "fancy-regex",
  "file-rotate",
  "futures-util",
+ "getrandom 0.3.4",
  "glob",
  "goxlr-audio",
  "goxlr-ipc",
