@@ -832,12 +832,21 @@ async fn get_sample(
     };
     debug!("Found at {:?}", path);
 
-    // Streamed from the disk, with Range requests (seeking in a long sample)
+    // Streamed from the disk, with Range requests (seeking in a long sample). A sample can be
+    // edited in place: the browser must check it's unchanged (cheap, with the ETag) before
+    // playing a copy it kept, or it plays the audio from before the edit.
     match actix_files::NamedFile::open_async(&path).await {
-        Ok(file) => file
-            .set_content_type(MimeGuess::from_path(&path).first_or_octet_stream())
-            .disable_content_disposition()
-            .into_response(&req),
+        Ok(file) => {
+            let mut response = file
+                .set_content_type(MimeGuess::from_path(&path).first_or_octet_stream())
+                .disable_content_disposition()
+                .into_response(&req);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            );
+            response
+        }
         // The file may have been removed, or be unreadable, since it was found.
         Err(error) => {
             warn!("Unable to read sample {:?}: {}", path, error);
