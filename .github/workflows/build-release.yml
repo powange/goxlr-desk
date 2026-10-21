@@ -52,6 +52,17 @@ jobs:
           ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
+      # Tauri replaces WebView2's drag and drop handler unless this is off, which stops drag and
+      # drop inside the web UI on Windows (moving samples, dropping them on sampler buttons).
+      # The wrapper doesn't use Tauri's own file drop events.
+      - name: "Allow drag and drop in the UI window"
+        shell: bash
+        run: |
+          conf=goxlr-utility-ui/src-tauri/tauri.conf.json
+          jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp"
+          mv "$conf.tmp" "$conf"
+          jq '.app.windows[0]' "$conf"
+
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -222,6 +233,17 @@ jobs:
           ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
+      # Tauri replaces WebView2's drag and drop handler unless this is off, which stops drag and
+      # drop inside the web UI on Windows (moving samples, dropping them on sampler buttons).
+      # The wrapper doesn't use Tauri's own file drop events.
+      - name: "Allow drag and drop in the UI window"
+        shell: bash
+        run: |
+          conf=goxlr-utility-ui/src-tauri/tauri.conf.json
+          jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp"
+          mv "$conf.tmp" "$conf"
+          jq '.app.windows[0]' "$conf"
+
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -273,10 +295,18 @@ jobs:
           name: "macos-artifact-aarch64-apple-darwin"
 
       - name: "Install Packages App.."
+        # The download is plain HTTP and always the latest version, so the volume is mounted at a
+        # fixed path (its name carries the version) and the installer's Developer ID signature is
+        # checked before it runs as root.
         run: |
           wget http://s.sudre.free.fr/Software/files/Packages.dmg
-          hdiutil attach Packages.dmg
-          sudo installer -pkg /Volumes/Packages\ 1.2.10/Install\ Packages.pkg -target /
+          hdiutil attach Packages.dmg -nobrowse -mountpoint /Volumes/PackagesInstaller
+          pkg=$(find /Volumes/PackagesInstaller -maxdepth 1 -name "*.pkg" | head -n 1)
+          test -n "$pkg"
+          pkgutil --check-signature "$pkg" | tee signature.txt
+          grep -q "Status: signed by a developer certificate issued by Apple" signature.txt
+          grep -q "Developer ID Installer: Stephane Sudre (NL5M9E394P)" signature.txt
+          sudo installer -pkg "$pkg" -target /
       - name: "Build LIPO Binaries"
         run: ./ci/build-macos-package '${{ needs.get_version.outputs.version }}'
         shell: bash
