@@ -23,7 +23,7 @@ strip goxlr-utility/target/$TARGET/release/goxlr-daemon
 strip goxlr-utility/target/$TARGET/release/goxlr-launcher
 strip goxlr-utility/target/$TARGET/release/goxlr-defaults
 strip goxlr-utility/target/$TARGET/release/goxlr-initialiser
-strip goxlr-utility/target/$TARGET/release/goxlr-utility-ui
+strip goxlr-utility/target/$TARGET/release/goxlr-desk-ui
 
 
 # Next, we need to make a folder for the 'final' binaries..
@@ -33,7 +33,7 @@ cp goxlr-utility/target/$TARGET/release/goxlr-daemon package/
 cp goxlr-utility/target/$TARGET/release/goxlr-launcher package/
 cp goxlr-utility/target/$TARGET/release/goxlr-defaults package/
 cp goxlr-utility/target/$TARGET/release/goxlr-initialiser package/
-cp goxlr-utility/target/$TARGET/release/goxlr-utility-ui package/
+cp goxlr-utility/target/$TARGET/release/goxlr-desk-ui package/
 
 # Bundle all the created binaries (we'll do more with this later!)
 cd package

@@ -6,7 +6,7 @@ pub fn display_error(message: String) {
     // We have two choices here, kdialog, or zenity. We'll try both.
     if let Err(e) = Command::new("kdialog")
         .arg("--title")
-        .arg("GoXLR Utility")
+        .arg("GoXLR Desk")
         .arg("--error")
         .arg(message.clone())
         .output()
@@ -14,7 +14,7 @@ pub fn display_error(message: String) {
         println!("Error Running kdialog: {e}, falling back to zenity..");
         let _ = Command::new("zenity")
             .arg("--title")
-            .arg("GoXLR Utility")
+            .arg("GoXLR Desk")
             .arg("--error")
             .arg("--text")
             .arg(message)

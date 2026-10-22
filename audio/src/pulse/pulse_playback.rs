@@ -51,7 +51,7 @@ impl OpenOutputStream for PulsePlayback {
         // Create the Connection (Use Pulse Simple for this, because, well, it's simple!)
         let pulse = Simple::new(
             None,
-            "GoXLR Utility",
+            "GoXLR Desk",
             Direction::Playback,
             device_str,
             "Media",

@@ -6,12 +6,19 @@ use std::io::Error;
 use std::path::Path;
 
 include!("src/cli.rs");
+include!("../ci/windows_resource.rs");
 
 fn main() -> Result<(), Error> {
     let outdir = match env::var_os("OUT_DIR") {
         None => return Ok(()),
         Some(outdir) => outdir,
     };
+
+    windows_icon(
+        "../daemon/resources/goxlr-desk.ico",
+        "goxlr-client",
+        "GoXLR Desk command line client",
+    )?;
 
     let mut app = Cli::command();
     for shell in Shell::value_variants() {

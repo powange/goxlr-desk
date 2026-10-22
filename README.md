@@ -1,98 +1,101 @@
-[![Support Server](https://img.shields.io/discord/1124010710138106017.svg?label=Discord&logo=Discord&colorB=7289da&style=flat)](https://discord.gg/BRBjkkbvmZ)
-[![GitHub tag (latest SemVer pre-release)](https://img.shields.io/github/v/tag/goxlr-on-linux/goxlr-utility?label=Latest)](http://github.com/goxlr-on-linux/goxlr-utility/releases/latest)
-![GitHub Workflow Status (with event)](https://img.shields.io/github/actions/workflow/status/goxlr-on-linux/goxlr-utility/build.yml)
+![GoXLR Desk](docs/banner.png)
 
-## GoXLR Configuration Utility
+![GitHub tag (latest SemVer pre-release)](https://img.shields.io/github/v/tag/powange/goxlr-desk?label=Latest)
+![GitHub Workflow Status (with event)](https://img.shields.io/github/actions/workflow/status/powange/goxlr-desk/build.yml)
 
-An unofficial tool to configure and control a TC-Helicon GoXLR or GoXLR Mini on Linux, MacOS and
-Windows. [Click Here](https://discord.gg/BRBjkkbvmZ) to join our discord!
+## GoXLR Desk
+
+GoXLR Desk configures and controls a TC-Helicon GoXLR or GoXLR Mini from Windows, Linux or macOS: profiles,
+routing, effects, sampler. Unofficial and open source.
+
+Website: [powange.github.io/goxlr-desk](https://powange.github.io/goxlr-desk/)
+
+> **A fork of GoXLR Utility.** GoXLR Desk is derived from [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility),
+> made by the GoXLR on Linux team (Nathan Adams, Craig McLure and contributors), and keeps its MIT licence. It is a
+> separate project, not supported by them: please report GoXLR Desk issues [here](https://github.com/powange/goxlr-desk/issues),
+> not to GoXLR Utility.
+
+On top of GoXLR Utility, GoXLR Desk has a redesigned interface, sample file management (browser, editor, trash), scenes,
+undo, backups of the settings and profiles, network access with an access link, and a large set of fixes. Much of this
+work was written with the help of AI.
+
+![The GoXLR Desk interface, on the Mixer page](docs/screenshot.png)
 
 ## Features
 
-* Full control over the GoXLR and GoXLR Mini (Similar to the official App)
+* Full control over the GoXLR and GoXLR Mini (similar to the official app)
 * Compatibility with profiles created by the official application
-* An accessible UI designed to work well with Assistive Technologies
-* Remote Access. Control your GoXLR from another computer on your network
-* A Sample 'Pre-Buffer'. Record audio from before you press the button
-* Exit Actions, including saving profiles and loading other profiles / lighting
-* Multiple Device Support. Run more than one GoXLR on one PC
-* A CLI and API for basic or advanced scripting and automation
-* Streamdeck Integration (
-  through [The StreamDeck Repository](https://github.com/FrostyCoolSlug/goxlr-utility-streamdeck))
+* An accessible UI designed to work well with assistive technologies
+* Remote access: control your GoXLR from another device on your network, with an access link
+* A sample library: browse, preview, edit, move and restore samples, drop them on the sampler buttons
+* A sample 'pre-buffer': record audio from before you press the button
+* Exit, sleep and wake actions, including saving profiles and loading other profiles / lighting
+* Multiple device support: run more than one GoXLR on one PC
+* A CLI and an HTTP / WebSocket API for scripting and automation
 
 ## Downloads
 
-Downloads are available on the [Releases Page](https://github.com/GoXLR-on-Linux/goxlr-utility/releases/latest) under
-the
-'Assets' header, we currently provide the following files:
+Downloads are available on the [Releases Page](https://github.com/powange/goxlr-desk/releases/latest) under the
+'Assets' header:
 
-* `.exe` files, usable on Windows<sup>1</sup>
-* `.pkg` files, usable on MacOS, both Intel and M1 based packages are available<sup>2</sup>
-* `.deb` files, usable on Debian based systems (Ubuntu, Mint, Pop!_OS, etc)
-* `.rpm` files, usable on Redhat based systems (CentOS, Fedora, etc)
-
-### OS / Distro Specific Notes
-
-* If you are running Ubuntu 24.04 or a derivitive (such as Linux Mint), please review
-  [this issue](https://github.com/GoXLR-on-Linux/goxlr-utility/issues/221)
-* If you're running the Mix 2 firmware and are seeing UCM errors, please
-  review [this issue](https://github.com/GoXLR-on-Linux/goxlr-utility/issues/223)
-* Arch users can install the `goxlr-utility` package from [AUR](https://aur.archlinux.org/packages/goxlr-utility)
-* Fedora Atomic or Bazzite users please check the instructions
-  [here](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Fedora-Atomic-&-Bazzite)
-* Windows users can also aquire the GoXLR Utility via `winget`
-* On Windows on ARM, spoken messages use Windows' own voice: the NVDA and System Access
-  libraries the Utility talks to screen readers with are only available for x64
+* `.exe` files, for Windows (x64 and ARM)<sup>1</sup>
+* `.deb` files, for Debian based systems (Debian 12+, Ubuntu 22.04+, Mint, Pop!_OS, etc)
+* `.rpm` files, for Red Hat based systems (Fedora, etc) and openSUSE
+* `.pkg` files, for macOS, when the release has them<sup>2</sup>
 
 <sup>1</sup> Windows requires the official device drivers provided by TC-Helicon. If you have the official app
-installed you don't need to do anything, otherwise download the latest drivers from 
-[here](https://utility.frostycoolslug.com/update-site/drivers/TC-Helicon_GoXLR_Driver_5.57.zip).
+installed you don't need to do anything, otherwise get them from TC-Helicon's support page for the GoXLR.
 
+<sup>2</sup> macOS support is still experimental.
 
-<sup>2</sup> MacOS support is still somewhat experimental, and the package may conflict with the existing
-GoXLR-MacOS project as they attempt to do the same thing in certain situations.
+### Next to GoXLR Utility
+
+GoXLR Desk installs next to GoXLR Utility, with its own folder, settings and autostart. On its first start, it copies
+GoXLR Utility's settings, profiles, mic profiles, samples, presets and icons, once: GoXLR Utility keeps its own and
+keeps working. Only one of the two can control the GoXLR at a time: the second one started refuses to run.
+
+On Linux, the `goxlr-desk` package replaces the `goxlr-utility` package (they install the same programs).
+
+### OS specific notes
+
+* On Windows on ARM, spoken messages use Windows' own voice: the NVDA and System Access libraries used to talk to
+  screen readers are only available for x64
+* On Linux, the interface opens in your web browser (the desktop app is built for Windows)
+
+## Firmware updates
+
+System > Firmware update shows the GoXLR's firmware and the latest version, and installs it. TC-Helicon's update
+servers being offline, the list of versions and the firmware files come from the mirror kept by the GoXLR Utility
+project (`utility.frostycoolslug.com`); the files are TC-Helicon's own firmware.
+
+Before anything is written to the GoXLR, GoXLR Desk checks the download (size, version, and its SHA-256 when the list
+gives one), then that the GoXLR received exactly that file (the CRC-32 the device returns for every chunk). Don't
+unplug the GoXLR or close GoXLR Desk during an update. If an update goes wrong, GoXLR Utility's
+[firmware updating guide](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Firmware-Updating) explains how the
+device recovers.
 
 ## Integrations
 
-* [twitchat](https://twitchat.fr/) - Activate and change GoXLR settings based on twitch bits / donations (Thanks Durss!)
-* [MacroGraph](https://www.macrograph.app/) - A visual programmer for Streamers. (Thanks JDUDE!)
+Tools made for GoXLR Utility use the same API and work with GoXLR Desk:
+
+* [twitchat](https://twitchat.fr/) - Activate and change GoXLR settings based on twitch bits / donations
+* [MacroGraph](https://www.macrograph.app/) - A visual programmer for streamers
 * [OBS Fader Sync](https://github.com/parzival-space/obs-goxlr-fader-sync-plugin) - An OBS plugin to sync pre-mix
-  volumes to fader volumes (Thanks parzival!)
-* [Home Assistant](https://github.com/timmo001/homeassistant-integration-goxlr-utility) - A plugin that lets you tie the
-  GoXLR into your home automation (Thanks timmmo!)
+  volumes to fader volumes
+* [Home Assistant](https://github.com/timmo001/homeassistant-integration-goxlr-utility) - Tie the GoXLR into your home
+  automation
+* [Stream Deck](https://github.com/FrostyCoolSlug/goxlr-utility-streamdeck)
+
+System > Integrations, in the interface, shows the addresses and example commands for your device.
 
 ## Getting Started
 
-Once installed, you can launch the Utility using the `GoXLR Utility` item in your Applications Menu, this will launch
-the utility and configuration UI. The UI will then be accessible via the system tray icon, or (if you don't have a tray)
-by re-running the `GoXLR Utility` menu item.
+Once installed, launch GoXLR Desk from the `GoXLR Desk` item in your applications menu. The interface is then
+available from the system tray icon, or by running the menu item again.
 
-If you're running on Linux, a first configuration step should be to enable `Autostart on Login` via System -> Settings.
-Windows users will get the choice during installation. If you change your mind, you can change the setting.
-
-If you want to import your profiles from the official app, simply click on the folder icon in the top right of the
-relevant profiles pane (either Main or Mic) which will open the directory in your file browser. Copy the profile across
-from the Official App's directory (normally `Documents/GoXLR`) and they'll appear in the util ready to load, simply
-double click them.
-
-If you're setting up from scratch, the best place to start is configuring your microphone. Head over to the `Mic` tab
-and hit `Mic Setup` to configure your microphone type and gain. It may be easier to configure if you first set your
-Gate Amount to 0, then reconfigure it once your mic is working. Once done, go explore the UI!
-
-## The UI
-
-The Utility's UI is web based and served directly from the utility to your web browser of choice (if configured, it
-can also be served to a web browser on another computer). The Utility also provides an 'Application' which wraps the
-web UI into a dedicated app. If you're using the Utility on Windows this option is presented to you during install.
-The UI design was modelled around the official application in an attempt to provide a familiar interface for those
-moving from Windows to other platforms, rather than forcing people to learn a new configuration paradigm.
-
-![image](https://github.com/GoXLR-on-Linux/goxlr-utility/assets/574943/8f14bd2c-e67a-42e5-bd9f-b3cb367e171d)
-
-If you're running on Linux, the 'Application' isn't provided as part of the base utility installation. If you'd
-prefer to use it, check out the [GoXLR UI Repository](https://github.com/frostyCoolSlug/goxlr-utility-ui/), which
-provides various builds for distributions. Once installed, you should be able to go to System -> Utility Settings
-and change the UI Handler there.
+The setup assistant (System > Setup assistant) helps with the first configuration. To use profiles
+from the official app, open the profiles folder from Library > Profiles and copy them from the official app's folder
+(normally `Documents/GoXLR`).
 
 ## Building
 
@@ -111,16 +114,21 @@ cargo build --release
 
 The binaries land in `target/release/`. On Linux, the udev rules in `50-goxlr.rules` need to be copied to
 `/etc/udev/rules.d/` so the GoXLR can be used without root. The web interface is embedded from
-`daemon/web-content/`, built from the [UI repository](https://github.com/GoXLR-on-Linux/goxlr-ui).
+`daemon/web-content/`, built from the [interface repository](https://github.com/powange/goxlr-desk-ui).
 
-More information can be found on the
-project's [wiki](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Compilation-Guide).
+The Windows installers and the Linux packages can also be built without GitHub Actions, in a container: see
+`ci/local/build.sh`. The icons are drawn by `daemon/resources/create-icons.py`.
+
+## Questions and bug reports
+
+Use the [issues of this repository](https://github.com/powange/goxlr-desk/issues). The System > Help link of the
+interface opens them too.
 
 ## Disclaimer
 
-This project is also not supported by, or affiliated in any way with, TC-Helicon. For the official GoXLR software,
-please refer to their website.
+GoXLR Desk is not supported by, or affiliated in any way with, TC-Helicon, nor with the GoXLR Utility project. GoXLR is
+a trademark of TC-Helicon, used here only to say which device this software works with. For the official GoXLR
+software, please refer to TC-Helicon's website.
 
-In addition, this project accepts no responsibility or liability for use of this software, or any problems which may
-occur from its use. Please read the [LICENSE](https://github.com/GoXLR-on-Linux/goxlr-utility/blob/main/LICENSE) for
-more information.
+This project accepts no responsibility or liability for use of this software, or any problems which may occur from its
+use. Please read the [LICENSE](LICENSE) for more information.

@@ -16,15 +16,15 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.4"
+version = "1.0.0"
 edition = "2024"
 # Edition 2024 with let-chains needs Rust 1.88 or newer.
 rust-version = "1.88"
 
-authors = ["Nathan Adams <dinnerbone@dinnerbone.com>", "Craig McLure <craig@mclure.net>", "Lars Mühlbauer <lm41@dismail.de>"]
+authors = ["Nathan Adams <dinnerbone@dinnerbone.com>", "Craig McLure <craig@mclure.net>", "Lars Mühlbauer <lm41@dismail.de>", "powange"]
 license = "MIT"
 
-repository = "https://github.com/GoXLR-on-Linux/GoXLR-Utility"
+repository = "https://github.com/powange/goxlr-desk"
 
 # The lint policy lives here, not only on the CI command line, so a local `cargo clippy` sees the
 # same thing (CI still adds `-D warnings` to turn them into errors).
@@ -34,6 +34,10 @@ unused_must_use = "deny"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# Cargo.lock: speech-dispatcher-sys (Linux text to speech) accepts any bindgen from 0.54, and
+# generates wrong callback types with bindgen 0.58 (size_t as u64): it's locked to bindgen 0.72.1,
+# the version coreaudio-sys uses. A full `cargo update` may move it again; the Linux CI check
+# (--all-features) fails if so.
 [workspace.dependencies]
 log = "0.4.28"
 

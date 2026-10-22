@@ -226,7 +226,10 @@ async fn get_firmware_file(device: &FirmwareUpdateDevice, sender: Sender) -> Res
             sha256,
         });
     }
-    bail!("Error Downloading Manifest from TC-Helicon Servers");
+    bail!(
+        "Unable to download the firmware list from {}",
+        FIRMWARE_PATHS[device.source]
+    );
 }
 
 async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Result<FirmwareInfo> {
@@ -329,7 +332,10 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
         }
         return Ok(firmware_info);
     }
-    bail!("Error Downloading content from TC-Helicon Servers");
+    bail!(
+        "Unable to download the firmware from {}",
+        FIRMWARE_PATHS[device.source]
+    );
 }
 
 async fn enter_dfu(serial: &str, sender: Sender) -> Result<()> {
@@ -592,6 +598,8 @@ fn private_download_dir() -> Result<PathBuf> {
             "goxlr-firmware-{}-{stamp}-{attempt}",
             std::process::id()
         ));
+        // Only changed on Unix (the folder's permissions)
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

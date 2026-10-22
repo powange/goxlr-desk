@@ -1519,13 +1519,16 @@ mod watcher_tests {
     #[tokio::test]
     async fn written_samples_are_listed_again() {
         let root = tempfile::tempdir().unwrap();
+        // The real path: macOS's temporary folder (/var) is a link to /private/var, the path
+        // its file events carry
+        let base = root.path().canonicalize().unwrap();
         let paths = FilePaths {
-            profiles: root.path().join("profiles"),
-            mic_profiles: root.path().join("mic"),
-            presets: root.path().join("presets"),
-            icons: root.path().join("icons"),
-            samples: root.path().join("samples"),
-            backups: root.path().join("backups"),
+            profiles: base.join("profiles"),
+            mic_profiles: base.join("mic"),
+            presets: base.join("presets"),
+            icons: base.join("icons"),
+            samples: base.join("samples"),
+            backups: base.join("backups"),
         };
         for dir in [
             &paths.profiles,

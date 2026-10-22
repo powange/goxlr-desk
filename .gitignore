@@ -9,3 +9,6 @@
 
 # Used by CI to make distributables
 /deployment
+
+# Python bytecode (daemon/resources/create-icons.py)
+__pycache__/

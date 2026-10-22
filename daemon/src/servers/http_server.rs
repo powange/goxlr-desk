@@ -345,7 +345,7 @@ async fn check_request_source(
                 req.path()
             );
             return Err(ErrorUnauthorized(
-                "This GoXLR Utility needs an access link. On the computer running it, open \
+                "This GoXLR Desk needs an access link. On the computer running it, open \
                  System > Integrations and use the network access link shown there.",
             ));
         }
@@ -945,7 +945,7 @@ async fn export_backup(
         .insert_header(ContentType(mime_guess::mime::APPLICATION_OCTET_STREAM))
         .insert_header((
             header::CONTENT_DISPOSITION,
-            header::ContentDisposition::attachment(format!("goxlr-utility-backup-{date}.zip")),
+            header::ContentDisposition::attachment(format!("goxlr-desk-backup-{date}.zip")),
         ))
         .body(actix_web::body::SizedStream::new(
             size,

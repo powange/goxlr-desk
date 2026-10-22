@@ -23,47 +23,47 @@ mkdir final
 #lipo -create -output final/goxlr-launcher x86_64/goxlr-launcher aarch64/goxlr-launcher
 #lipo -create -output final/goxlr-defaults x86_64/goxlr-defaults aarch64/goxlr-defaults
 #lipo -create -output final/goxlr-initialiser x86_64/goxlr-initialiser aarch64/goxlr-initialiser
-#lipo -create -output final/goxlr-utility-ui x86_64/goxlr-utility-ui aarch64/goxlr-utility-ui
+#lipo -create -output final/goxlr-desk-ui x86_64/goxlr-desk-ui aarch64/goxlr-desk-ui
 
 echo "Constructing App.."
 
 # Ok, build our .app..
 DATE=$(date +"%Y%m%d.%H%M%S")
 
-mkdir 'GoXLR Utility.app'
-mkdir -p 'GoXLR Utility.app/Contents/MacOS'
-mkdir -p 'GoXLR Utility.app/Contents/Resources'
+mkdir 'GoXLR Desk.app'
+mkdir -p 'GoXLR Desk.app/Contents/MacOS'
+mkdir -p 'GoXLR Desk.app/Contents/Resources'
 
 echo "Using x64 binaries..";
-cp x86_64/* 'GoXLR Utility.app/Contents/MacOS'
-#cp ../ci/macos/icon.icns 'GoXLR Utility.app/Contents/Resources'
-cp ../daemon/resources/icon.icns 'GoXLR Utility.app/Contents/Resources'
+cp x86_64/* 'GoXLR Desk.app/Contents/MacOS'
+#cp ../ci/macos/icon.icns 'GoXLR Desk.app/Contents/Resources'
+cp ../daemon/resources/icon.icns 'GoXLR Desk.app/Contents/Resources'
 
 # Generate the plist for the App..
-sed -e "s/{{VERSION}}/$VERSION/g" ../ci/macos/Info.plist.template.xml | sed -e "s/{{DATE}}/$DATE/g" > 'GoXLR Utility.app/Contents/Info.plist'
+sed -e "s/{{VERSION}}/$VERSION/g" ../ci/macos/Info.plist.template.xml | sed -e "s/{{DATE}}/$DATE/g" > 'GoXLR Desk.app/Contents/Info.plist'
 
 # Build the .pkg..
 mkdir pkg
-mv 'GoXLR Utility.app' pkg/
-sed -e "s/{{VERSION}}/$VERSION/g" '../ci/macos/GoXLR Utility.pkgproj' > 'pkg/GoXLR Utility.pkgproj'
+mv 'GoXLR Desk.app' pkg/
+sed -e "s/{{VERSION}}/$VERSION/g" '../ci/macos/GoXLR Desk.pkgproj' > 'pkg/GoXLR Desk.pkgproj'
 
 mkdir pkg/scripts
 cp ../ci/macos/helpers/* pkg/scripts
 
 mkdir pkg/plist
-cp ../ci/macos/initialise.mini.plist.xml pkg/plist/com.github.goxlr-on-linux.goxlr-utility.initialiser.mini.plist
-cp ../ci/macos/initialise.full.plist.xml pkg/plist/com.github.goxlr-on-linux.goxlr-utility.initialiser.full.plist
+cp ../ci/macos/initialise.mini.plist.xml pkg/plist/com.github.powange.goxlr-desk.initialiser.mini.plist
+cp ../ci/macos/initialise.full.plist.xml pkg/plist/com.github.powange.goxlr-desk.initialiser.full.plist
 
 cp ../ci/macos/LICENSE pkg/LICENSE.txt
 
 # Run the Package Build..
 cd pkg || exit
-packagesbuild --project 'GoXLR Utility.pkgproj'
-mv 'build/GoXLR Utility.pkg' ../../goxlr-utility-macos-$VERSION-intel.pkg
+packagesbuild --project 'GoXLR Desk.pkgproj'
+mv 'build/GoXLR Desk.pkg' ../../goxlr-desk-macos-$VERSION-intel.pkg
 
 # Switch with the aarch64 binaries, and re-run the build..
 echo "Building with aarch64 binaries..";
 rm -rf build/
-cp ../aarch64/* 'GoXLR Utility.app/Contents/MacOS'
-packagesbuild --project 'GoXLR Utility.pkgproj'
-mv 'build/GoXLR Utility.pkg' ../../goxlr-utility-macos-$VERSION-m1.pkg
+cp ../aarch64/* 'GoXLR Desk.app/Contents/MacOS'
+packagesbuild --project 'GoXLR Desk.pkgproj'
+mv 'build/GoXLR Desk.pkg' ../../goxlr-desk-macos-$VERSION-m1.pkg

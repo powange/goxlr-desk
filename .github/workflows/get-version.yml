@@ -3,7 +3,7 @@ on:
   workflow_call:
     outputs:
       version:
-        description: "The GoXLR Utility Version Number"
+        description: "The GoXLR Desk Version Number"
         value: ${{ jobs.get_version.outputs.version }}
 
 permissions:

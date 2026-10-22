@@ -6,7 +6,7 @@
         <string>English</string>
 
         <key>CFBundleDisplayName</key>
-        <string>GoXLR Utility</string>
+        <string>GoXLR Desk</string>
 
         <key>CFBundleExecutable</key>
         <string>goxlr-launcher</string>
@@ -15,13 +15,13 @@
         <string>icon.icns</string>
 
         <key>CFBundleIdentifier</key>
-        <string>com.github.goxlr-on-linux.goxlr-utility</string>
+        <string>com.github.powange.goxlr-desk</string>
 
         <key>CFBundleInfoDictionaryVersion</key>
         <string>6.0</string>
 
         <key>CFBundleName</key>
-        <string>goxlr-utility</string>
+        <string>goxlr-desk</string>
 
         <key>CFBundlePackageType</key>
         <string>APPL</string>

@@ -11,8 +11,8 @@ use objc2_foundation::{NSData, NSString};
 use std::path::Path;
 use std::{env, fs};
 
-const PLIST: &[u8] = include_bytes!("../../resources/goxlr-utility.plist.xml");
-const PLIST_FILENAME: &str = "com.github.goxlr-on-linux.goxlr-utility.plist";
+const PLIST: &[u8] = include_bytes!("../../resources/goxlr-desk.plist.xml");
+const PLIST_FILENAME: &str = "com.github.powange.goxlr-desk.plist";
 
 pub fn display_error(message: String) {
     let mtm = MainThreadMarker::new().unwrap();
@@ -20,7 +20,7 @@ pub fn display_error(message: String) {
     unsafe {
         let alert = NSAlert::new(mtm);
         alert.setIcon(get_icon().as_deref());
-        alert.setMessageText(&NSString::from_str("GoXLR Utility"));
+        alert.setMessageText(&NSString::from_str("GoXLR Desk"));
         alert.setInformativeText(&NSString::from_str(&message));
         alert.setAlertStyle(NSAlertStyle::Critical);
 

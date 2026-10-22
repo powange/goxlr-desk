@@ -48,7 +48,7 @@ impl OpenInputStream for PulseRecord {
         // Create the Connection (Use Pulse Simple for this, because, well, it's simple!)
         let pulse = Simple::new(
             None,
-            "GoXLR Utility",
+            "GoXLR Desk",
             Direction::Record,
             device_str,
             "Media",

@@ -31,8 +31,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-debug-
+          key: ${{ runner.os }}-cargo-debug-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-debug-v2-
 
       - name: Running Tests
         run: cargo test --workspace --all-features
@@ -63,8 +63,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-debug-
+          key: ${{ runner.os }}-cargo-debug-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-debug-v2-
 
       - name: Running Tests
         run: cargo test --workspace --all-features
@@ -95,8 +95,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-debug-
+          key: ${{ runner.os }}-cargo-debug-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-debug-v2-
 
       - name: Running Tests
         run: cargo test --workspace --all-features

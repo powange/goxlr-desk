@@ -6,7 +6,7 @@ D="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # This script builds a binary dpkg for Debian based distros.
 # Original script from ripgrep - https://github.com/BurntSushi/ripgrep (licensed MIT)
 #
-# Adapted for the GoXLR Utility (RPM and DEB)
+# Adapted for GoXLR Desk (RPM and DEB)
 #
 # Note that this requires both cargo-deb and cargo-generate-rpm which can be installed with
 # 'cargo install cargo-deb cargo-generate-rpm'

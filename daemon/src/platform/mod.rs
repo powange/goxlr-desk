@@ -131,7 +131,7 @@ pub fn get_ui_app_path() -> Option<PathBuf> {
     path
 }
 
-static UI_NAME: &str = "goxlr-utility-ui";
+static UI_NAME: &str = "goxlr-desk-ui";
 fn get_ui_binary_name() -> String {
     if cfg!(windows) {
         format!("{UI_NAME}.exe")

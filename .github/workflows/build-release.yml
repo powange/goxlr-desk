@@ -38,13 +38,13 @@ jobs:
           }
 
       # Firstly Checkout our Repository..
-      - name: "Check out GoXLR Utility"
+      - name: "Check out GoXLR Desk"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: goxlr-utility
 
       # Now Checkout the App Wrappers repository..
-      - name: "Check out GoXLR Utility UI"
+      - name: "Check out the UI window (from GoXLR Utility)"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: goxlr-on-linux/goxlr-utility-ui-wrapper-app
@@ -52,16 +52,14 @@ jobs:
           ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
-      # Tauri replaces WebView2's drag and drop handler unless this is off, which stops drag and
-      # drop inside the web UI on Windows (moving samples, dropping them on sampler buttons).
-      # The wrapper doesn't use Tauri's own file drop events.
-      - name: "Allow drag and drop in the UI window"
+      # The desktop app comes from GoXLR Utility's repository: made GoXLR Desk's (name, icons,
+      # settings location). Also turns Tauri's drag and drop handler off, which otherwise stops
+      # drag and drop inside the web UI on Windows (moving samples, dropping them on buttons).
+      - name: "Make the UI window GoXLR Desk's"
         shell: bash
         run: |
-          conf=goxlr-utility-ui/src-tauri/tauri.conf.json
-          jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp"
-          mv "$conf.tmp" "$conf"
-          jq '.app.windows[0]' "$conf"
+          bash goxlr-utility/ci/rebrand-ui-wrapper.sh goxlr-utility-ui
+          jq '{productName, identifier, window: .app.windows[0]}' goxlr-utility-ui/src-tauri/tauri.conf.json
 
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -152,7 +150,7 @@ jobs:
         uses: joncloud/makensis-action@1446fc4d066482f715a57952550f559a3ab72b8a # publish branch
         with:
           additional-plugin-paths: ${{ github.workspace }}/NSIS_Plugins
-          script-file: goxlr-utility/ci/nsis/goxlr-utility.nsi
+          script-file: goxlr-utility/ci/nsis/goxlr-desk.nsi
           arguments: "/DPRODUCT_VERSION=${{ needs.get_version.outputs.version }}${{ env.SUFFIX }}"
 
       - name: "Upload Installer"
@@ -225,7 +223,7 @@ jobs:
           path: goxlr-utility
 
       # Now Checkout the App Wrappers repository..
-      - name: "Check out GoXLR Utility UI"
+      - name: "Check out the UI window (from GoXLR Utility)"
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: goxlr-on-linux/goxlr-utility-ui-wrapper-app
@@ -233,16 +231,14 @@ jobs:
           ref: e71bb2e33439ca832ee7f2cbd5b29e500e2a8596
           path: goxlr-utility-ui
 
-      # Tauri replaces WebView2's drag and drop handler unless this is off, which stops drag and
-      # drop inside the web UI on Windows (moving samples, dropping them on sampler buttons).
-      # The wrapper doesn't use Tauri's own file drop events.
-      - name: "Allow drag and drop in the UI window"
+      # The desktop app comes from GoXLR Utility's repository: made GoXLR Desk's (name, icons,
+      # settings location). Also turns Tauri's drag and drop handler off, which otherwise stops
+      # drag and drop inside the web UI on Windows (moving samples, dropping them on buttons).
+      - name: "Make the UI window GoXLR Desk's"
         shell: bash
         run: |
-          conf=goxlr-utility-ui/src-tauri/tauri.conf.json
-          jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp"
-          mv "$conf.tmp" "$conf"
-          jq '.app.windows[0]' "$conf"
+          bash goxlr-utility/ci/rebrand-ui-wrapper.sh goxlr-utility-ui
+          jq '{productName, identifier, window: .app.windows[0]}' goxlr-utility-ui/src-tauri/tauri.conf.json
 
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -315,7 +311,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-artifact
-          path: ./goxlr-utility-macos-*.pkg
+          path: ./goxlr-desk-macos-*.pkg
 
       - name: "Remove x64 artifact"
         uses: geekyeggo/delete-artifact@f275313e70c08f6120db482d7a6b98377786765b # v5.1.0
