@@ -1,5 +1,16 @@
 name: Create Release Build
-on: [ workflow_dispatch, workflow_call ]
+on:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: "Also build the macOS packages (experimental, untested since the rename)"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      macos:
+        type: boolean
+        default: false
 
 # Builds only read the repository, artifacts are uploaded with the job token.
 permissions:
@@ -214,6 +225,7 @@ jobs:
     strategy:
       matrix:
         targets: [ x86_64-apple-darwin, aarch64-apple-darwin ]
+    if: ${{ inputs.macos }}
     runs-on: macos-latest
     needs: [ get_version ]
     steps:
@@ -273,6 +285,7 @@ jobs:
 
   package_macos:
     name: "Package MacOS Binaries"
+    if: ${{ inputs.macos }}
     runs-on: macos-latest
     needs: [ get_version, build_macos ]
 

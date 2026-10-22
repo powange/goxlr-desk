@@ -49,5 +49,3 @@ jobs:
             ./rpm-artifact/goxlr-desk-${{ needs.get_version.outputs.version }}-suse.x86_64.rpm
             ./windows-artifact/goxlr-desk-${{ needs.get_version.outputs.version }}.exe
             ./windows-artifact-arm/goxlr-desk-${{ needs.get_version.outputs.version }}-arm64.exe
-            ./macos-artifact/goxlr-desk-macos-${{ needs.get_version.outputs.version }}-intel.pkg
-            ./macos-artifact/goxlr-desk-macos-${{ needs.get_version.outputs.version }}-m1.pkg
