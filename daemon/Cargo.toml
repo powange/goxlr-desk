@@ -16,6 +16,8 @@ tts = ["dep:tts"]
 [dependencies]
 goxlr-usb = { path = "../usb" }
 goxlr-ipc = { path = "../ipc" }
+sha2 = "0.11.1"
+schemars = { workspace = true }
 goxlr-types = { path = "../types" }
 goxlr-audio = { path = "../audio" }
 goxlr-profile-loader = { path = "../profile" }
@@ -44,7 +46,6 @@ byteorder = { workspace = true }
 clap = { workspace = true }
 include_dir = { workspace = true }
 cfg-if = { workspace = true }
-lazy_static = { workspace = true }
 fancy-regex = { workspace = true }
 which = { workspace = true }
 
@@ -57,7 +58,7 @@ log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 directories = "6.0.0"
 
 # Linked Hashsets
-ritelinked = "0.3.2"
+hashlink = "0.12.2"
 
 # Opens a Browser or App
 open = "5.3.2"
@@ -66,7 +67,6 @@ open = "5.3.2"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 
 # File Matching
-glob = "0.3.3"
 
 # Text to Speech
 tts = { version = "0.26.3", features = ["tolk"], optional = true }
@@ -81,7 +81,8 @@ sys-locale = "0.3.2"
 actix-web = { version = "4.11.0", default-features = false, features = ["macros", "compress-brotli", "compress-gzip"] }
 actix-ws = "0.3.0"
 actix-cors = "0.7.1"
-actix-multipart = "0.7.2"
+actix-multipart = "0.8.5"
+actix-files = "0.6.6"
 
 mime_guess = "2.0.5"
 jsonpath-rust = "1.0.4"
@@ -110,6 +111,7 @@ dunce = "1.0.5"
 windows-args = "0.2.0"
 
 winreg = { workspace = true }
+widestring = "1.2.0"
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_Shell",
@@ -118,7 +120,10 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Shutdown",
-    "Win32_System_RemoteDesktop"
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization"
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -137,12 +142,12 @@ core-foundation = "0.10.0"
 io-kit-sys = "0.4.1"
 
 [build-dependencies]
+# The Windows icon, also when cross-compiling from another system
+embed-resource = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
 directories = "6.0.0"
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
-windres = { workspace = true }
 
 [package.metadata.deb]
 name = "goxlr-utility"
@@ -156,10 +161,10 @@ assets = [
     ["../daemon/resources/goxlr-utility-large.png", "usr/share/pixmaps/goxlr-utility.png", "644"],
     ["../daemon/resources/goxlr-utility.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["../daemon/resources/goxlr-utility.desktop", "usr/share/applications/", "644"],
-    ["../deployment/deb/goxlr-client.bash", "usr/share/bash-completion/completions/", "644"],
+    ["../deployment/deb/goxlr-client.bash", "usr/share/bash-completion/completions/goxlr-client", "644"],
     ["../deployment/deb/goxlr-client.fish", "usr/share/fish/vendor_completions.d/", "644"],
     ["../deployment/deb/_goxlr-client", "usr/share/zsh/vendor-completions/", "644"],
-    ["../deployment/deb/goxlr-daemon.bash", "usr/share/bash-completion/completions/", "644"],
+    ["../deployment/deb/goxlr-daemon.bash", "usr/share/bash-completion/completions/goxlr-daemon", "644"],
     ["../deployment/deb/goxlr-daemon.fish", "usr/share/fish/vendor_completions.d/", "644"],
     ["../deployment/deb/_goxlr-daemon", "usr/share/zsh/vendor-completions/", "644"],
 ]
@@ -185,12 +190,12 @@ assets = [
     { source = "../daemon/resources/goxlr-utility-large.png", dest = "/usr/share/pixmaps/goxlr-utility.png", mode = "0644" },
     { source = "../daemon/resources/goxlr-utility.svg", dest = "/usr/share/icons/hicolor/scalable/apps/goxlr-utility.svg", mode = "0644" },
     { source = "../daemon/resources/goxlr-utility.desktop", dest = "/usr/share/applications/goxlr-utility.desktop", mode = "0644" },
-    { source = "../deployment/deb/goxlr-client.bash", dest = "/usr/share/bash-completion/completions/goxlr-client.bash", mode = "0644" },
+    { source = "../deployment/deb/goxlr-client.bash", dest = "/usr/share/bash-completion/completions/goxlr-client", mode = "0644" },
     { source = "../deployment/deb/goxlr-client.fish", dest = "/usr/share/fish/vendor_completions.d/goxlr-client.fish", mode = "0644" },
-    { source = "../deployment/deb/_goxlr-client", dest = "/usr/share/zsh/vendor-completions/_goxlr-client", mode = "0644" },
-    { source = "../deployment/deb/goxlr-daemon.bash", dest = "/usr/share/bash-completion/completions/goxlr-daemon.bash", mode = "0644" },
+    { source = "../deployment/deb/_goxlr-client", dest = "/usr/share/zsh/site-functions/_goxlr-client", mode = "0644" },
+    { source = "../deployment/deb/goxlr-daemon.bash", dest = "/usr/share/bash-completion/completions/goxlr-daemon", mode = "0644" },
     { source = "../deployment/deb/goxlr-daemon.fish", dest = "/usr/share/fish/vendor_completions.d/goxlr-daemon.fish", mode = "0644" },
-    { source = "../deployment/deb/_goxlr-daemon", dest = "/usr/share/zsh/vendor-completions/_goxlr-daemon", mode = "0644" },
+    { source = "../deployment/deb/_goxlr-daemon", dest = "/usr/share/zsh/site-functions/_goxlr-daemon", mode = "0644" },
 ]
 
 # Tiny scriptlet, should reload udev if possible.
@@ -225,3 +230,6 @@ speech-dispatcher = ">= 0.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[lints]
+workspace = true

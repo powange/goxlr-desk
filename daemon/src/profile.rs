@@ -78,8 +78,44 @@ pub fn saved_profiles_using_samples(directory: &Path, names: &HashSet<String>) -
 
 /// A sample file was renamed: updates every profile saved in `directory` that uses it, and
 /// returns the names of the profiles that changed.
-pub fn rename_sample_in_saved_profiles(directory: &Path, old: &str, new: &str) -> Vec<String> {
+pub fn rename_sample_in_saved_profiles(
+    directory: &Path,
+    backups: &Path,
+    old: &str,
+    new: &str,
+) -> Vec<String> {
+    update_saved_profiles(directory, backups, old, |profile| {
+        profile.rename_sample_file(old, new)
+    })
+}
+
+/// Points the saved profiles' tracks of a sample edited in place at the whole file, at its new
+/// gain (see `reset_sample_file`).
+pub fn reset_sample_in_saved_profiles(
+    directory: &Path,
+    backups: &Path,
+    name: &str,
+    gain: f64,
+) -> Vec<String> {
+    update_saved_profiles(directory, backups, name, |profile| {
+        profile.reset_sample_file(name, gain)
+    })
+}
+
+/// Applies `change` to every saved profile, saving those it changed (after a copy kept in the
+/// backups: the user never opened most of them). `sample` names the file, for the logs.
+fn update_saved_profiles(
+    directory: &Path,
+    backups: &Path,
+    sample: &str,
+    change: impl Fn(&mut ProfileAdapter) -> bool,
+) -> Vec<String> {
     let mut changed = Vec::new();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let kept = backups.join("sample-renames").join(stamp.to_string());
     let Ok(entries) = std::fs::read_dir(directory) else {
         return changed;
     };
@@ -93,17 +129,29 @@ pub fn rename_sample_in_saved_profiles(directory: &Path, old: &str, new: &str) -
         };
         match ProfileAdapter::from_named(name.to_string(), directory) {
             Ok(mut profile) => {
-                if profile.rename_sample_file(old, new) {
+                if change(&mut profile) {
+                    let copied = std::fs::create_dir_all(&kept)
+                        .and_then(|_| std::fs::copy(&path, kept.join(entry.file_name())));
+                    if let Err(e) = copied {
+                        warn!(
+                            "Not updating {} in {}, unable to keep a copy: {}",
+                            sample, name, e
+                        );
+                        continue;
+                    }
                     match profile.save(directory, true) {
                         Ok(()) => changed.push(name.to_string()),
                         Err(e) => warn!(
-                            "Unable to save profile {} after renaming {}: {}",
-                            name, old, e
+                            "Unable to save profile {} after updating {}: {}",
+                            name, sample, e
                         ),
                     }
                 }
             }
-            Err(e) => warn!("Unable to check profile {} for sample {}: {}", name, old, e),
+            Err(e) => warn!(
+                "Unable to check profile {} for sample {}: {}",
+                name, sample, e
+            ),
         }
     }
     changed
@@ -188,6 +236,10 @@ impl ProfileAdapter {
     /// Returns whether anything changed.
     pub fn rename_sample_file(&mut self, old: &str, new: &str) -> bool {
         self.profile.settings_mut().rename_sample_file(old, new) > 0
+    }
+
+    pub fn reset_sample_file(&mut self, name: &str, gain: f64) -> bool {
+        self.profile.settings_mut().reset_sample_file(name, gain) > 0
     }
 
     /// Tells whether the profile changed since it was loaded or saved (compare two values).
@@ -315,7 +367,7 @@ impl ProfileAdapter {
     pub fn get_fader_mute_state(&self, fader: FaderName) -> ChannelState {
         let (muted_to_x, muted_to_all, mute_function) = self.get_mute_button_state(fader);
 
-        if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) {
+        if hard_muted(muted_to_x, muted_to_all, mute_function) {
             return ChannelState::Muted;
         }
         ChannelState::Unmuted
@@ -967,7 +1019,7 @@ impl ProfileAdapter {
             rate: self.get_active_hardtune_profile().rate(),
             window: self.get_active_hardtune_profile().window(),
             source: profile_to_standard_hard_tune_source(
-                &self.get_active_hardtune_profile().get_source_value(),
+                self.get_active_hardtune_profile().get_source_value(),
             ),
         };
 
@@ -1117,6 +1169,12 @@ impl ProfileAdapter {
         let mute_function = *mute_config.mute_function();
 
         (muted_to_x, muted_to_all, mute_function)
+    }
+
+    /// Whether a fader is muted for everyone: muted to all, or muted while its function is All.
+    pub fn is_fader_hard_muted(&self, fader: FaderName) -> bool {
+        let (muted_to_x, muted_to_all, mute_function) = self.get_mute_button_state(fader);
+        hard_muted(muted_to_x, muted_to_all, mute_function)
     }
 
     pub fn get_mute_button_previous_volume(&self, fader: FaderName) -> u8 {
@@ -1297,7 +1355,8 @@ impl ProfileAdapter {
 
     /** Fader Stuff */
     pub fn is_mic_on_fader(&self) -> bool {
-        self.profile.settings().mute_chat().mic_fader_id() != 4
+        // 0 to 3 are the faders; anything else (4 in the official profiles) isn't on one
+        self.profile.settings().mute_chat().mic_fader_id() < 4
     }
 
     pub fn get_mic_fader(&self) -> FaderName {
@@ -1319,6 +1378,8 @@ impl ProfileAdapter {
     }
 
     // TODO: This can probably be cleaned with EnumIter
+    /// The fader with this profile id (0 to 3). Only called for a mic on a fader (see
+    /// is_mic_on_fader), the id is checked when the profile is read.
     pub fn fader_from_id(&self, fader: u8) -> FaderName {
         match fader {
             0 => FaderName::A,
@@ -1704,7 +1765,7 @@ impl ProfileAdapter {
     }
 
     pub fn get_hardtune_source(&self) -> goxlr_types::HardTuneSource {
-        profile_to_standard_hard_tune_source(&self.get_active_hardtune_profile().get_source_value())
+        profile_to_standard_hard_tune_source(self.get_active_hardtune_profile().get_source_value())
     }
 
     pub fn get_active_hardtune_profile(&self) -> &HardTuneEffect {
@@ -1734,7 +1795,8 @@ impl ProfileAdapter {
 
     pub fn get_active_hardtune_source(&self) -> InputDevice {
         let source = self.get_active_hardtune_profile().source();
-        match source.unwrap() {
+        // A profile without a source plays like 'All'
+        match source.unwrap_or(HardTuneSource::All) {
             HardTuneSource::Music => InputDevice::Music,
             HardTuneSource::Game => InputDevice::Game,
             HardTuneSource::LineIn => InputDevice::LineIn,
@@ -2681,160 +2743,104 @@ impl ProfileAdapter {
     }
 }
 
-fn profile_to_standard_input(value: InputChannels) -> InputDevice {
-    match value {
-        InputChannels::Mic => InputDevice::Microphone,
-        InputChannels::Chat => InputDevice::Chat,
-        InputChannels::Music => InputDevice::Music,
-        InputChannels::Game => InputDevice::Game,
-        InputChannels::Console => InputDevice::Console,
-        InputChannels::LineIn => InputDevice::LineIn,
-        InputChannels::System => InputDevice::System,
-        InputChannels::Sample => InputDevice::Samples,
-    }
+/// The two conversions between a profile enum and its goxlr-types counterpart, from one list of
+/// variant pairs (so the two directions can't disagree). They take the value or a reference.
+macro_rules! bimap {
+    (
+        $vis:vis fn $forward:ident($from:ty) -> $to:ty;
+        $vis2:vis fn $backward:ident;
+        $($a:ident => $b:ident),+ $(,)?
+    ) => {
+        bimap!(@one $vis $forward, $from, $to, $($a => $b),+);
+        bimap!(@one $vis2 $backward, $to, $from, $($b => $a),+);
+    };
+    (@one $vis:vis $name:ident, $from:ty, $to:ty, $($a:ident => $b:ident),+) => {
+        #[allow(dead_code)] // one of the two directions may not be needed
+        $vis fn $name(value: impl std::borrow::Borrow<$from>) -> $to {
+            type Source = $from;
+            type Target = $to;
+            match *value.borrow() {
+                $(Source::$a => Target::$b),+
+            }
+        }
+    };
 }
 
-fn standard_input_to_profile(value: InputDevice) -> InputChannels {
-    match value {
-        InputDevice::Microphone => InputChannels::Mic,
-        InputDevice::Chat => InputChannels::Chat,
-        InputDevice::Music => InputChannels::Music,
-        InputDevice::Game => InputChannels::Game,
-        InputDevice::Console => InputChannels::Console,
-        InputDevice::LineIn => InputChannels::LineIn,
-        InputDevice::System => InputChannels::System,
-        InputDevice::Samples => InputChannels::Sample,
-    }
+bimap! {
+    fn profile_to_standard_input(InputChannels) -> InputDevice;
+    fn standard_input_to_profile;
+    Mic => Microphone,
+    Chat => Chat,
+    Music => Music,
+    Game => Game,
+    Console => Console,
+    LineIn => LineIn,
+    System => System,
+    Sample => Samples,
 }
 
-fn profile_to_standard_output(value: OutputChannels) -> OutputDevice {
-    match value {
-        OutputChannels::Headphones => OutputDevice::Headphones,
-        OutputChannels::Broadcast => OutputDevice::BroadcastMix,
-        OutputChannels::LineOut => OutputDevice::LineOut,
-        OutputChannels::ChatMic => OutputDevice::ChatMic,
-        OutputChannels::Sampler => OutputDevice::Sampler,
-        OutputChannels::StreamMix2 => OutputDevice::StreamMix2,
-    }
+bimap! {
+    fn profile_to_standard_output(OutputChannels) -> OutputDevice;
+    fn standard_output_to_profile;
+    Headphones => Headphones,
+    Broadcast => BroadcastMix,
+    LineOut => LineOut,
+    ChatMic => ChatMic,
+    Sampler => Sampler,
+    StreamMix2 => StreamMix2,
 }
 
-fn standard_output_to_profile(value: OutputDevice) -> OutputChannels {
-    match value {
-        OutputDevice::Headphones => OutputChannels::Headphones,
-        OutputDevice::BroadcastMix => OutputChannels::Broadcast,
-        OutputDevice::LineOut => OutputChannels::LineOut,
-        OutputDevice::ChatMic => OutputChannels::ChatMic,
-        OutputDevice::Sampler => OutputChannels::Sampler,
-        OutputDevice::StreamMix2 => OutputChannels::StreamMix2,
-    }
+bimap! {
+    fn profile_to_standard_mute_function(MuteFunction) -> BasicMuteFunction;
+    fn standard_to_profile_mute_function;
+    All => All,
+    ToStream => ToStream,
+    ToVoiceChat => ToVoiceChat,
+    ToPhones => ToPhones,
+    ToLineOut => ToLineOut,
+    ToStream2 => ToStream2,
+    ToStreams => ToStreams,
 }
 
-fn profile_to_standard_mute_function(value: MuteFunction) -> BasicMuteFunction {
-    match value {
-        MuteFunction::All => BasicMuteFunction::All,
-        MuteFunction::ToStream => BasicMuteFunction::ToStream,
-        MuteFunction::ToVoiceChat => BasicMuteFunction::ToVoiceChat,
-        MuteFunction::ToPhones => BasicMuteFunction::ToPhones,
-        MuteFunction::ToLineOut => BasicMuteFunction::ToLineOut,
-        MuteFunction::ToStream2 => BasicMuteFunction::ToStream2,
-        MuteFunction::ToStreams => BasicMuteFunction::ToStreams,
-    }
+bimap! {
+    fn standard_to_profile_fader_display(BasicColourDisplay) -> ColourDisplay;
+    fn profile_to_standard_fader_display;
+    TwoColour => TwoColour,
+    Gradient => Gradient,
+    Meter => Meter,
+    GradientMeter => GradientMeter,
 }
 
-fn standard_to_profile_mute_function(value: BasicMuteFunction) -> MuteFunction {
-    match value {
-        BasicMuteFunction::All => MuteFunction::All,
-        BasicMuteFunction::ToStream => MuteFunction::ToStream,
-        BasicMuteFunction::ToVoiceChat => MuteFunction::ToVoiceChat,
-        BasicMuteFunction::ToPhones => MuteFunction::ToPhones,
-        BasicMuteFunction::ToLineOut => MuteFunction::ToLineOut,
-        BasicMuteFunction::ToStream2 => MuteFunction::ToStream2,
-        BasicMuteFunction::ToStreams => MuteFunction::ToStreams,
-    }
+bimap! {
+    fn standard_to_profile_colour_off_style(BasicColourOffStyle) -> ColourOffStyle;
+    fn profile_to_standard_colour_off_style;
+    Dimmed => Dimmed,
+    Colour2 => Colour2,
+    DimmedColour2 => DimmedColour2,
 }
 
-fn standard_to_profile_fader_display(value: BasicColourDisplay) -> ColourDisplay {
-    match value {
-        BasicColourDisplay::TwoColour => ColourDisplay::TwoColour,
-        BasicColourDisplay::Gradient => ColourDisplay::Gradient,
-        BasicColourDisplay::Meter => ColourDisplay::Meter,
-        BasicColourDisplay::GradientMeter => ColourDisplay::GradientMeter,
-    }
+bimap! {
+    fn profile_to_standard_channel(FullChannelList) -> ChannelName;
+    fn standard_to_profile_channel;
+    Mic => Mic,
+    Chat => Chat,
+    Music => Music,
+    Game => Game,
+    Console => Console,
+    LineIn => LineIn,
+    System => System,
+    Sample => Sample,
+    Headphones => Headphones,
+    MicMonitor => MicMonitor,
+    LineOut => LineOut,
 }
 
-#[allow(dead_code)]
-fn profile_to_standard_fader_display(value: ColourDisplay) -> BasicColourDisplay {
-    match value {
-        ColourDisplay::TwoColour => BasicColourDisplay::TwoColour,
-        ColourDisplay::Gradient => BasicColourDisplay::Gradient,
-        ColourDisplay::Meter => BasicColourDisplay::Meter,
-        ColourDisplay::GradientMeter => BasicColourDisplay::GradientMeter,
-    }
-}
-
-fn standard_to_profile_colour_off_style(value: BasicColourOffStyle) -> ColourOffStyle {
-    match value {
-        BasicColourOffStyle::Dimmed => ColourOffStyle::Dimmed,
-        BasicColourOffStyle::Colour2 => ColourOffStyle::Colour2,
-        BasicColourOffStyle::DimmedColour2 => ColourOffStyle::DimmedColour2,
-    }
-}
-
-fn profile_to_standard_colour_off_style(value: ColourOffStyle) -> BasicColourOffStyle {
-    match value {
-        ColourOffStyle::Dimmed => BasicColourOffStyle::Dimmed,
-        ColourOffStyle::Colour2 => BasicColourOffStyle::Colour2,
-        ColourOffStyle::DimmedColour2 => BasicColourOffStyle::DimmedColour2,
-    }
-}
-
-fn profile_to_standard_channel(value: FullChannelList) -> ChannelName {
-    match value {
-        FullChannelList::Mic => ChannelName::Mic,
-        FullChannelList::Chat => ChannelName::Chat,
-        FullChannelList::Music => ChannelName::Music,
-        FullChannelList::Game => ChannelName::Game,
-        FullChannelList::Console => ChannelName::Console,
-        FullChannelList::LineIn => ChannelName::LineIn,
-        FullChannelList::System => ChannelName::System,
-        FullChannelList::Sample => ChannelName::Sample,
-        FullChannelList::Headphones => ChannelName::Headphones,
-        FullChannelList::MicMonitor => ChannelName::MicMonitor,
-        FullChannelList::LineOut => ChannelName::LineOut,
-    }
-}
-
-fn standard_to_profile_channel(value: ChannelName) -> FullChannelList {
-    match value {
-        ChannelName::Mic => FullChannelList::Mic,
-        ChannelName::Chat => FullChannelList::Chat,
-        ChannelName::Music => FullChannelList::Music,
-        ChannelName::Game => FullChannelList::Game,
-        ChannelName::Console => FullChannelList::Console,
-        ChannelName::LineIn => FullChannelList::LineIn,
-        ChannelName::System => FullChannelList::System,
-        ChannelName::Sample => FullChannelList::Sample,
-        ChannelName::Headphones => FullChannelList::Headphones,
-        ChannelName::MicMonitor => FullChannelList::MicMonitor,
-        ChannelName::LineOut => FullChannelList::LineOut,
-    }
-}
-
-#[allow(dead_code)]
-fn profile_to_standard_sample_bank(bank: SampleBank) -> goxlr_types::SampleBank {
-    match bank {
-        SampleBank::A => goxlr_types::SampleBank::A,
-        SampleBank::B => goxlr_types::SampleBank::B,
-        SampleBank::C => goxlr_types::SampleBank::C,
-    }
-}
-
-fn standard_to_profile_sample_bank(bank: goxlr_types::SampleBank) -> SampleBank {
-    match bank {
-        goxlr_types::SampleBank::A => SampleBank::A,
-        goxlr_types::SampleBank::B => SampleBank::B,
-        goxlr_types::SampleBank::C => SampleBank::C,
-    }
+bimap! {
+    fn profile_to_standard_sample_bank(SampleBank) -> goxlr_types::SampleBank;
+    fn standard_to_profile_sample_bank;
+    A => A,
+    B => B,
+    C => C,
 }
 
 fn standard_to_profile_sample_button(button: goxlr_types::SampleButtons) -> SampleButtons {
@@ -2856,72 +2862,33 @@ fn profile_to_standard_sample_button(button: SampleButtons) -> goxlr_types::Samp
     }
 }
 
-fn standard_to_profile_sample_playback_mode(mode: SamplePlaybackMode) -> PlaybackMode {
-    match mode {
-        SamplePlaybackMode::PlayNext => PlaybackMode::PlayNext,
-        SamplePlaybackMode::PlayStop => PlaybackMode::PlayStop,
-        SamplePlaybackMode::PlayFade => PlaybackMode::PlayFade,
-        SamplePlaybackMode::StopOnRelease => PlaybackMode::StopOnRelease,
-        SamplePlaybackMode::FadeOnRelease => PlaybackMode::FadeOnRelease,
-        SamplePlaybackMode::Loop => PlaybackMode::Loop,
-    }
+bimap! {
+    fn standard_to_profile_sample_playback_mode(SamplePlaybackMode) -> PlaybackMode;
+    fn profile_to_standard_sample_playback_mode;
+    PlayNext => PlayNext,
+    PlayStop => PlayStop,
+    PlayFade => PlayFade,
+    StopOnRelease => StopOnRelease,
+    FadeOnRelease => FadeOnRelease,
+    Loop => Loop,
 }
 
-fn profile_to_standard_sample_playback_mode(mode: PlaybackMode) -> SamplePlaybackMode {
-    match mode {
-        PlaybackMode::PlayNext => SamplePlaybackMode::PlayNext,
-        PlaybackMode::PlayStop => SamplePlaybackMode::PlayStop,
-        PlaybackMode::PlayFade => SamplePlaybackMode::PlayFade,
-        PlaybackMode::StopOnRelease => SamplePlaybackMode::StopOnRelease,
-        PlaybackMode::FadeOnRelease => SamplePlaybackMode::FadeOnRelease,
-        PlaybackMode::Loop => SamplePlaybackMode::Loop,
-    }
+bimap! {
+    fn profile_to_standard_sample_playback_order(PlayOrder) -> SamplePlayOrder;
+    fn standard_to_profile_sample_playback_order;
+    Sequential => Sequential,
+    Random => Random,
 }
 
-fn profile_to_standard_sample_playback_order(order: PlayOrder) -> SamplePlayOrder {
-    match order {
-        PlayOrder::Sequential => SamplePlayOrder::Sequential,
-        PlayOrder::Random => SamplePlayOrder::Random,
-    }
-}
-
-fn standard_to_profile_sample_playback_order(order: SamplePlayOrder) -> PlayOrder {
-    match order {
-        SamplePlayOrder::Sequential => PlayOrder::Sequential,
-        SamplePlayOrder::Random => PlayOrder::Random,
-    }
-}
-
-#[allow(dead_code)]
-fn sample_bank_to_simple_element(bank: SampleBank) -> SimpleElements {
-    match bank {
-        SampleBank::A => SimpleElements::SampleBankA,
-        SampleBank::B => SimpleElements::SampleBankB,
-        SampleBank::C => SimpleElements::SampleBankC,
-    }
-}
-
-#[allow(dead_code)]
-fn profile_to_standard_preset(value: Preset) -> EffectBankPresets {
-    match value {
-        Preset::Preset1 => EffectBankPresets::Preset1,
-        Preset::Preset2 => EffectBankPresets::Preset2,
-        Preset::Preset3 => EffectBankPresets::Preset3,
-        Preset::Preset4 => EffectBankPresets::Preset4,
-        Preset::Preset5 => EffectBankPresets::Preset5,
-        Preset::Preset6 => EffectBankPresets::Preset6,
-    }
-}
-
-fn standard_to_profile_preset(value: EffectBankPresets) -> Preset {
-    match value {
-        EffectBankPresets::Preset1 => Preset::Preset1,
-        EffectBankPresets::Preset2 => Preset::Preset2,
-        EffectBankPresets::Preset3 => Preset::Preset3,
-        EffectBankPresets::Preset4 => Preset::Preset4,
-        EffectBankPresets::Preset5 => Preset::Preset5,
-        EffectBankPresets::Preset6 => Preset::Preset6,
-    }
+bimap! {
+    fn profile_to_standard_preset(Preset) -> EffectBankPresets;
+    fn standard_to_profile_preset;
+    Preset1 => Preset1,
+    Preset2 => Preset2,
+    Preset3 => Preset3,
+    Preset4 => Preset4,
+    Preset5 => Preset5,
+    Preset6 => Preset6,
 }
 
 fn standard_to_profile_fader(value: FaderName) -> Faders {
@@ -3039,6 +3006,8 @@ fn get_profile_colour_map(profile: &ProfileSettings, colour_target: ColourTarget
         ColourTargets::ReverbEncoder => profile.reverb_encoder().colour_map(),
         ColourTargets::EchoEncoder => profile.echo_encoder().colour_map(),
         ColourTargets::LogoX => profile.simple_element(SimpleElements::LogoX).colour_map(),
+        // The light inside the GoXLR has its own colour slot on the device but none in the
+        // profile: it takes the Logo X (Accent) colour, so the two always match.
         ColourTargets::InternalLight => profile.simple_element(SimpleElements::LogoX).colour_map(),
     }
 }
@@ -3099,6 +3068,7 @@ fn get_profile_colour_map_mut(
         ColourTargets::LogoX => profile
             .simple_element_mut(SimpleElements::LogoX)
             .colour_map_mut(),
+        // Shared with the Logo X, see get_profile_colour_map
         ColourTargets::InternalLight => profile
             .simple_element_mut(SimpleElements::LogoX)
             .colour_map_mut(),
@@ -3209,174 +3179,85 @@ pub fn get_scribble_colour_targets() -> Vec<SimpleColourTargets> {
     ]
 }
 
-#[allow(dead_code)]
-fn standard_to_profile_reverb_style(style: goxlr_types::ReverbStyle) -> ReverbStyle {
-    match style {
-        goxlr_types::ReverbStyle::Library => ReverbStyle::Library,
-        goxlr_types::ReverbStyle::DarkBloom => ReverbStyle::DarkBloom,
-        goxlr_types::ReverbStyle::MusicClub => ReverbStyle::MusicClub,
-        goxlr_types::ReverbStyle::RealPlate => ReverbStyle::RealPlate,
-        goxlr_types::ReverbStyle::Chapel => ReverbStyle::Chapel,
-        goxlr_types::ReverbStyle::HockeyArena => ReverbStyle::HockeyArena,
-    }
+bimap! {
+    fn standard_to_profile_reverb_style(goxlr_types::ReverbStyle) -> ReverbStyle;
+    fn profile_to_standard_reverb_style;
+    Library => Library,
+    DarkBloom => DarkBloom,
+    MusicClub => MusicClub,
+    RealPlate => RealPlate,
+    Chapel => Chapel,
+    HockeyArena => HockeyArena,
 }
 
-fn profile_to_standard_reverb_style(style: &ReverbStyle) -> goxlr_types::ReverbStyle {
-    match style {
-        ReverbStyle::Library => goxlr_types::ReverbStyle::Library,
-        ReverbStyle::DarkBloom => goxlr_types::ReverbStyle::DarkBloom,
-        ReverbStyle::MusicClub => goxlr_types::ReverbStyle::MusicClub,
-        ReverbStyle::RealPlate => goxlr_types::ReverbStyle::RealPlate,
-        ReverbStyle::Chapel => goxlr_types::ReverbStyle::Chapel,
-        ReverbStyle::HockeyArena => goxlr_types::ReverbStyle::HockeyArena,
-    }
+bimap! {
+    fn standard_to_profile_echo_style(goxlr_types::EchoStyle) -> EchoStyle;
+    fn profile_to_standard_echo_style;
+    Quarter => Quarter,
+    Eighth => Eighth,
+    Triplet => Triplet,
+    PingPong => PingPong,
+    ClassicSlap => ClassicSlap,
+    MultiTap => MultiTap,
 }
 
-#[allow(dead_code)]
-fn standard_to_profile_echo_style(style: goxlr_types::EchoStyle) -> EchoStyle {
-    match style {
-        goxlr_types::EchoStyle::Quarter => EchoStyle::Quarter,
-        goxlr_types::EchoStyle::Eighth => EchoStyle::Eighth,
-        goxlr_types::EchoStyle::Triplet => EchoStyle::Triplet,
-        goxlr_types::EchoStyle::PingPong => EchoStyle::PingPong,
-        goxlr_types::EchoStyle::ClassicSlap => EchoStyle::ClassicSlap,
-        goxlr_types::EchoStyle::MultiTap => EchoStyle::MultiTap,
-    }
+bimap! {
+    fn standard_to_profile_pitch_style(goxlr_types::PitchStyle) -> PitchStyle;
+    fn profile_to_standard_pitch_style;
+    Narrow => Narrow,
+    Wide => Wide,
 }
 
-fn profile_to_standard_echo_style(style: &EchoStyle) -> goxlr_types::EchoStyle {
-    match style {
-        EchoStyle::Quarter => goxlr_types::EchoStyle::Quarter,
-        EchoStyle::Eighth => goxlr_types::EchoStyle::Eighth,
-        EchoStyle::Triplet => goxlr_types::EchoStyle::Triplet,
-        EchoStyle::PingPong => goxlr_types::EchoStyle::PingPong,
-        EchoStyle::ClassicSlap => goxlr_types::EchoStyle::ClassicSlap,
-        EchoStyle::MultiTap => goxlr_types::EchoStyle::MultiTap,
-    }
+bimap! {
+    fn standard_to_profile_gender_style(goxlr_types::GenderStyle) -> GenderStyle;
+    fn profile_to_standard_gender_style;
+    Narrow => Narrow,
+    Medium => Medium,
+    Wide => Wide,
 }
 
-#[allow(dead_code)]
-fn standard_to_profile_pitch_style(style: goxlr_types::PitchStyle) -> PitchStyle {
-    match style {
-        goxlr_types::PitchStyle::Narrow => PitchStyle::Narrow,
-        goxlr_types::PitchStyle::Wide => PitchStyle::Wide,
-    }
+bimap! {
+    fn standard_to_profile_megaphone_style(goxlr_types::MegaphoneStyle) -> MegaphoneStyle;
+    fn profile_to_standard_megaphone_style;
+    Megaphone => Megaphone,
+    Radio => Radio,
+    OnThePhone => OnThePhone,
+    Overdrive => Overdrive,
+    BuzzCutt => BuzzCutt,
+    Tweed => Tweed,
 }
 
-fn profile_to_standard_pitch_style(style: &PitchStyle) -> goxlr_types::PitchStyle {
-    match style {
-        PitchStyle::Narrow => goxlr_types::PitchStyle::Narrow,
-        PitchStyle::Wide => goxlr_types::PitchStyle::Wide,
-    }
+bimap! {
+    fn standard_to_profile_robot_style(goxlr_types::RobotStyle) -> RobotStyle;
+    fn profile_to_standard_robot_style;
+    Robot1 => Robot1,
+    Robot2 => Robot2,
+    Robot3 => Robot3,
 }
 
-#[allow(dead_code)]
-fn standard_to_profile_gender_style(style: goxlr_types::GenderStyle) -> GenderStyle {
-    match style {
-        goxlr_types::GenderStyle::Narrow => GenderStyle::Narrow,
-        goxlr_types::GenderStyle::Medium => GenderStyle::Medium,
-        goxlr_types::GenderStyle::Wide => GenderStyle::Wide,
-    }
+bimap! {
+    fn standard_to_profile_hard_tune_style(goxlr_types::HardTuneStyle) -> HardTuneStyle;
+    fn profile_to_standard_hard_tune_style;
+    Natural => Natural,
+    Medium => Medium,
+    Hard => Hard,
 }
 
-fn profile_to_standard_gender_style(style: &GenderStyle) -> goxlr_types::GenderStyle {
-    match style {
-        GenderStyle::Narrow => goxlr_types::GenderStyle::Narrow,
-        GenderStyle::Medium => goxlr_types::GenderStyle::Medium,
-        GenderStyle::Wide => goxlr_types::GenderStyle::Wide,
-    }
+bimap! {
+    fn standard_to_profile_hard_tune_source(goxlr_types::HardTuneSource) -> HardTuneSource;
+    fn profile_to_standard_hard_tune_source;
+    All => All,
+    Music => Music,
+    Game => Game,
+    LineIn => LineIn,
+    System => System,
 }
 
-#[allow(dead_code)]
-fn standard_to_profile_megaphone_style(style: goxlr_types::MegaphoneStyle) -> MegaphoneStyle {
-    match style {
-        goxlr_types::MegaphoneStyle::Megaphone => MegaphoneStyle::Megaphone,
-        goxlr_types::MegaphoneStyle::Radio => MegaphoneStyle::Radio,
-        goxlr_types::MegaphoneStyle::OnThePhone => MegaphoneStyle::OnThePhone,
-        goxlr_types::MegaphoneStyle::Overdrive => MegaphoneStyle::Overdrive,
-        goxlr_types::MegaphoneStyle::BuzzCutt => MegaphoneStyle::BuzzCutt,
-        goxlr_types::MegaphoneStyle::Tweed => MegaphoneStyle::Tweed,
-    }
-}
-
-fn profile_to_standard_megaphone_style(style: &MegaphoneStyle) -> goxlr_types::MegaphoneStyle {
-    match style {
-        MegaphoneStyle::Megaphone => goxlr_types::MegaphoneStyle::Megaphone,
-        MegaphoneStyle::Radio => goxlr_types::MegaphoneStyle::Radio,
-        MegaphoneStyle::OnThePhone => goxlr_types::MegaphoneStyle::OnThePhone,
-        MegaphoneStyle::Overdrive => goxlr_types::MegaphoneStyle::Overdrive,
-        MegaphoneStyle::BuzzCutt => goxlr_types::MegaphoneStyle::BuzzCutt,
-        MegaphoneStyle::Tweed => goxlr_types::MegaphoneStyle::Tweed,
-    }
-}
-
-#[allow(dead_code)]
-fn standard_to_profile_robot_style(style: goxlr_types::RobotStyle) -> RobotStyle {
-    match style {
-        goxlr_types::RobotStyle::Robot1 => RobotStyle::Robot1,
-        goxlr_types::RobotStyle::Robot2 => RobotStyle::Robot2,
-        goxlr_types::RobotStyle::Robot3 => RobotStyle::Robot3,
-    }
-}
-
-fn profile_to_standard_robot_style(style: &RobotStyle) -> goxlr_types::RobotStyle {
-    match style {
-        RobotStyle::Robot1 => goxlr_types::RobotStyle::Robot1,
-        RobotStyle::Robot2 => goxlr_types::RobotStyle::Robot2,
-        RobotStyle::Robot3 => goxlr_types::RobotStyle::Robot3,
-    }
-}
-
-#[allow(dead_code)]
-fn standard_to_profile_hard_tune_style(style: goxlr_types::HardTuneStyle) -> HardTuneStyle {
-    match style {
-        goxlr_types::HardTuneStyle::Natural => HardTuneStyle::Natural,
-        goxlr_types::HardTuneStyle::Medium => HardTuneStyle::Medium,
-        goxlr_types::HardTuneStyle::Hard => HardTuneStyle::Hard,
-    }
-}
-
-fn profile_to_standard_hard_tune_style(style: &HardTuneStyle) -> goxlr_types::HardTuneStyle {
-    match style {
-        HardTuneStyle::Natural => goxlr_types::HardTuneStyle::Natural,
-        HardTuneStyle::Medium => goxlr_types::HardTuneStyle::Medium,
-        HardTuneStyle::Hard => goxlr_types::HardTuneStyle::Hard,
-    }
-}
-
-fn standard_to_profile_hard_tune_source(source: goxlr_types::HardTuneSource) -> HardTuneSource {
-    match source {
-        goxlr_types::HardTuneSource::All => HardTuneSource::All,
-        goxlr_types::HardTuneSource::Music => HardTuneSource::Music,
-        goxlr_types::HardTuneSource::Game => HardTuneSource::Game,
-        goxlr_types::HardTuneSource::LineIn => HardTuneSource::LineIn,
-        goxlr_types::HardTuneSource::System => HardTuneSource::System,
-    }
-}
-
-fn profile_to_standard_hard_tune_source(source: &HardTuneSource) -> goxlr_types::HardTuneSource {
-    match source {
-        HardTuneSource::All => goxlr_types::HardTuneSource::All,
-        HardTuneSource::Music => goxlr_types::HardTuneSource::Music,
-        HardTuneSource::Game => goxlr_types::HardTuneSource::Game,
-        HardTuneSource::LineIn => goxlr_types::HardTuneSource::LineIn,
-        HardTuneSource::System => goxlr_types::HardTuneSource::System,
-    }
-}
-
-fn profile_to_standard_mix(source: Mix) -> goxlr_types::Mix {
-    match source {
-        Mix::A => goxlr_types::Mix::A,
-        Mix::B => goxlr_types::Mix::B,
-    }
-}
-
-#[allow(unused)]
-fn standard_to_profile_mix(source: goxlr_types::Mix) -> Mix {
-    match source {
-        goxlr_types::Mix::A => Mix::A,
-        goxlr_types::Mix::B => Mix::B,
-    }
+bimap! {
+    fn profile_to_standard_mix(Mix) -> goxlr_types::Mix;
+    fn standard_to_profile_mix;
+    A => A,
+    B => B,
 }
 
 fn submix_standard_to_profile_input(source: SubMixChannelName) -> InputChannels {
@@ -3408,26 +3289,15 @@ pub fn channel_name_to_submix(source: ChannelName) -> Option<SubMixChannelName> 
     }
 }
 
-pub fn profile_to_standard_animation_mode(mode: AnimationMode) -> goxlr_types::AnimationMode {
-    match mode {
-        AnimationMode::RetroRainbow => goxlr_types::AnimationMode::RetroRainbow,
-        AnimationMode::RainbowDark => goxlr_types::AnimationMode::RainbowDark,
-        AnimationMode::RainbowBright => goxlr_types::AnimationMode::RainbowBright,
-        AnimationMode::Simple => goxlr_types::AnimationMode::Simple,
-        AnimationMode::Ripple => goxlr_types::AnimationMode::Ripple,
-        AnimationMode::None => goxlr_types::AnimationMode::None,
-    }
-}
-
-pub fn standard_to_profile_animation_mode(mode: goxlr_types::AnimationMode) -> AnimationMode {
-    match mode {
-        goxlr_types::AnimationMode::RetroRainbow => AnimationMode::RetroRainbow,
-        goxlr_types::AnimationMode::RainbowDark => AnimationMode::RainbowDark,
-        goxlr_types::AnimationMode::RainbowBright => AnimationMode::RainbowBright,
-        goxlr_types::AnimationMode::Simple => AnimationMode::Simple,
-        goxlr_types::AnimationMode::Ripple => AnimationMode::Ripple,
-        goxlr_types::AnimationMode::None => AnimationMode::None,
-    }
+bimap! {
+    pub fn profile_to_standard_animation_mode(AnimationMode) -> goxlr_types::AnimationMode;
+    pub fn standard_to_profile_animation_mode;
+    RetroRainbow => RetroRainbow,
+    RainbowDark => RainbowDark,
+    RainbowBright => RainbowBright,
+    Simple => Simple,
+    Ripple => Ripple,
+    None => None,
 }
 
 pub fn profile_to_standard_animation_waterfall(
@@ -3488,8 +3358,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enum_mappings_go_both_ways() {
+        for channel in ChannelName::iter() {
+            assert_eq!(
+                profile_to_standard_channel(standard_to_profile_channel(channel)),
+                channel
+            );
+        }
+        for input in InputDevice::iter() {
+            assert_eq!(
+                profile_to_standard_input(standard_input_to_profile(input)),
+                input
+            );
+        }
+        for style in goxlr_types::ReverbStyle::iter() {
+            let profile = standard_to_profile_reverb_style(style);
+            assert_eq!(profile_to_standard_reverb_style(profile), style);
+        }
+    }
+
+    #[test]
     fn renames_samples_in_saved_profiles() {
-        let dir = std::env::temp_dir().join(format!("goxlr-test-profiles-{}", std::process::id()));
+        let root = tempfile::tempdir().unwrap();
+        let (dir, backups) = (root.path().join("profiles"), root.path().join("backups"));
         std::fs::create_dir_all(&dir).unwrap();
 
         // A saved profile with a sample on a button
@@ -3504,15 +3395,20 @@ mod tests {
             .save_as("Other".to_string(), &dir, false)
             .unwrap();
 
-        let changed = rename_sample_in_saved_profiles(&dir, "intro.wav", "start.wav");
+        let changed = rename_sample_in_saved_profiles(&dir, &backups, "intro.wav", "start.wav");
         assert_eq!(changed, vec!["Stream".to_string()]);
+
+        // The profile as it was is kept in the backups
+        let kept: Vec<_> = std::fs::read_dir(backups.join("sample-renames"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(kept[0].path().join("Stream.goxlr").is_file());
 
         // Reloaded from disk, the button now uses the new name
         let mut reloaded = ProfileAdapter::from_named("Stream".to_string(), &dir).unwrap();
         assert!(reloaded.rename_sample_file("start.wav", "check.wav"));
         assert!(!reloaded.rename_sample_file("intro.wav", "check.wav"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -3543,4 +3439,10 @@ mod fingerprint_tests {
             MicProfileAdapter::default().fingerprint()
         );
     }
+}
+
+/// Whether a mute button state means "nobody hears it": muted to all (held), or muted while the
+/// button's function is All. The one place this rule is written, for faders and the cough button.
+pub fn hard_muted(muted_to_x: bool, muted_to_all: bool, mute_function: MuteFunction) -> bool {
+    muted_to_all || (muted_to_x && mute_function == MuteFunction::All)
 }

@@ -33,7 +33,12 @@ impl MixRoutingTree {
             // they have different names to anywhere else, so we'll do it by hand.
 
             // Firstly, work out the Mix value..
-            if let Some(value) = Mix::iter().nth(attr.value.parse::<usize>()? - 1) {
+            if let Some(value) = attr
+                .value
+                .parse::<usize>()?
+                .checked_sub(1)
+                .and_then(|index| Mix::iter().nth(index))
+            {
                 if attr.name == "headphone" {
                     self.mix[OutputChannels::Headphones] = value;
                     continue;

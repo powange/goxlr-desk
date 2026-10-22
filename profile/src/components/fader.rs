@@ -8,6 +8,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::Faders;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourDisplay, ColourMap, ColourOffStyle};
 use crate::components::mixer::FullChannelList;
 use crate::profile::Attribute;
@@ -32,6 +33,9 @@ pub enum ParseError {
 pub struct Fader {
     colour_map: ColourMap,
     channel: FullChannelList,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl Fader {
@@ -57,6 +61,7 @@ impl Fader {
         Self {
             colour_map,
             channel,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -75,14 +80,14 @@ impl Fader {
                 }
 
                 if !found {
-                    println!("Cannot Find Fader Index: {}", attr.value);
+                    log::warn!("Cannot Find Fader Index: {}", attr.value);
                 }
                 continue;
             }
 
             // Send the rest out for colouring..
             if !self.colour_map.read_colours(attr)? {
-                println!("[FADER] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -102,6 +107,7 @@ impl Fader {
         self.colour_map
             .write_colours_with_prefix(element_name.into(), &mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

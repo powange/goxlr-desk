@@ -24,6 +24,7 @@ pub enum ParseError {
     #[error("[COUGH] Invalid colours: {0}")]
     InvalidColours(#[from] crate::components::colours::ParseError),
 }
+use crate::components::UnknownAttributes;
 use crate::enum_from_index;
 use crate::profile::Attribute;
 use log::warn;
@@ -47,6 +48,9 @@ pub struct MuteChat {
     cough_behaviour: CoughToggle,
     cough_mute_source: MuteFunction,
     cough_button_on: bool,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl MuteChat {
@@ -67,13 +71,25 @@ impl MuteChat {
             cough_behaviour: Hold,
             cough_mute_source: MuteFunction::All,
             cough_button_on: false,
+            unknown: UnknownAttributes::default(),
         }
     }
 
     pub fn parse_mute_chat(&mut self, attributes: &Vec<Attribute>) -> Result<(), ParseError> {
         for attr in attributes {
             if attr.name == "micIsAnActiveFader" {
-                self.mic_fader_id = attr.value.parse()?;
+                // 0 to 3 are the faders, 4 is none; anything else (or unreadable) is none too,
+                // rather than a fader picked by accident or a profile refused
+                self.mic_fader_id = match attr.value.trim().parse::<u8>() {
+                    Ok(id) if id <= 4 => id,
+                    _ => {
+                        log::warn!(
+                            "micIsAnActiveFader: {} isn't a fader, the mic isn't on one",
+                            attr.value
+                        );
+                        4
+                    }
+                };
                 continue;
             }
 
@@ -105,7 +121,7 @@ impl MuteChat {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -148,6 +164,7 @@ impl MuteChat {
 
         self.colour_map.write_colours(&mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

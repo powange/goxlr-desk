@@ -2,7 +2,7 @@ use ab_glyph::{FontRef, PxScale};
 use anyhow::{Result, bail};
 use image::ImageFormat::Png;
 use image::imageops::{BiLevel, FilterType, dither, overlay};
-use image::{ColorType, DynamicImage, GenericImage, GenericImageView, GrayImage, Luma, Rgba};
+use image::{DynamicImage, GenericImage, GenericImageView, GrayImage, Luma, Rgba};
 use imageproc::drawing::{draw_text_mut, text_size};
 use log::warn;
 use std::borrow::BorrowMut;
@@ -119,7 +119,8 @@ fn load_grayscale_image(path: PathBuf) -> Result<DynamicImage> {
 
     let mut img = img.grayscale();
 
-    if img.color() == ColorType::La8 || img.color() == ColorType::L16 {
+    // Any image with transparency (LA8, LA16 for 16 bit icons..), L16 has no alpha channel
+    if img.color().has_alpha() {
         // Ensure any fully transparent pixels are white..
         for (x, y, pixel) in img.clone().pixels() {
             if pixel[3] == 0 {
@@ -142,6 +143,10 @@ fn create_text_image(text: &str) -> Result<DynamicImage> {
     // Calculate the draw width..
     let (width, _height) = text_size(scale, &draw_font, text);
     let draw_width = if width < 128 { width } else { 128 };
+    // An empty text has no width, and an image with no width can't be drawn on
+    if draw_width == 0 {
+        bail!("No text to draw");
+    }
 
     let mut image = DynamicImage::new_rgb8(draw_width, 19);
     image
@@ -149,9 +154,10 @@ fn create_text_image(text: &str) -> Result<DynamicImage> {
         .pixels()
         .for_each(|f| image.put_pixel(f.0, f.1, Rgba::from([255, 255, 255, 255])));
 
+    // Opaque black: the alpha is used when drawing (a transparent colour draws nothing)
     draw_text_mut(
         &mut image,
-        Rgba::from([0, 0, 0, 0]),
+        Rgba::from([0, 0, 0, 255]),
         0,
         0,
         scale,
@@ -228,8 +234,8 @@ fn to_goxlr(img: GrayImage, invert: bool) -> Result<[u8; 1024]> {
     let mut bytes: [u8; 1024] = [base; 1024];
     let white = Luma::from([255_u8]);
 
-    for x in 0..img.width() - 1 {
-        for y in 0..img.height() - 1 {
+    for x in 0..img.width() {
+        for y in 0..img.height() {
             if img.get_pixel(x, y) != &white {
                 let byte = ((128 * (y / 8)) + x) as usize;
                 let bit = y % 8;
@@ -240,4 +246,38 @@ fn to_goxlr(img: GrayImage, invert: bool) -> Result<[u8; 1024]> {
         }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// The 1-bit image the GoXLR receives for a few texts (an empty one included), compared
+    /// with what was drawn so far: a change of the drawing library mustn't move a pixel
+    /// (imageproc 0.27 moves the text by one).
+    #[test]
+    fn text_renders_as_before() {
+        let render = |top: &str, bottom: &str, invert: bool| {
+            get_scribble(
+                None,
+                Some(bottom.to_string()),
+                Some(top.to_string()),
+                invert,
+            )
+        };
+        let mut all = Vec::new();
+        for (top, bottom, invert) in [
+            ("Mic", "Chat", false),
+            ("1", "Game Audio", true),
+            ("", "AaWw@gjpqy", false),
+        ] {
+            all.extend_from_slice(&render(top, bottom, invert));
+        }
+        let sum = all.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        });
+        assert_eq!(format!("{sum:x}"), EXPECTED);
+    }
+
+    const EXPECTED: &str = "bf62d1399da4b053";
 }

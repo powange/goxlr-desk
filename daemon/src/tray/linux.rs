@@ -19,7 +19,12 @@ pub async fn handle_tray(mut stop: Shutdown, tx: mpsc::Sender<EventTriggers>) ->
     // gnome, where occasionally the icon will not correctly spawn.
 
     // We'll dump the icon here :)
-    let tmp_file_dir = PathBuf::from("/tmp/goxlr-utility/");
+    // This user's runtime folder (private to them), not a folder of /tmp shared by everyone
+    let tmp_file_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("goxlr-utility-{}", nix_uid())))
+        .join("goxlr-utility");
 
     // Extract the icon to a temporary directory, and pass its path..
     let tmp_file_path = tmp_file_dir.join("goxlr-utility-icon.png");
@@ -249,4 +254,8 @@ impl Tray for GoXLRTray {
         );
         menu
     }
+}
+
+fn nix_uid() -> u32 {
+    nix::unistd::Uid::current().as_raw()
 }

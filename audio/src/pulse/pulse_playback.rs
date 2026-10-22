@@ -9,7 +9,12 @@ use std::time::Duration;
 
 pub struct PulsePlayback {
     pulse_simple: Simple,
+    // Reused for each write, rather than allocating one per packet
+    bytes: Vec<u8>,
 }
+
+// How much audio the server keeps ahead: 20 ms, a scheduling hiccup doesn't make it underrun
+const TARGET_LATENCY_MS: u32 = 20;
 
 impl OpenOutputStream for PulsePlayback {
     fn open(spec: AudioSpecification) -> Result<Box<dyn AudioOutput>> {
@@ -34,9 +39,10 @@ impl OpenOutputStream for PulsePlayback {
         };
 
         // We need to maintain a relatively small buffer..
+        let bytes_per_second = pulse_spec.rate * pulse_spec.channels as u32 * 4;
         let pulse_buffer_attributes = BufferAttr {
             maxlength: u32::MAX,
-            tlength: 1024,
+            tlength: bytes_per_second * TARGET_LATENCY_MS / 1000,
             prebuf: u32::MAX,
             minreq: u32::MAX,
             fragsize: u32::MAX,
@@ -57,7 +63,10 @@ impl OpenOutputStream for PulsePlayback {
         match pulse {
             Ok(pulse_simple) => {
                 thread::sleep(Duration::from_millis(75));
-                Ok(Box::new(PulsePlayback { pulse_simple }))
+                Ok(Box::new(PulsePlayback {
+                    pulse_simple,
+                    bytes: vec![],
+                }))
             }
             Err(_) => Err(anyhow!("Unable to Connect to Pulse")),
         }
@@ -66,14 +75,17 @@ impl OpenOutputStream for PulsePlayback {
 
 impl AudioOutput for PulsePlayback {
     fn write(&mut self, samples: &[f32]) -> Result<()> {
-        let mut buffer = vec![];
-
+        // The stream is FLOAT32NE: native byte order
+        self.bytes.clear();
         for sample in samples {
-            buffer.extend_from_slice(&sample.to_le_bytes());
+            self.bytes.extend_from_slice(&sample.to_ne_bytes());
         }
 
-        let _ = self.pulse_simple.write(buffer.as_slice());
-        Ok(())
+        // A dead stream is an error, otherwise the player would run through the file at full
+        // speed without playing anything.
+        self.pulse_simple
+            .write(self.bytes.as_slice())
+            .map_err(|e| anyhow!("Unable to play on PulseAudio: {}", e))
     }
 
     fn flush(&mut self) {

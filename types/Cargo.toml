@@ -12,8 +12,10 @@ repository.workspace = true
 
 [features]
 default = []
+schema = ["serde", "dep:schemars"]
 
 [dependencies]
+schemars = { workspace = true, optional = true }
 # Common Workspace
 strum = { workspace = true }
 serde = { workspace = true, optional = true }
@@ -22,4 +24,6 @@ clap = { workspace = true, optional = true }
 
 
 serde_repr = "0.1.20"
-derivative = "2.2.0"
+
+[lints]
+workspace = true

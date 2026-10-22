@@ -5,14 +5,17 @@ use std::os::raw::c_float;
 use enum_map::{Enum, EnumMap};
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap};
 use crate::components::reverb::ReverbStyle::Library;
+use crate::components::{check_range, knob_to_percentage, percentage_to_knob, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -40,6 +43,9 @@ pub struct ReverbEncoderBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, ReverbEncoder>,
     active_set: u8, // Not sure what this does?
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl ReverbEncoderBase {
@@ -54,6 +60,7 @@ impl ReverbEncoderBase {
             colour_map,
             preset_map: EnumMap::default(),
             active_set: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -65,7 +72,7 @@ impl ReverbEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[ReverbEncoder] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -79,12 +86,13 @@ impl ReverbEncoderBase {
     ) -> Result<(), ParseError> {
         let mut preset = ReverbEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "REVERB_STYLE" {
-                for style in ReverbStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<ReverbStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
@@ -102,56 +110,7 @@ impl ReverbEncoderBase {
                 continue;
             }
 
-            if attr.name == "REVERB_TYPE" {
-                preset.reverb_type = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "REVERB_DECAY" {
-                preset.decay = attr.value.parse::<c_float>()? as u16;
-                continue;
-            }
-            if attr.name == "REVERB_PREDELAY" {
-                preset.pre_delay = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "REVERB_DIFFUSE" {
-                preset.diffuse = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_LOCOLOR" {
-                preset.low_color = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_HICOLOR" {
-                preset.high_color = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_HIFACTOR" {
-                preset.high_factor = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_MODSPEED" {
-                preset.mod_speed = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_MODDEPTH" {
-                preset.mod_depth = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_EARLYLEVEL" {
-                preset.early_level = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_TAILLEVEL" {
-                preset.tail_level = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-            if attr.name == "REVERB_DRYLEVEL" {
-                preset.dry_level = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-
-            println!("[ReverbEncoder] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         // Ok, we should be able to store this now..
@@ -167,6 +126,7 @@ impl ReverbEncoderBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -203,43 +163,9 @@ impl ReverbEncoderBase {
             "REVERB_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("REVERB_TYPE".to_string(), format!("{}", value.reverb_type));
-        attributes.insert("REVERB_DECAY".to_string(), format!("{}", value.decay));
-        attributes.insert(
-            "REVERB_PREDELAY".to_string(),
-            format!("{}", value.pre_delay),
-        );
-        attributes.insert("REVERB_DIFFUSE".to_string(), format!("{}", value.diffuse));
-        attributes.insert("REVERB_LOCOLOR".to_string(), format!("{}", value.low_color));
-        attributes.insert(
-            "REVERB_HICOLOR".to_string(),
-            format!("{}", value.high_color),
-        );
-        attributes.insert(
-            "REVERB_HIFACTOR".to_string(),
-            format!("{}", value.high_factor),
-        );
-        attributes.insert(
-            "REVERB_MODSPEED".to_string(),
-            format!("{}", value.mod_speed),
-        );
-        attributes.insert(
-            "REVERB_MODDEPTH".to_string(),
-            format!("{}", value.mod_depth),
-        );
-        attributes.insert(
-            "REVERB_EARLYLEVEL".to_string(),
-            format!("{}", value.early_level),
-        );
-        attributes.insert(
-            "REVERB_TAILLEVEL".to_string(),
-            format!("{}", value.tail_level),
-        );
-        attributes.insert(
-            "REVERB_DRYLEVEL".to_string(),
-            format!("{}", value.dry_level),
-        );
+        value.write_numeric(&mut attributes);
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -258,7 +184,7 @@ impl ReverbEncoderBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ReverbEncoder {
     knob_position: i8,
     style: ReverbStyle,
@@ -274,6 +200,9 @@ pub struct ReverbEncoder {
     early_level: i8,
     tail_level: i8,
     dry_level: i8, // Dry level exists in the config, but is never sent?
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl ReverbEncoder {
@@ -293,6 +222,7 @@ impl ReverbEncoder {
             early_level: 0,
             tail_level: 0,
             dry_level: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -303,13 +233,11 @@ impl ReverbEncoder {
     // TODO: As with echo, we probably shouldn't do this!
     pub fn get_percentage_amount(&self) -> u8 {
         // Knob Position and Amount are two very different things, so is percentage :)
-        ((self.knob_position as u16 * 100) / 24) as u8
+        knob_to_percentage(self.knob_position)
     }
     pub fn set_percentage_amount(&mut self, percentage: u8) -> Result<()> {
-        if percentage > 100 {
-            return Err(anyhow!("Value must be a percentage"));
-        }
-        self.set_knob_position(((percentage as i16 * 24) / 100) as i8)?;
+        check_range(percentage, ranges::PERCENTAGE, "Amount")?;
+        self.set_knob_position(percentage_to_knob(percentage))?;
         Ok(())
     }
 
@@ -317,9 +245,7 @@ impl ReverbEncoder {
         self.knob_position
     }
     pub fn set_knob_position(&mut self, knob_position: i8) -> Result<()> {
-        if !(0..=24).contains(&knob_position) {
-            return Err(anyhow!("Reverb Knob Position should be between 0 and 24"));
-        }
+        check_range(knob_position, ranges::KNOB, "Reverb Knob Position")?;
 
         self.knob_position = knob_position;
         Ok(())
@@ -362,21 +288,17 @@ impl ReverbEncoder {
     }
 
     pub fn get_decay_millis(&self) -> u16 {
-        let decay = self.decay;
-        if decay <= 100 {
-            return decay * 10;
-        }
-
-        let base = 1000;
-        let current = decay - 100;
-        let addition = current * 100;
-        base + addition
+        let decay = self.decay as u32;
+        let millis = if decay <= 100 {
+            decay * 10
+        } else {
+            1000 + (decay - 100) * 100
+        };
+        millis.min(u16::MAX as u32) as u16
     }
     pub fn set_decay_millis(&mut self, milliseconds: u16) -> Result<()> {
         // We're going to handle the conversion here directly..
-        if !(10..=20000).contains(&milliseconds) {
-            return Err(anyhow!("Decay should be between 10 and 20000 milliseconds"));
-        }
+        check_range(milliseconds, ranges::REVERB_DECAY_MILLIS, "Decay")?;
 
         // For everything below 1000ms, the division is ms / 10..
         if milliseconds <= 1000 {
@@ -404,9 +326,7 @@ impl ReverbEncoder {
         self.pre_delay
     }
     pub fn set_predelay(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Predelay must be between 0 and 100ms"));
-        }
+        check_range(value, ranges::REVERB_PREDELAY, "Predelay")?;
         self.pre_delay = value;
         Ok(())
     }
@@ -415,9 +335,7 @@ impl ReverbEncoder {
         self.diffuse
     }
     pub fn set_diffuse(&mut self, value: i8) -> Result<()> {
-        if !(-50..=50).contains(&value) {
-            return Err(anyhow!("Diffuse should be between -50 and 50"));
-        }
+        check_range(value, ranges::REVERB_DIFFUSE, "Diffuse")?;
         self.diffuse = value;
         Ok(())
     }
@@ -426,9 +344,7 @@ impl ReverbEncoder {
         self.low_color
     }
     pub fn set_low_color(&mut self, value: i8) -> Result<()> {
-        if !(-50..=50).contains(&value) {
-            return Err(anyhow!("LoColour should be between -50 and 50"));
-        }
+        check_range(value, ranges::REVERB_COLOUR, "LoColour")?;
         self.low_color = value;
         Ok(())
     }
@@ -437,9 +353,7 @@ impl ReverbEncoder {
         self.high_color
     }
     pub fn set_hi_color(&mut self, value: i8) -> Result<()> {
-        if !(-50..=50).contains(&value) {
-            return Err(anyhow!("HiColour should be between -50 and 50"));
-        }
+        check_range(value, ranges::REVERB_COLOUR, "HiColour")?;
         self.high_color = value;
         Ok(())
     }
@@ -448,9 +362,7 @@ impl ReverbEncoder {
         self.high_factor
     }
     pub fn set_hi_factor(&mut self, value: i8) -> Result<()> {
-        if !(-25..=25).contains(&value) {
-            return Err(anyhow!("HiFactor should be between -25 and 25"));
-        }
+        check_range(value, ranges::REVERB_HIGH_FACTOR, "HiFactor")?;
         self.high_factor = value;
         Ok(())
     }
@@ -459,9 +371,7 @@ impl ReverbEncoder {
         self.mod_speed
     }
     pub fn set_mod_speed(&mut self, value: i8) -> Result<()> {
-        if !(-25..=25).contains(&value) {
-            return Err(anyhow!("Mod Speed should be between -25 and 25"));
-        }
+        check_range(value, ranges::REVERB_MOD, "Mod Speed")?;
         self.mod_speed = value;
         Ok(())
     }
@@ -470,9 +380,7 @@ impl ReverbEncoder {
         self.mod_depth
     }
     pub fn set_mod_depth(&mut self, value: i8) -> Result<()> {
-        if !(-25..=25).contains(&value) {
-            return Err(anyhow!("Mod Depth should be between -25 and 25"));
-        }
+        check_range(value, ranges::REVERB_MOD, "Mod Depth")?;
         self.mod_depth = value;
         Ok(())
     }
@@ -481,9 +389,7 @@ impl ReverbEncoder {
         self.early_level
     }
     pub fn set_early_level(&mut self, value: i8) -> Result<()> {
-        if !(-25..=0).contains(&value) {
-            return Err(anyhow!("Early Level should be between -25 and 0"));
-        }
+        check_range(value, ranges::REVERB_LEVEL, "Early Level")?;
         self.early_level = value;
         Ok(())
     }
@@ -493,9 +399,7 @@ impl ReverbEncoder {
         self.tail_level
     }
     pub fn set_tail_level(&mut self, value: i8) -> Result<()> {
-        if !(-25..=0).contains(&value) {
-            return Err(anyhow!("Tail Level should be between -25 and 0"));
-        }
+        check_range(value, ranges::REVERB_LEVEL, "Tail Level")?;
         self.tail_level = value;
         Ok(())
     }
@@ -625,3 +529,18 @@ impl ReverbPreset {
         }
     }
 }
+
+numeric_attributes!(ReverbEncoder {
+    reverb_type: u8 = "REVERB_TYPE",
+    decay: u16 = "REVERB_DECAY" in ranges::REVERB_DECAY,
+    pre_delay: u8 = "REVERB_PREDELAY" in ranges::REVERB_PREDELAY,
+    diffuse: i8 = "REVERB_DIFFUSE" in ranges::REVERB_DIFFUSE,
+    low_color: i8 = "REVERB_LOCOLOR" in ranges::REVERB_COLOUR,
+    high_color: i8 = "REVERB_HICOLOR" in ranges::REVERB_COLOUR,
+    high_factor: i8 = "REVERB_HIFACTOR" in ranges::REVERB_HIGH_FACTOR,
+    mod_speed: i8 = "REVERB_MODSPEED" in ranges::REVERB_MOD,
+    mod_depth: i8 = "REVERB_MODDEPTH" in ranges::REVERB_MOD,
+    early_level: i8 = "REVERB_EARLYLEVEL" in ranges::REVERB_LEVEL,
+    tail_level: i8 = "REVERB_TAILLEVEL" in ranges::REVERB_LEVEL,
+    dry_level: i8 = "REVERB_DRYLEVEL",
+});

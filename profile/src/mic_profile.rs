@@ -49,6 +49,7 @@ impl MicProfileSettings {
 
         let mut buf = Vec::new();
         loop {
+            buf.clear();
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Empty(ref e)) => {
                     let (name, attributes) = wrap_start_event(e)?;
@@ -98,7 +99,7 @@ impl MicProfileSettings {
                         continue;
                     }
 
-                    println!("Unhandled Tag: {name}");
+                    log::warn!("Unhandled Tag: {name}");
                 }
 
                 Ok(Event::Eof) => {

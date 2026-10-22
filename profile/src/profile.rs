@@ -50,6 +50,9 @@ pub struct Attribute {
     pub(crate) value: String,
 }
 
+// A screen image is a few KB; anything this large isn't one
+const MAX_SCRIBBLE_SIZE: u64 = 1024 * 1024;
+
 impl Profile {
     pub fn load<R: Read + std::io::Seek>(read: R) -> Result<Self> {
         debug!("Loading Profile Archive..");
@@ -61,9 +64,15 @@ impl Profile {
         // Load the scribbles if they exist, store them in memory for later fuckery.
         for (i, scribble) in scribbles.iter_mut().enumerate() {
             let filename = format!("scribble{}.png", i + 1);
-            if let Ok(mut file) = archive.by_name(filename.as_str()) {
-                *scribble = vec![0; file.size() as usize];
-                file.read_exact(scribble)?;
+            if let Ok(file) = archive.by_name(filename.as_str()) {
+                // The size comes from the archive itself: read at most a sane amount
+                let mut data = Vec::new();
+                file.take(MAX_SCRIBBLE_SIZE + 1).read_to_end(&mut data)?;
+                if data.len() as u64 > MAX_SCRIBBLE_SIZE {
+                    warn!("Ignoring {}, it's too large for a screen image", filename);
+                    continue;
+                }
+                *scribble = data;
             }
         }
 
@@ -245,6 +254,7 @@ impl ProfileSettings {
 
         let mut buf = Vec::new();
         loop {
+            buf.clear();
             match reader.read_event_into(&mut buf) {
                 // Applies to most tags, represents a tag with no child
                 Ok(Event::Empty(ref e)) => {
@@ -394,9 +404,13 @@ impl ProfileSettings {
                         || name == "globalColour"
                         || name == "logoX"
                     {
-                        // In this case, the tag name, and attribute prefixes are the same..
-                        let element = SimpleElements::from_str(&name)?;
-                        simple_elements[element].parse_simple(&attributes)?;
+                        // In this case, the tag name, and attribute prefixes are the same.. An
+                        // element this version doesn't know (a 'sampleBankD') is skipped rather
+                        // than failing the whole profile.
+                        match SimpleElements::from_str(&name) {
+                            Ok(element) => simple_elements[element].parse_simple(&attributes)?,
+                            Err(_) => warn!("Skipping unknown element {}", name),
+                        }
 
                         continue;
                     }
@@ -536,7 +550,35 @@ impl ProfileSettings {
         })
     }
 
+    /// Loads an effect preset into the active effect bank. It's all or nothing: a preset that
+    /// can't be read completely leaves the bank as it was.
     pub fn load_preset<R: Read>(&mut self, read: R) -> Result<()> {
+        let current = self.context().selected_effects();
+        let before = (
+            self.reverb_encoder.get_preset(current).clone(),
+            self.echo_encoder.get_preset(current).clone(),
+            self.pitch_encoder.get_preset(current).clone(),
+            self.gender_encoder.get_preset(current).clone(),
+            self.megaphone_effect.get_preset(current).clone(),
+            self.robot_effect.get_preset(current).clone(),
+            self.hardtune_effect.get_preset(current).clone(),
+            self.effects(current).name().to_string(),
+        );
+        let result = self.read_preset(read);
+        if result.is_err() {
+            *self.reverb_encoder.get_preset_mut(current) = before.0;
+            *self.echo_encoder.get_preset_mut(current) = before.1;
+            *self.pitch_encoder.get_preset_mut(current) = before.2;
+            *self.gender_encoder.get_preset_mut(current) = before.3;
+            *self.megaphone_effect.get_preset_mut(current) = before.4;
+            *self.robot_effect.get_preset_mut(current) = before.5;
+            *self.hardtune_effect.get_preset_mut(current) = before.6;
+            self.effects_mut(current).set_loaded_name(before.7);
+        }
+        result
+    }
+
+    fn read_preset<R: Read>(&mut self, read: R) -> Result<()> {
         let buf_reader = BufReader::new(read);
         let mut reader = Reader::from_reader(buf_reader);
 
@@ -548,6 +590,7 @@ impl ProfileSettings {
         let current = self.context().selected_effects();
         let mut buf = Vec::new();
         loop {
+            buf.clear();
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Empty(ref e)) => {
                     let (name, attributes) = wrap_start_event(e)?;
@@ -588,7 +631,7 @@ impl ProfileSettings {
                     for attribute in attributes {
                         if attribute.name == "name" {
                             found = true;
-                            self.effects_mut(current).set_name(attribute.value)?;
+                            self.effects_mut(current).set_loaded_name(attribute.value);
                             break;
                         }
                     }
@@ -604,7 +647,7 @@ impl ProfileSettings {
                 }
 
                 Ok(_) => {}
-                Err(_) => {}
+                Err(e) => bail!("The preset can't be read: {}", e),
             }
         }
         Ok(())
@@ -778,7 +821,8 @@ impl ProfileSettings {
             .last()
             .map(|s| u8::from_str(&s.to_string()))
             .transpose()?
-            && let Some(preset) = Preset::iter().nth((id - 1) as usize)
+            && let Some(index) = id.checked_sub(1)
+            && let Some(preset) = Preset::iter().nth(index as usize)
         {
             return Ok(preset);
         }
@@ -894,6 +938,13 @@ impl ProfileSettings {
 
     /// Points every sampler track using the sample file `old` at `new` instead (a sample file
     /// was renamed). Returns how many tracks were changed.
+    pub fn reset_sample_file(&mut self, name: &str, gain: f64) -> usize {
+        self.sampler_map
+            .values_mut()
+            .map(|button| button.reset_track_file(name, gain))
+            .sum()
+    }
+
     pub fn rename_sample_file(&mut self, old: &str, new: &str) -> usize {
         self.sampler_map
             .values_mut()
@@ -1004,6 +1055,307 @@ mod tests {
         assert!(ProfileSettings::load(TEST_PROFILE.as_bytes()).is_ok());
     }
 
+    /// Every element with its attributes sorted (they're written from HashMaps, in any order).
+    fn normalised(xml: &[u8]) -> Vec<String> {
+        let mut reader = Reader::from_reader(xml);
+        let (mut lines, mut buf) = (Vec::new(), Vec::new());
+        loop {
+            match reader.read_event_into(&mut buf).unwrap() {
+                Event::Start(e) | Event::Empty(e) => {
+                    let mut attributes: Vec<String> = e
+                        .attributes()
+                        .map(|a| {
+                            let a = a.unwrap();
+                            let key = a.key.as_ref().to_string();
+                            format!("{key}={}", a.value)
+                        })
+                        .collect();
+                    attributes.sort();
+                    let name = e.name().as_ref().to_string();
+                    lines.push(format!("{name} {}", attributes.join(" ")));
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        lines
+    }
+
+    fn written(settings: &mut ProfileSettings) -> Vec<u8> {
+        let mut out = Vec::new();
+        settings.write_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_profile_round_trip() {
+        // What's written reads back to the same thing (load -> write -> load -> write)
+        let mut first = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let once = written(&mut first);
+        let mut second = ProfileSettings::load(&once[..]).unwrap();
+        let twice = written(&mut second);
+        assert_eq!(normalised(&once), normalised(&twice));
+
+        // And every effect preset value of the source is kept
+        let source = normalised(TEST_PROFILE.as_bytes());
+        let once = normalised(&once);
+        for prefix in [
+            "reverbEncoder",
+            "echoEncoder",
+            "pitchEncoder",
+            "genderEncoder",
+            "megaphoneEffect",
+            "robotEffect",
+            "hardtuneEffect",
+        ] {
+            let elements: Vec<&String> = source.iter().filter(|l| l.starts_with(prefix)).collect();
+            assert!(
+                !elements.is_empty(),
+                "{prefix} missing from the test profile"
+            );
+            for element in elements {
+                let name = element.split(' ').next().unwrap();
+                let out = once
+                    .iter()
+                    .find(|l| l.split(' ').next() == Some(name))
+                    .unwrap_or_else(|| panic!("{name} not written"));
+                for attribute in element.split(' ').skip(1) {
+                    let key = attribute.split('=').next().unwrap();
+                    assert!(
+                        out.split(' ').any(|a| a.starts_with(&format!("{key}="))),
+                        "{name}: {key} not written"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_profiles_keep_their_effect_values() {
+        // Their values are inside the ranges: loading and writing them changes nothing
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = vec![root.join("daemon/profiles/Default.goxlr")];
+        for entry in fs::read_dir(root.join("defaults/resources/profiles")).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+        for file in files {
+            let mut archive = zip::ZipArchive::new(File::open(&file).unwrap()).unwrap();
+            let mut source = String::new();
+            archive
+                .by_name("profile.xml")
+                .unwrap()
+                .read_to_string(&mut source)
+                .unwrap();
+            let mut settings = ProfileSettings::load(source.as_bytes()).unwrap();
+            let out = normalised(&written(&mut settings));
+            for element in normalised(source.as_bytes()) {
+                let mut parts = element.split(' ');
+                let name = parts.next().unwrap();
+                let effects = [
+                    "reverb",
+                    "echo",
+                    "pitch",
+                    "gender",
+                    "megaphone",
+                    "robot",
+                    "hardtune",
+                ];
+                if !effects.iter().any(|effect| name.starts_with(effect)) {
+                    continue;
+                }
+                let Some(line) = out.iter().find(|l| l.split(' ').next() == Some(name)) else {
+                    continue;
+                };
+                for attribute in parts {
+                    let Some((key, value)) = attribute.split_once('=') else {
+                        continue;
+                    };
+                    // Derived from the style when loading, not read
+                    if key == "PITCH_SHIFT_THRESHOLD" {
+                        continue;
+                    }
+                    let Ok(value) = value.parse::<f64>() else {
+                        continue;
+                    };
+                    let prefix = format!("{key}=");
+                    let Some(now) = line.split(' ').find(|a| a.starts_with(&prefix)) else {
+                        continue;
+                    };
+                    if let Ok(now) = now[prefix.len()..].parse::<f64>() {
+                        assert_eq!(
+                            value.trunc(),
+                            now,
+                            "{}: {name} {key} changed",
+                            file.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_attributes_are_written_back() {
+        // Attributes from a newer app, on an effect preset and on a root element
+        let profile = TEST_PROFILE
+            .replacen(
+                "<echoEncoderpreset1 DELAY_KNOB_POSITION=\"0\"",
+                "<echoEncoderpreset1 FUTURE_DELAY=\"7\" DELAY_KNOB_POSITION=\"0\"",
+                1,
+            )
+            .replacen(
+                "<mixerTree headphoneLevel",
+                "<mixerTree futureLevel=\"3\" headphoneLevel",
+                1,
+            );
+        let mut settings = ProfileSettings::load(profile.as_bytes()).unwrap();
+        let out = normalised(&written(&mut settings));
+        let line = |name: &str| out.iter().find(|l| l.starts_with(name)).unwrap().clone();
+        assert!(line("echoEncoderpreset1 ").contains("FUTURE_DELAY=7"));
+        assert!(line("mixerTree ").contains("futureLevel=3"));
+    }
+
+    #[test]
+    fn sample_stacks_keep_what_they_dont_know() {
+        use crate::components::sample::SampleBank;
+        let profile = TEST_PROFILE
+            .replacen(
+                "track_0NormalizedGain=\"11.26597213745117187500\" playbackMode=\"1\"",
+                "futureFade=\"4\" playbackMode=\"1\"",
+                1,
+            )
+            .replacen(
+                "<sampleStackC/>\n  </sampleTopLeft>",
+                "<sampleStackC/>\n    <sampleStackD sampleStackDstackSize=\"1\" track_0=\"x.wav\"/>\n  </sampleTopLeft>",
+                1,
+            );
+        assert_ne!(profile, TEST_PROFILE);
+        // A bank this version doesn't know doesn't fail the profile
+        let mut settings = ProfileSettings::load(profile.as_bytes()).unwrap();
+
+        // The track without its gain is kept, playing whole at an unchanged gain
+        let tracks = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(SampleBank::A)
+            .get_tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].normalized_gain(), 1.);
+        assert_eq!(tracks[0].end_position(), 100.);
+
+        let out = normalised(&written(&mut settings));
+        let line = out.iter().find(|l| l.starts_with("sampleStackA ")).unwrap();
+        assert!(line.contains("futureFade=4"), "{line}");
+        assert!(line.contains("track_0=Walkie Talkie Static.wav"), "{line}");
+    }
+
+    #[test]
+    fn a_mic_fader_id_out_of_range_means_no_fader() {
+        let with = |id: &str| {
+            let profile = TEST_PROFILE.replacen(
+                "micIsAnActiveFader=\"4\"",
+                &format!("micIsAnActiveFader=\"{id}\""),
+                1,
+            );
+            ProfileSettings::load(profile.as_bytes())
+                .unwrap()
+                .mute_chat()
+                .mic_fader_id()
+        };
+        assert_eq!(with("2"), 2);
+        assert_eq!(with("7"), 4);
+        assert_eq!(with("-1"), 4);
+        assert_eq!(with("x"), 4);
+    }
+
+    #[test]
+    fn a_broken_preset_changes_nothing() {
+        let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let current = settings.context().selected_effects();
+        let before = format!("{:?}", settings.reverb_encoder.get_preset(current));
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let preset = fs::read_to_string(root.join("defaults/resources/presets/Big Echo.preset"))
+            .unwrap()
+            .replace("TRANS_DIST_AMT=\"30\"", "TRANS_DIST_AMT=\"thirty\"");
+        // The reverb comes first in the file, the error is in the megaphone after it
+        assert!(settings.load_preset(preset.as_bytes()).is_err());
+        assert_eq!(
+            format!("{:?}", settings.reverb_encoder.get_preset(current)),
+            before
+        );
+
+        // The bank keeps its name too, even one `set_name` would refuse
+        settings
+            .effects_mut(current)
+            .set_loaded_name("Lo-Fi".into());
+        assert!(settings.load_preset(preset.as_bytes()).is_err());
+        assert_eq!(settings.effects(current).name(), "Lo-Fi");
+
+        // A preset named like that loads
+        let named = fs::read_to_string(root.join("defaults/resources/presets/Big Echo.preset"))
+            .unwrap()
+            .replace("name=\"Big Echo\"", "name=\"Big-Echo\"");
+        settings.load_preset(named.as_bytes()).unwrap();
+        assert_eq!(settings.effects(current).name(), "Big-Echo");
+    }
+
+    /// A light fuzz: random attribute values (empty, huge, negative, not numbers..) never make
+    /// the loading panic, and what loads also writes and loads again.
+    #[test]
+    fn random_attribute_values_never_panic() {
+        let values = [
+            "",
+            "-1",
+            "0",
+            "255",
+            "256",
+            "65536",
+            "-129",
+            "999999999999",
+            "1e40",
+            "-1e40",
+            "NaN",
+            "inf",
+            "abc",
+            "1.5",
+            "-0.5",
+            "\u{e9}",
+        ];
+        let positions: Vec<usize> = TEST_PROFILE
+            .match_indices("=\"")
+            .map(|(i, _)| i + 2)
+            .collect();
+        let mut rng = fastrand::Rng::with_seed(0x60_7c_1e);
+        for _ in 0..300 {
+            let mut profile = TEST_PROFILE.to_string();
+            // Replace a few values, from the end so the earlier positions stay valid
+            let mut chosen: Vec<usize> = (0..rng.usize(1..8))
+                .map(|_| positions[rng.usize(..positions.len())])
+                .collect();
+            chosen.sort_unstable();
+            chosen.dedup();
+            for start in chosen.into_iter().rev() {
+                let end = start + profile[start..].find('"').unwrap();
+                profile.replace_range(start..end, values[rng.usize(..values.len())]);
+            }
+            if let Ok(mut settings) = ProfileSettings::load(profile.as_bytes()) {
+                let out = written(&mut settings);
+                assert!(ProfileSettings::load(&out[..]).is_ok());
+            }
+        }
+    }
+
+    /// Writes the normalised output of the test profile, to compare before and after a change
+    /// of the parsing or writing code: GOXLR_PROFILE_DUMP=<file> cargo test dump_normalised
+    #[test]
+    fn dump_normalised() {
+        if let Ok(path) = std::env::var("GOXLR_PROFILE_DUMP") {
+            let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+            fs::write(path, normalised(&written(&mut settings)).join("\n")).unwrap();
+        }
+    }
+
     #[test]
     fn default_profile_round_trip() {
         let default = include_bytes!("../../daemon/profiles/Default.goxlr");
@@ -1071,6 +1423,32 @@ mod tests {
                 .track,
             "renamed.wav"
         );
+    }
+
+    #[test]
+    fn edited_samples_play_whole_at_their_new_gain() {
+        let mut settings = ProfileSettings::load(TEST_PROFILE.as_bytes()).unwrap();
+        let name = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(crate::components::sample::SampleBank::A)
+            .get_tracks()[0]
+            .track
+            .clone();
+        assert!(settings.reset_sample_file(&name, 0.5) >= 1);
+        let track = settings
+            .sample_button(SampleButtons::TopLeft)
+            .get_stack(crate::components::sample::SampleBank::A)
+            .get_tracks()[0]
+            .clone();
+        assert_eq!(
+            (
+                track.start_position,
+                track.end_position,
+                track.normalized_gain
+            ),
+            (0.0, 100.0, 0.5)
+        );
+        assert_eq!(settings.reset_sample_file("not-used.wav", 0.5), 0);
     }
 
     #[test]

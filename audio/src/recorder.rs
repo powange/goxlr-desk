@@ -80,13 +80,13 @@ impl BufferedRecorder {
         let buffer_size = max(forced_buffer, user_buffer);
 
         // Convert the list of Strings into a Regexp vec..
-        let regex = devices
-            .iter()
-            .map(|expression| {
-                Regex::new(expression)
-                    .unwrap_or_else(|_| panic!("Unable to Parse Regular Expression: {expression}"))
-            })
-            .collect();
+        let mut regex = Vec::with_capacity(devices.len());
+        for expression in &devices {
+            match Regex::new(expression) {
+                Ok(expression) => regex.push(expression),
+                Err(error) => bail!("Unable to Parse Regular Expression {expression}: {error}"),
+            }
+        }
 
         Ok(Self {
             devices: regex,
@@ -108,6 +108,11 @@ impl BufferedRecorder {
         let mut input: Option<Box<dyn AudioInput>> = None;
 
         let mut now = Instant::now();
+
+        // The input is reopened once after a silent minute (a stale stream recovers), not again
+        // until audio is heard: closing it for longer would leave the pre-record buffer empty
+        // when someone starts talking, which is what it's there to catch.
+        let mut refreshed_while_silent = false;
 
         while !self.stop.load(Ordering::Relaxed) {
             if input.is_none() {
@@ -135,12 +140,16 @@ impl BufferedRecorder {
                 // Read the latest samples from the input...
                 match input.as_mut().unwrap().read() {
                     Ok(samples) => {
+                        // The pre-record buffer and the recordings are fed under the same lock a
+                        // new recording takes to copy the buffer and join: no block is missed or
+                        // written twice in between.
+                        let producers = self.producers.lock().unwrap();
                         if self.buffer_size > 0
                             && let Err(e) = self.buffer.write_into(&samples)
                         {
                             warn!("Error writing samples to buffer: {}", e);
                         }
-                        for producer in self.producers.lock().unwrap().iter() {
+                        for producer in producers.iter() {
                             let result = producer.producer.write(&samples);
                             if let Err(e) = result {
                                 match e {
@@ -165,6 +174,9 @@ impl BufferedRecorder {
 
                         // Clear the Buffer
                         self.buffer.clear();
+
+                        // Back to looking for the device; nothing below applies without one.
+                        continue;
                     }
                 }
             }
@@ -192,15 +204,23 @@ impl BufferedRecorder {
 
                     // Push out and let it continue..
                     if received_audio {
+                        refreshed_while_silent = false;
                         continue;
                     }
                 } else {
                     continue;
                 }
 
-                // If we get here, nothing has stopped us, tear down the audio handler, and sleep..
-                input.unwrap().flush();
-                input = None;
+                if refreshed_while_silent {
+                    continue;
+                }
+                refreshed_while_silent = true;
+
+                // A silent minute: reopen the input (picked up again on the next pass)
+                debug!("No audio for a minute, reopening the input");
+                if let Some(mut stale) = input.take() {
+                    stale.flush();
+                }
                 self.is_ready.store(false, Ordering::Relaxed);
                 self.buffer.clear();
             }
@@ -246,18 +266,21 @@ impl BufferedRecorder {
 
         let producer_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-        // Add the producer to our handler, the guard removes it however this function returns.
-        self.add_producer(RingProducer {
-            id: producer_id,
-            producer: ring_buf_producer,
-        });
+        // Copy the pre-record buffer and join the live audio in one step (see listen), the guard
+        // removes the producer however this function returns.
+        let pre_samples = {
+            let mut producers = self.producers.lock().unwrap();
+            let pre_samples = self.get_samples_from_buffer();
+            producers.push(RingProducer {
+                id: producer_id,
+                producer: ring_buf_producer,
+            });
+            pre_samples
+        };
         let _producer = ProducerGuard {
             recorder: self,
             id: producer_id,
         };
-
-        // Grab the contents of the buffer, and push it into a simple vec
-        let pre_samples = self.get_samples_from_buffer();
 
         // Get the read buffer to pull a quarter of a second at a time..
         let mut read_buffer: [f32; 24000] = [0.0; 24000];
@@ -269,7 +292,12 @@ impl BufferedRecorder {
             bits_per_sample: 24,
             sample_format: hound::SampleFormat::Int,
         };
-        let mut writer = hound::WavWriter::create(path, spec)?;
+        // Never over an existing file (two recordings named alike would write into one)
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let mut writer = hound::WavWriter::new(std::io::BufWriter::new(file), spec)?;
 
         // EBU Prep is here to make sure that recent samples have hit a threshold to start recording.
         let mut ebu_prep_r128 = EbuR128::new(2, 48000, Mode::SAMPLE_PEAK)?;
@@ -325,6 +353,26 @@ impl BufferedRecorder {
             }
             if state.stop.load(Ordering::Relaxed) {
                 break;
+            }
+        }
+
+        // Write what was still waiting in the ring buffer when the button was released
+        while let Ok(samples) = ring_buf_consumer.read(&mut read_buffer)
+            && samples > 0
+        {
+            let samples: Vec<f32> = Vec::from(&read_buffer[0..samples]);
+            match self.handle_samples(
+                samples,
+                &mut ebu_prep_r128,
+                &mut ebu_rec_r128,
+                writing,
+                &mut writer,
+            ) {
+                Ok(result) => writing = result,
+                Err(error) => {
+                    error!("Error Writing Samples: {}", error);
+                    break;
+                }
             }
         }
 

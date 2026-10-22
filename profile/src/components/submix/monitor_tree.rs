@@ -57,7 +57,12 @@ impl MonitorTree {
             }
 
             if attr.name == "headphoneMix" {
-                if let Some(mix) = Mix::iter().nth(attr.value.parse::<usize>()? - 1) {
+                if let Some(mix) = attr
+                    .value
+                    .parse::<usize>()?
+                    .checked_sub(1)
+                    .and_then(|index| Mix::iter().nth(index))
+                {
                     self.headphone_mix = mix;
                 }
                 continue;

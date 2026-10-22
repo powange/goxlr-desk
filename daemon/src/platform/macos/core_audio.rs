@@ -27,8 +27,8 @@ use coreaudio_sys::{
 use goxlr_usb::{PID_GOXLR_FULL, PID_GOXLR_MINI, VID_GOXLR};
 use io_kit_sys::types::io_iterator_t;
 use io_kit_sys::{
-    IOIteratorNext, IORegistryEntryCreateCFProperties, IOServiceGetMatchingServices,
-    IOServiceMatching, kIOMasterPortDefault,
+    IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
+    IOServiceGetMatchingServices, IOServiceMatching, kIOMasterPortDefault,
 };
 
 const CORE_AUDIO_UID: &str = "com.apple.audio.CoreAudio";
@@ -47,14 +47,16 @@ pub fn get_id_for_uid(uid: &str) -> anyhow::Result<AudioObjectID> {
         mElement: kAudioObjectPropertyElementMaster,
     };
 
-    let size = 0u32;
+    // CoreAudio writes the size here: a mutable u32, not a constant cast to a pointer (the
+    // compiler may assume a constant never changes).
+    let mut size = 0u32;
     let status = unsafe {
         AudioObjectGetPropertyDataSize(
             kAudioObjectSystemObject,
             &properties,
             0,
             ptr::null(),
-            &size as *const _ as *mut _,
+            &mut size,
         )
     };
     if status != kAudioHardwareNoError as i32 {
@@ -62,7 +64,9 @@ pub fn get_id_for_uid(uid: &str) -> anyhow::Result<AudioObjectID> {
     }
 
     // If our size is 0, something's gone terribly wrong :D
-    assert_ne!(size, 0);
+    if size == 0 {
+        bail!("CoreAudio returned no data size for the bundle lookup");
+    }
 
     let mut plugin_id = kAudioObjectUnknown;
     let plugin_ref = CFString::new(uid);
@@ -80,7 +84,7 @@ pub fn get_id_for_uid(uid: &str) -> anyhow::Result<AudioObjectID> {
             &properties,
             0,
             ptr::null(),
-            &size as *const _ as *mut _,
+            &mut size,
             &translation_value as *const _ as *mut _,
         )
     };
@@ -98,8 +102,8 @@ pub fn get_uid_for_id(id: AudioObjectID) -> anyhow::Result<String> {
         mElement: kAudioObjectPropertyElementMaster,
     };
 
-    let uid: CFStringRef = null();
-    let size = mem::size_of::<CFStringRef>();
+    let mut uid: CFStringRef = null();
+    let mut size = mem::size_of::<CFStringRef>() as u32;
 
     let uid = unsafe {
         let status = AudioObjectGetPropertyData(
@@ -107,15 +111,16 @@ pub fn get_uid_for_id(id: AudioObjectID) -> anyhow::Result<String> {
             &properties,
             0,
             null(),
-            &size as *const _ as *mut _,
-            &uid as *const _ as *mut _,
+            &mut size,
+            &mut uid as *mut _ as *mut _,
         );
 
-        if status != kAudioHardwareNoError as i32 {
+        if status != kAudioHardwareNoError as i32 || uid.is_null() {
             bail!("Error Extracting UID for {}", id);
         }
 
-        CFString::wrap_under_get_rule(uid)
+        // The UID is returned retained (a 'copy'): it's ours to release
+        CFString::wrap_under_create_rule(uid)
     };
 
     Ok(uid.to_string())
@@ -133,13 +138,7 @@ pub fn create_aggregate_device(channel: String, device: &CoreAudioDevice) -> Res
     // I should probably have a method for this..
     let mut size = 0u32;
     let status = unsafe {
-        AudioObjectGetPropertyDataSize(
-            core_audio_id,
-            &properties,
-            0,
-            ptr::null(),
-            &size as *const _ as *mut _,
-        )
+        AudioObjectGetPropertyDataSize(core_audio_id, &properties, 0, ptr::null(), &mut size)
     };
     if status != kAudioHardwareNoError as i32 {
         bail!("Create Aggregate Error Getting Size: {}", status);
@@ -210,7 +209,8 @@ pub fn destroy_aggregate_device(aggregate: AudioDeviceID) -> Result<()> {
     };
 
     // I should probably have a method for this..
-    let size = mem::size_of::<AudioDeviceID>();
+    let mut size = mem::size_of::<AudioDeviceID>() as u32;
+    let mut aggregate = aggregate;
 
     let status = unsafe {
         AudioObjectGetPropertyData(
@@ -218,8 +218,8 @@ pub fn destroy_aggregate_device(aggregate: AudioDeviceID) -> Result<()> {
             &properties,
             0,
             null(),
-            &size as *const _ as *mut _,
-            &aggregate as *const _ as *mut _,
+            &mut size,
+            &mut aggregate as *mut _ as *mut _,
         )
     };
 
@@ -306,15 +306,9 @@ pub fn find_all_existing_aggregates() -> Result<Vec<AudioDeviceID>> {
     };
 
     // Get the response size so we can prepare for it..
-    let size = 0u32;
+    let mut size = 0u32;
     let status = unsafe {
-        AudioObjectGetPropertyDataSize(
-            kAudioObjectSystemObject,
-            &properties,
-            0,
-            null(),
-            &size as *const _ as *mut _,
-        )
+        AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &properties, 0, null(), &mut size)
     };
     if status != kAudioHardwareNoError as i32 {
         bail!("CoreAudio Error: {}", status);
@@ -323,20 +317,21 @@ pub fn find_all_existing_aggregates() -> Result<Vec<AudioDeviceID>> {
     // We know that this request returns a list of AudioDeviceIDs, so we can work out how
     // many devices we're going to get back..
     let count: usize = size as usize / mem::size_of::<AudioDeviceID>();
-    let mut device_ids: Vec<AudioDeviceID> = vec![];
-    device_ids.reserve_exact(count);
+    // Initialised, and only as many kept as CoreAudio says it wrote (devices can come and go
+    // between the two calls; the size tells CoreAudio how much room there is)
+    let mut device_ids: Vec<AudioDeviceID> = vec![0; count];
+    let mut size = (count * mem::size_of::<AudioDeviceID>()) as u32;
     let status = unsafe {
-        let status = AudioObjectGetPropertyData(
+        AudioObjectGetPropertyData(
             kAudioObjectSystemObject,
             &properties,
             0,
             null(),
-            &size as *const _ as *mut _,
+            &mut size,
             device_ids.as_mut_ptr() as *mut _,
-        );
-        device_ids.set_len(count);
-        status
+        )
     };
+    device_ids.truncate((size as usize / mem::size_of::<AudioDeviceID>()).min(count));
 
     if status != kAudioHardwareNoError as i32 {
         bail!("CoreAudio Error: {}", status);
@@ -383,49 +378,49 @@ pub fn get_goxlr_devices() -> Result<Vec<CoreAudioDevice>> {
             break;
         }
 
-        // Pull the properties for this device..
-        let mut dictionary = mem::MaybeUninit::<CFMutableDictionaryRef>::uninit();
-        unsafe {
-            IORegistryEntryCreateCFProperties(
-                service,
-                dictionary.as_mut_ptr(),
-                kCFAllocatorDefault,
-                0,
-            );
+        // Pull the properties for this device.. They're only read when the call worked, and are
+        // ours (a 'create'), as is the service object.
+        let mut dictionary: CFMutableDictionaryRef = ptr::null_mut();
+        let result = unsafe {
+            IORegistryEntryCreateCFProperties(service, &mut dictionary, kCFAllocatorDefault, 0)
+        };
+        unsafe { IOObjectRelease(service) };
+        if result != KERN_SUCCESS as i32 || dictionary.is_null() {
+            continue;
         }
-        let properties: CFDictionary<CFString, CFType> = unsafe {
-            CFMutableDictionary::wrap_under_get_rule(dictionary.assume_init()).to_immutable()
+        let properties: CFDictionary<CFString, CFType> =
+            unsafe { CFMutableDictionary::wrap_under_create_rule(dictionary).to_immutable() };
+
+        // Pull out the values, skipping anything that isn't shaped as expected..
+        let number = |key: &CFString| {
+            properties
+                .find(key)
+                .and_then(|value| value.downcast::<CFNumber>())
+                .and_then(|value| value.to_i32())
+        };
+        let string = |key: &CFString| {
+            properties
+                .find(key)
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|value| value.to_string())
         };
 
-        // Check to see if this result includes 'idVendor' and 'idProduct'..
-        if properties.contains_key(&pid) && properties.contains_key(&vid) {
-            // Pull out the values..
-            let vid = properties.get(&vid).downcast::<CFNumber>().unwrap();
-            let pid = properties.get(&pid).downcast::<CFNumber>().unwrap();
+        // Check whether the Vendor is TC-Helicon, and that we're a GoXLR..
+        let (Some(vendor), Some(product)) = (number(&vid), number(&pid)) else {
+            continue;
+        };
+        if vendor != VID_GOXLR as i32
+            || (product != PID_GOXLR_FULL as i32 && product != PID_GOXLR_MINI as i32)
+        {
+            continue;
+        }
 
-            // Check whether the Vendor is TC-Helicon..
-            if vid.to_i32().unwrap() != VID_GOXLR as i32 {
-                continue;
-            }
-
-            let pid = pid.to_i32().unwrap();
-            // Check whether we're a GoXLR
-            if pid == PID_GOXLR_FULL as i32 || pid == PID_GOXLR_MINI as i32 {
-                // Get the UID of this device..
-                if properties.contains_key(&uid) {
-                    let uid = properties.get(&uid).downcast::<CFString>().unwrap();
-
-                    if properties.contains_key(&dsc) {
-                        let description = properties.get(&dsc).downcast::<CFString>().unwrap();
-                        devices.push(CoreAudioDevice {
-                            display_name: description.to_string(),
-                            uid: uid.to_string(),
-                        });
-                    }
-                }
-            }
+        // Get the UID and name of this device..
+        if let (Some(uid), Some(display_name)) = (string(&uid), string(&dsc)) {
+            devices.push(CoreAudioDevice { display_name, uid });
         }
     }
 
+    unsafe { IOObjectRelease(iterator.assume_init()) };
     Ok(devices)
 }

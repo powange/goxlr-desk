@@ -33,6 +33,19 @@ struct TrashEntry {
     // The sampler tracks that played it in the loaded profiles, put back on restore
     #[serde(default)]
     tracks: Vec<TrashedTrack>,
+    // For an original replaced by an edit: where the edited version went (it may have a new
+    // name, an MP3 becomes a WAV). Restoring the original undoes the edit.
+    #[serde(default)]
+    replaced_by: Option<String>,
+}
+
+/// What a restore put back.
+#[derive(Debug)]
+pub struct RestoredSample {
+    pub path: String,
+    pub tracks: Vec<TrashedTrack>,
+    // Undoing an edit that renamed the sample: (edited name, original name), for the profiles
+    pub renamed: Option<(String, String)>,
 }
 
 /// A sampler track removed from a loaded profile because its file went to the trash.
@@ -112,6 +125,27 @@ pub fn trash_sample_path(
     relative: &str,
     tracks: Vec<TrashedTrack>,
 ) -> Result<()> {
+    trash_entry(samples, backups, relative, tracks, None)
+}
+
+/// Moves an original that an edit is about to replace, noting where the edited version goes.
+pub fn trash_replaced_sample(
+    samples: &Path,
+    backups: &Path,
+    relative: &str,
+    replaced_by: &str,
+) -> Result<()> {
+    let replaced_by = replaced_by.replace('\\', "/").trim_matches('/').to_string();
+    trash_entry(samples, backups, relative, vec![], Some(replaced_by))
+}
+
+fn trash_entry(
+    samples: &Path,
+    backups: &Path,
+    relative: &str,
+    tracks: Vec<TrashedTrack>,
+    replaced_by: Option<String>,
+) -> Result<()> {
     if is_recorded_folder(relative) {
         bail!(
             "The {} folder is where recordings go, it can't be deleted",
@@ -140,6 +174,7 @@ pub fn trash_sample_path(
         path: relative.replace('\\', "/").trim_matches('/').to_string(),
         deleted_at,
         tracks,
+        replaced_by,
     };
     fs::write(entry.join(ENTRY_FILE), serde_json::to_vec_pretty(&record)?)?;
 
@@ -210,18 +245,24 @@ fn entry_path(backups: &Path, id: &str) -> Result<PathBuf> {
 
 /// Puts a trashed item back where it was (its parent folders are recreated if needed), and
 /// returns its path with the sampler tracks to put back.
-pub fn restore_trash_item(
-    samples: &Path,
-    backups: &Path,
-    id: &str,
-) -> Result<(String, Vec<TrashedTrack>)> {
+pub fn restore_trash_item(samples: &Path, backups: &Path, id: &str) -> Result<RestoredSample> {
     let entry = entry_path(backups, id)?;
     let Some((record, item)) = read_entry(&entry) else {
         bail!("This trash item is damaged");
     };
 
+    // Restoring an original that an edit replaced undoes the edit: the edited version goes to
+    // the trash (so it can be brought back too), and profiles follow if its name was different.
+    // Everything is checked first: a restore that can't happen leaves the edited version alone.
+    let edited = record
+        .replaced_by
+        .as_ref()
+        .and_then(|edited| sample_path(samples, edited).ok().map(|path| (edited, path)))
+        .filter(|(_, path)| path.is_file());
+
     let target = sample_path(samples, &record.path)?;
-    if target.exists() {
+    let target_is_edited = edited.as_ref().is_some_and(|(_, path)| path == &target);
+    if target.exists() && !target_is_edited {
         bail!("{} already exists, rename or move it first", record.path);
     }
     // Profiles find a sample by its file name alone, so a name used elsewhere would be ambiguous.
@@ -233,8 +274,14 @@ pub fn restore_trash_item(
     }
     let used: HashSet<String> =
         recursive_file_list(samples.to_path_buf(), SAMPLE_EXTENSIONS.to_vec())
-            .into_values()
-            .map(|name| name.to_lowercase())
+            .into_iter()
+            // The edited version is about to leave (another file of that name still counts)
+            .filter(|(relative, _)| {
+                edited
+                    .as_ref()
+                    .is_none_or(|(_, path)| path != &samples.join(relative))
+            })
+            .map(|(_, name)| name.to_lowercase())
             .collect();
     let taken: Vec<String> = names
         .into_iter()
@@ -246,12 +293,28 @@ pub fn restore_trash_item(
             taken.join(", ")
         );
     }
+
+    let mut renamed = None;
+    if let Some((edited, _)) = &edited {
+        trash_sample_path(samples, backups, edited, vec![])
+            .context("Unable to move the edited version to the trash")?;
+        let name_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let (edited_name, original_name) = (name_of(edited), name_of(&record.path));
+        if edited_name != original_name {
+            renamed = Some((edited_name, original_name));
+        }
+    }
+
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
     move_path(&item, &target).context(format!("Unable to restore {}", record.path))?;
     let _ = fs::remove_dir_all(&entry);
-    Ok((record.path, record.tracks))
+    Ok(RestoredSample {
+        path: record.path,
+        tracks: record.tracks,
+        renamed,
+    })
 }
 
 /// Deletes an item from the trash for good, or everything when `id` is None.
@@ -269,14 +332,75 @@ pub fn empty_trash(backups: &Path, id: Option<&str>) -> Result<()> {
 }
 
 /// Removes items that have been in the trash for longer than TRASH_RETENTION.
+// Past this size, the oldest items go first (each in place edit keeps a full copy)
+pub const MAX_TRASH_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+// An entry that can't be read (a crash while it was made) is removed after this long
+const DAMAGED_ENTRY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn size_of(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    fs::read_dir(path)
+        .map(|entries| entries.flatten().map(|entry| size_of(&entry.path())).sum())
+        .unwrap_or(0)
+}
+
+/// Removes items kept longer than TRASH_RETENTION, damaged entries, and the oldest items while
+/// the trash is larger than MAX_TRASH_SIZE.
 pub fn purge_trash(backups: &Path) {
-    let limit = now().saturating_sub(TRASH_RETENTION.as_secs());
-    for item in list_trash(backups) {
-        if item.deleted_at < limit
-            && let Err(e) = empty_trash(backups, Some(&item.id))
-        {
-            warn!("Unable to purge {} from the sample trash: {}", item.path, e);
+    purge_trash_with(backups, TRASH_RETENTION, MAX_TRASH_SIZE);
+}
+
+fn purge_trash_with(backups: &Path, retention: Duration, max_size: u64) {
+    // Damaged entries never show in the list, so they'd never be purged otherwise
+    if let Ok(entries) = fs::read_dir(trash_directory(backups)) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > DAMAGED_ENTRY_RETENTION);
+            if old && read_entry(&entry.path()).is_none() {
+                warn!(
+                    "Removing a damaged sample trash entry: {}",
+                    entry.path().display()
+                );
+                let _ = fs::remove_dir_all(entry.path());
+            }
         }
+    }
+
+    let limit = now().saturating_sub(retention.as_secs());
+    let mut kept = Vec::new();
+    for item in list_trash(backups) {
+        if item.deleted_at < limit {
+            if let Err(e) = empty_trash(backups, Some(&item.id)) {
+                warn!("Unable to purge {} from the sample trash: {}", item.path, e);
+            }
+        } else {
+            let size = size_of(&trash_directory(backups).join(&item.id));
+            kept.push((item, size));
+        }
+    }
+
+    // Oldest first, until the trash fits
+    kept.sort_by_key(|(item, _)| item.deleted_at);
+    let mut total: u64 = kept.iter().map(|(_, size)| size).sum();
+    for (item, size) in kept {
+        if total <= max_size {
+            break;
+        }
+        if let Err(e) = empty_trash(backups, Some(&item.id)) {
+            warn!("Unable to purge {} from the sample trash: {}", item.path, e);
+            continue;
+        }
+        total = total.saturating_sub(size);
     }
 }
 
@@ -315,7 +439,9 @@ mod tests {
         assert!(restore_trash_item(&samples, &backups, &file.id).is_err());
         fs::remove_file(samples.join("intro.wav")).unwrap();
         assert_eq!(
-            restore_trash_item(&samples, &backups, &file.id).unwrap().0,
+            restore_trash_item(&samples, &backups, &file.id)
+                .unwrap()
+                .path,
             "intro.wav"
         );
         assert_eq!(fs::read(samples.join("intro.wav")).unwrap(), b"intro");
@@ -342,7 +468,7 @@ mod tests {
             .find(|item| !item.folder)
             .unwrap()
             .id;
-        let (_, tracks) = restore_trash_item(&samples, &backups, &id).unwrap();
+        let tracks = restore_trash_item(&samples, &backups, &id).unwrap().tracks;
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             (tracks[0].bank, tracks[0].index, tracks[0].start),
@@ -352,6 +478,44 @@ mod tests {
         empty_trash(&backups, Some(&folder.id)).unwrap();
         assert!(list_trash(&backups).is_empty());
         empty_trash(&backups, None).unwrap();
+    }
+
+    #[test]
+    fn purge_keeps_the_trash_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let (samples, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(&samples).unwrap();
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            fs::write(samples.join(name), vec![0u8; 1000]).unwrap();
+            trash_sample_path(&samples, &backups, name, vec![]).unwrap();
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        // A damaged entry, old enough to go
+        let damaged = trash_directory(&backups).join("damaged");
+        fs::create_dir_all(&damaged).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        // A folder can't be opened as a file on Windows: there it just isn't aged
+        if let Ok(folder) = fs::File::open(&damaged) {
+            folder.set_modified(old).ok();
+        }
+
+        // At most about two items' worth: the oldest goes
+        purge_trash_with(&backups, TRASH_RETENTION, 2500);
+        let left: Vec<String> = list_trash(&backups)
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert_eq!(left, vec!["c.wav".to_string(), "b.wav".to_string()]);
+        if damaged.exists() {
+            // set_modified isn't available on every file system; the entry is at least listed out
+            assert!(read_entry(&damaged).is_none());
+        }
+
+        // Nothing kept past the retention
+        purge_trash_with(&backups, Duration::ZERO, MAX_TRASH_SIZE);
+        std::thread::sleep(Duration::from_millis(1100));
+        purge_trash_with(&backups, Duration::ZERO, MAX_TRASH_SIZE);
+        assert!(list_trash(&backups).is_empty());
     }
 
     #[test]

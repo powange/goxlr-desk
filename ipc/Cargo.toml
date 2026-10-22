@@ -11,21 +11,25 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-goxlr-types = { path = "../types", features = ["serde"] }
+goxlr-types = { path = "../types", features = ["serde", "schema"] }
 
 # Common Workspace
 anyhow = { workspace = true }
 serde = { workspace = true }
+schemars = { workspace = true }
 json-patch = { workspace = true }
 futures = { workspace = true }
 enum-map = { workspace = true }
 interprocess = { workspace = true }
 
 tokio-util = { version = "0.7.16", features = ["codec", "compat"] }
-tokio-serde = { version = "0.9.0", features = ["bincode", "json"] }
+tokio-serde = { version = "0.9.0", features = ["json"] }
 async-trait = "0.1.89"
 
 # Used for Web Requests
 reqwest = { workspace = true, features = ["json"] }
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,4 +1,5 @@
 use crate::FIRMWARE_PATHS;
+use crate::firmware::device_hash::device_hash;
 use crate::firmware::firmware_file::check_firmware;
 use anyhow::{Result, bail};
 use futures_util::StreamExt;
@@ -96,7 +97,7 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
     let device = settings.device;
 
     // Ok, when we get here we should be good to go, grab the firmware bytes from disk..
-    let firmware = match fs::read(file_info.path) {
+    let firmware = match fs::read(&file_info.path) {
         Ok(bytes) => bytes,
         Err(e) => {
             let error = format!("Unable to load firmware from disk: {e}");
@@ -104,7 +105,8 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
             return;
         }
     };
-    let firmware_len = firmware.len() as u32;
+    // Flashed from memory from here: a downloaded file isn't needed any more
+    remove_downloaded_firmware(&file_info.path);
 
     info!("Entering DFU Mode");
     if let Err(e) = enter_dfu(&device.serial, sender.clone()).await {
@@ -121,14 +123,14 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
     }
 
     info!("Uploading Firmware..");
-    if let Err(e) = upload_firmware(&device.serial, sender.clone(), firmware).await {
+    if let Err(e) = upload_firmware(&device.serial, sender.clone(), &firmware).await {
         send_error(&device.serial, sender.clone(), e.to_string()).await;
         reboot_goxlr(&device.serial, sender).await;
         return;
     }
 
     info!("Validating Upload");
-    if let Err(e) = validate_upload(&device.serial, sender.clone(), firmware_len).await {
+    if let Err(e) = validate_upload(&device.serial, sender.clone(), &firmware).await {
         send_error(&device.serial, sender.clone(), e.to_string()).await;
         reboot_goxlr(&device.serial, sender).await;
         return;
@@ -153,10 +155,15 @@ pub async fn do_firmware_update(settings: FirmwareUpdateSettings, file_info: Fir
     reboot_goxlr(&device.serial, sender.clone()).await;
 }
 
-async fn get_firmware_file(
-    device: &FirmwareUpdateDevice,
-    sender: Sender,
-) -> Result<(String, VersionNumber)> {
+/// What the manifest says to download: the file, its version, and its SHA-256 when the
+/// manifest gives one.
+struct ManifestEntry {
+    file: String,
+    version: VersionNumber,
+    sha256: Option<String>,
+}
+
+async fn get_firmware_file(device: &FirmwareUpdateDevice, sender: Sender) -> Result<ManifestEntry> {
     set_update_state(&device.serial, sender.clone(), UpdateState::Manifest).await?;
 
     // Firstly, grab some variables depending on device..
@@ -169,6 +176,11 @@ async fn get_firmware_file(
         DeviceType::Unknown => bail!("Unknown Device Type"),
         DeviceType::Full => "version",
         DeviceType::Mini => "miniVersion",
+    };
+    let sha_key = match device.device_type {
+        DeviceType::Unknown => bail!("Unknown Device Type"),
+        DeviceType::Full => "fwFullSha256",
+        DeviceType::Mini => "fwMiniSha256",
     };
     let fail_back_path = match device.device_type {
         DeviceType::Unknown => bail!("Unknown Device Type"),
@@ -199,24 +211,33 @@ async fn get_firmware_file(
             bail!("Unable to obtain Firmware Version");
         };
 
-        return if root.attributes.contains_key(file_key) {
-            Ok((root.attributes[file_key].clone(), version))
-        } else {
-            Ok((String::from(fail_back_path), version))
-        };
+        let file = root
+            .attributes
+            .get(file_key)
+            .cloned()
+            .unwrap_or_else(|| String::from(fail_back_path));
+        let sha256 = root
+            .attributes
+            .get(sha_key)
+            .map(|sha| sha.trim().to_lowercase());
+        return Ok(ManifestEntry {
+            file,
+            version,
+            sha256,
+        });
     }
     bail!("Error Downloading Manifest from TC-Helicon Servers");
 }
 
 async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Result<FirmwareInfo> {
     // First thing we're going to do, is determine which file to download
-    let file_name = get_firmware_file(device, sender.clone()).await?;
+    let entry = get_firmware_file(device, sender.clone()).await?;
 
     // Now we'll grab and process that file
     set_update_state(&device.serial, sender.clone(), UpdateState::Download).await?;
     // The name comes from the server's manifest: only its last part is used on disk, and a
     // path leaving the firmware folder on the server is refused.
-    let remote = file_name.0.replace('\\', "/");
+    let remote = entry.file.replace('\\', "/");
     if remote.starts_with('/')
         || remote
             .split('/')
@@ -224,13 +245,13 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
     {
         bail!(
             "Unexpected firmware file name in the manifest: {}",
-            file_name.0
+            entry.file
         );
     }
     let Some(local_name) = remote.rsplit('/').next().filter(|name| !name.is_empty()) else {
         bail!(
             "Unexpected firmware file name in the manifest: {}",
-            file_name.0
+            entry.file
         );
     };
     let url = format!("{}{}", FIRMWARE_PATHS[device.source], remote);
@@ -238,7 +259,7 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
 
     info!(
         "Downloading Firmware, URL: {}, Expected Version: {}",
-        url, file_name.1
+        url, entry.version
     );
 
     if output_path.exists() && fs::remove_file(&output_path).is_err() {
@@ -272,12 +293,25 @@ async fn download_firmware(device: &FirmwareUpdateDevice, sender: Sender) -> Res
             }
         }
 
+        // A download cut short (the server closed early) is never used
+        file.flush()?;
+        if downloaded != size {
+            bail!("Firmware download incomplete ({downloaded} of {size} bytes)");
+        }
+        if let Some(expected) = &entry.sha256 {
+            let actual = sha256_of(&output_path)?;
+            if &actual != expected {
+                bail!("Downloaded Firmware doesn't match the manifest (SHA-256 {actual})");
+            }
+            info!("Firmware SHA-256 matches the manifest");
+        }
+
         let firmware_info = check_firmware(&output_path)?;
-        if firmware_info.version != file_name.1 {
+        if firmware_info.version != entry.version {
             bail!(
                 "Downloaded Firmware version does not match expected firmware (Received: {}, Expected: {})",
                 firmware_info.version,
-                file_name.1
+                entry.version
             );
         }
 
@@ -342,7 +376,7 @@ async fn clear_nvr(serial: &str, sender: Sender) -> Result<()> {
     set_update_stage_percent(serial, sender.clone(), 100).await
 }
 
-async fn upload_firmware(serial: &str, sender: Sender, bytes: Vec<u8>) -> Result<()> {
+async fn upload_firmware(serial: &str, sender: Sender, bytes: &[u8]) -> Result<()> {
     set_update_state(serial, sender.clone(), UpdateState::UploadFirmware).await?;
 
     // Monitor the current percentage
@@ -380,8 +414,11 @@ async fn upload_firmware(serial: &str, sender: Sender, bytes: Vec<u8>) -> Result
     Ok(())
 }
 
-async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Result<()> {
+async fn validate_upload(serial: &str, sender: Sender, firmware: &[u8]) -> Result<()> {
     set_update_state(serial, sender.clone(), UpdateState::ValidateUpload).await?;
+    let firmware_size = firmware.len() as u32;
+
+    let mut chunks = 0;
 
     let mut last_percent = 0;
 
@@ -409,10 +446,25 @@ async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Re
         if response.count == 0 {
             bail!("Error Validating Firmware, the device validated nothing");
         }
-        processed_bytes += response.count;
-        if processed_bytes > firmware_size {
+        if processed_bytes + response.count > firmware_size {
             bail!("Error Validating Firmware, Length Mismatch");
         }
+        let chunk =
+            &firmware[processed_bytes as usize..(processed_bytes + response.count) as usize];
+        // The device's hash of what it received, against the one of the file: different bytes
+        // stop the update here, before anything is written.
+        let expected = device_hash(hash_in, chunk);
+        if response.hash != expected {
+            bail!(
+                "Error Validating Firmware, the device received different data at byte {} (hash {:08x}, expected {:08x})",
+                processed_bytes,
+                response.hash,
+                expected
+            );
+        }
+        chunks += 1;
+
+        processed_bytes += response.count;
 
         hash_in = response.hash;
         remaining_bytes -= response.count;
@@ -423,6 +475,11 @@ async fn validate_upload(serial: &str, sender: Sender, firmware_size: u32) -> Re
             set_update_stage_percent(serial, sender.clone(), percent).await?;
         }
     }
+
+    info!(
+        "Firmware upload validated: {} chunks, hash {:08x} as computed here",
+        chunks, hash_in
+    );
 
     Ok(())
 }
@@ -501,6 +558,25 @@ async fn hardware_write(serial: &str, sender: Sender) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Removes a firmware this daemon downloaded, with its private folder (see private_download_dir).
+/// A file picked or uploaded by the user isn't one.
+pub fn remove_downloaded_firmware(path: &std::path::Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let downloaded = dir.parent() == Some(std::env::temp_dir().as_path())
+        && dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("goxlr-firmware-"));
+    if downloaded && let Err(e) = fs::remove_dir_all(dir) {
+        warn!(
+            "Unable to remove the downloaded firmware {}: {}",
+            dir.display(),
+            e
+        );
+    }
 }
 
 /// A new folder only this user can use, for the downloaded firmware: the shared temporary
@@ -654,4 +730,40 @@ pub enum FirmwareMessages {
     PollHardwareWrite(OneShot<Result<HardwareProgressResponse>>),
 
     RebootGoXLR(OneShot<Result<()>>),
+}
+
+/// The SHA-256 of a file, in lower case hexadecimal.
+fn sha256_of(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_of_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firmware.bin");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_of(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

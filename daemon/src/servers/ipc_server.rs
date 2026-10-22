@@ -89,6 +89,15 @@ pub async fn bind_socket() -> Result<LocalSocketListener> {
     };
 
     let opts = ListenerOptions::new().name(name.clone());
+    // Only this user (and the system) may open the pipe, never from the network
+    #[cfg(windows)]
+    let opts = match super::pipe_security::pipe_security() {
+        Some(descriptor) => {
+            use interprocess::os::windows::local_socket::ListenerOptionsExt;
+            opts.security_descriptor(descriptor)
+        }
+        None => opts,
+    };
     let listener = opts.create_tokio()?;
 
     // Only this user may talk to the daemon (it can run programs through the activator).
@@ -104,6 +113,25 @@ pub async fn bind_socket() -> Result<LocalSocketListener> {
     Ok(listener)
 }
 
+/// Whether the client runs as the daemon's user (the IPC can run programs, through the
+/// activator). On Windows the named pipe's security already restricts it to this user.
+#[cfg(unix)]
+fn same_user(connection: &LocalSocketStream) -> bool {
+    use interprocess::local_socket::traits::StreamCommon;
+    match connection.peer_creds() {
+        Ok(creds) => creds.euid() == Some(nix::unistd::geteuid().as_raw()),
+        Err(e) => {
+            warn!("Unable to check the IPC client's user: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn same_user(_connection: &LocalSocketStream) -> bool {
+    true
+}
+
 pub async fn spawn_ipc_server(
     listener: LocalSocketListener,
     usb_tx: DeviceSender,
@@ -112,7 +140,21 @@ pub async fn spawn_ipc_server(
     debug!("Running IPC Server..");
     loop {
         tokio::select! {
-            Ok(connection) = listener.accept() => {
+            // An accept that fails (out of descriptors, a client gone mid-handshake) is logged
+            // and retried: matching Ok() here would stop accepting connections for good.
+            accepted = listener.accept() => {
+                let connection = match accepted {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        warn!("Unable to accept an IPC connection: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                if !same_user(&connection) {
+                    warn!("Refused an IPC connection from another user");
+                    continue;
+                }
                 let socket = Socket::new(connection);
                 let usb_tx = usb_tx.clone();
                 tokio::spawn(async move {

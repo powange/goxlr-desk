@@ -1,4 +1,5 @@
 use crate::device::Device;
+use crate::device_actor::{DeviceActor, DeviceUpdate, Reply};
 use crate::events::EventTriggers;
 use crate::files::{
     RenamedSample, create_sample_folder, duplicate_sample, edit_sample_file, extract_defaults,
@@ -6,10 +7,12 @@ use crate::files::{
 };
 use crate::firmware::firmware_update::{
     FirmwareMessages, FirmwareRequest, FirmwareUpdateDevice, FirmwareUpdateSettings,
-    do_firmware_update, start_firmware_update,
+    do_firmware_update, remove_downloaded_firmware, start_firmware_update,
 };
 use crate::platform::{get_ui_app_path, has_autostart, set_autostart};
-use crate::profile::{rename_sample_in_saved_profiles, saved_profiles_using_samples};
+use crate::profile::{
+    rename_sample_in_saved_profiles, reset_sample_in_saved_profiles, saved_profiles_using_samples,
+};
 use crate::profile_trash::{
     empty_profile_trash, list_profile_trash, purge_profile_trash, restore_profile,
 };
@@ -25,8 +28,8 @@ use goxlr_audio::editor::probe_duration;
 use goxlr_ipc::{
     Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
     FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
-    NetworkAccess, PathTypes, Paths, ProfileTrashItem, SampleFile, SampleTrashItem, SampleUsage,
-    UpdateState, UsbProductInformation,
+    MixerStatus, NetworkAccess, PathTypes, Paths, ProfileTrashItem, SampleFile, SampleTrashItem,
+    SampleUsage, UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::{FullGoXLRDevice, GoXLRDevice};
@@ -69,6 +72,7 @@ fn retry_delay(failures: u32) -> Duration {
     }
 }
 const APP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const TRASH_PURGE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // Adding a third entry has tripped enum_variant_names, I'll probably need to rename
 // RunDeviceCommand, but that'll need to be in a separate commit, for now, suppress.
@@ -152,28 +156,47 @@ pub async fn spawn_usb_handler(
     let app_sleep = sleep(app_duration);
     tokio::pin!(app_sleep);
 
+    // The trashes are purged at startup (when listed) and then once a day
+    let purge_sleep = sleep(TRASH_PURGE_INTERVAL);
+    tokio::pin!(purge_sleep);
+
     // Get the Driver Type and Details..
     let (interface, version) = get_version();
     let mut driver_interface = DriverDetails { interface, version };
 
     // Create the Primary Device List, and 'Ignore' list..
-    let mut devices: HashMap<String, Device> = HashMap::new();
+    // Each device runs in its own task (see device_actor), and sends its status back here
+    let mut devices: HashMap<String, DeviceActor> = HashMap::new();
+    let mut mixers: HashMap<String, MixerStatus> = HashMap::new();
+    // Unbounded: a device task must never wait for this loop, which may itself be waiting for
+    // that device (run()), or both would wait for ever. A status per job, consumed promptly.
+    let (update_tx, mut update_rx) = mpsc::unbounded_channel::<DeviceUpdate>();
     let mut devices_firmware: HashMap<String, FirmwareUpdateState> = HashMap::new();
     let mut ignore_list: HashMap<DeviceKey, (Instant, u32)> = HashMap::new();
 
     // Devices are opened on a blocking thread (it takes a few seconds), one at a time, so this
     // loop keeps answering requests meanwhile.
     let (attach_tx, mut attach_rx) = mpsc::channel::<AttachResult>(1);
+    // Then their profiles are applied in a task of their own, the device comes back here
+    let (loaded_tx, mut loaded_rx) = mpsc::channel::<(DeviceKey, Result<Device>)>(1);
 
     // Slow sample operations run in the background and report back here.
     let (sample_job_tx, mut sample_job_rx) = mpsc::channel::<SampleJobDone>(16);
+    // Sample jobs still running. While one renames or replaces a file, the profiles loaded on
+    // the devices aren't checked against the files (validate_sampler would drop the track whose
+    // file is about to get its new name): the check waits for the jobs to end.
+    let mut sample_jobs_running = 0usize;
+    let mut validate_pending = false;
     // Samples being edited, so the same file isn't edited twice at once.
     let mut busy_samples: HashSet<String> = HashSet::new();
     let mut attaching = false;
+    // Input from a device still having its profiles applied (moving the motorised faders sends
+    // some): read once it's ready, rather than lost.
+    let mut early_input: HashSet<String> = HashSet::new();
 
     let mut files = get_files(&mut file_manager, &settings).await;
     let mut daemon_status = get_daemon_status(
-        &devices,
+        &mixers,
         &settings,
         &http_settings,
         &driver_interface,
@@ -184,11 +207,18 @@ pub async fn spawn_usb_handler(
     )
     .await;
 
+    // The status as last sent, kept as JSON so a change is diffed without serialising it again
+    let mut status_json = serde_json::to_value(&daemon_status).unwrap_or_default();
+
     let mut shutdown_triggered = false;
     let _ = ready_tx.send(());
 
     loop {
+        // Something changed anywhere (the whole status is rebuilt), or only one device's
+        // inputs moved (only its part is: that's most changes, while faders move)
         let mut change_found = false;
+        let mut device_changed: Option<String> = None;
+        let mut pending_reply: Option<Reply> = None;
         tokio::select! {
             Some(version) = firmware_receiver.recv() => {
                 firmware_version = Some(version);
@@ -198,6 +228,10 @@ pub async fn spawn_usb_handler(
                 match received {
                     FirmwareRequest::SetUpdateState(serial,status) => {
                         if let Some(state) = devices_firmware.get_mut(&serial) {
+                            // A file uploaded for this update isn't needed once it's flashed
+                            if status == UpdateState::Complete {
+                                remove_uploaded_firmware(&state.settings.file);
+                            }
                             state.status.state = status;
                             state.status.progress = 0;
                             change_found = true;
@@ -225,10 +259,12 @@ pub async fn spawn_usb_handler(
                         }
                     }
                     FirmwareRequest::FirmwareMessage(serial,message) => {
-                        if let Some(device) = devices.get_mut(&serial) {
+                        if let Some(device) = devices.get(&serial) {
                             // Pass this to the device to manage
-                            device.handle_firmware_message(message).await;
-                            change_found = true;
+                            device.send(move |d| Box::pin(async move {
+                                d.handle_firmware_message(message).await;
+                                true
+                            }));
                         } else {
                             // We need to locate the sender, and inform it that the device is gone, these
                             // will pop back a SetError.
@@ -280,35 +316,56 @@ pub async fn spawn_usb_handler(
                     attaching = true;
                     let started = Instant::now();
                     tokio::task::spawn_blocking(move || {
-                        let result = attach_device(device, existing_serials, disconnect_sender, event_sender);
+                        // A panic in the USB or driver code must still answer, otherwise
+                        // 'attaching' stays set and no device is ever detected again.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            attach_device(device, existing_serials, disconnect_sender, event_sender)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow!("The device code panicked while attaching")));
                         let _ = attach_tx.blocking_send((key, started, result));
                     });
                 }
                 detection_sleep.as_mut().reset(tokio::time::Instant::now() + detection_duration);
             },
             Some((key, started, attached)) = attach_rx.recv() => {
-                attaching = false;
-                let loaded = match attached {
+                match attached {
                     Ok((handled_device, hardware)) => {
+                        // The profiles are applied in their own task (a few seconds of USB
+                        // requests), this loop keeps answering meanwhile
                         info!("Attached GoXLR {} in {:?}, loading profiles..", hardware.serial_number, started.elapsed());
-                        let profile_start = Instant::now();
-                        let loaded = load_device(handled_device, hardware, global_tx.clone(), &settings).await;
-                        if let Ok(device) = &loaded {
-                            info!(
-                                "GoXLR {} ready, profiles applied in {:?} ({:?} after it was found)",
-                                device.serial(), profile_start.elapsed(), started.elapsed()
-                            );
-                        }
-                        loaded
+                        let (settings, global_tx, loaded_tx) = (settings.clone(), global_tx.clone(), loaded_tx.clone());
+                        tokio::spawn(async move {
+                            let profile_start = Instant::now();
+                            let loaded = load_device(handled_device, hardware, global_tx, &settings).await;
+                            if let Ok(device) = &loaded {
+                                info!(
+                                    "GoXLR {} ready, profiles applied in {:?} ({:?} after it was found)",
+                                    device.serial(), profile_start.elapsed(), started.elapsed()
+                                );
+                            }
+                            let _ = loaded_tx.send((key, loaded)).await;
+                        });
                     }
-                    Err(error) => Err(error),
-                };
-
+                    Err(error) => {
+                        let _ = loaded_tx.send((key, Err(error))).await;
+                    }
+                }
+            },
+            Some((key, loaded)) = loaded_rx.recv() => {
+                attaching = false;
+                if loaded.is_err() {
+                    early_input.clear();
+                }
                 match loaded {
                     Ok(device) => {
                         let serial = String::from(device.serial());
 
-                        devices.insert(serial.clone(), device);
+                        mixers.insert(serial.clone(), device.status().await);
+                        let actor = DeviceActor::spawn(device, update_tx.clone());
+                        if early_input.remove(&serial) {
+                            actor.input_event();
+                        }
+                        devices.insert(serial.clone(), actor);
                         ignore_list.remove(&key);
                         change_found = true;
 
@@ -334,18 +391,18 @@ pub async fn spawn_usb_handler(
                 }
             },
             () = &mut update_sleep => {
-                for device in devices.values_mut() {
-                    let updated = device.update_state().await;
-
-                    if let Ok(result) = updated {
-                        change_found |= result;
-                    }
-
-                    if let Err(error) = updated {
-                        warn!("Error Received from {} while updating state: {}", device.serial(), error);
-                    }
+                for device in devices.values() {
+                    device.tick();
                 }
                 update_sleep.as_mut().reset(tokio::time::Instant::now() + update_duration);
+            },
+            () = &mut purge_sleep => {
+                let backups = settings.get_backup_directory().await;
+                tokio::task::spawn_blocking(move || {
+                    purge_trash(&backups);
+                    purge_profile_trash(&backups);
+                });
+                purge_sleep.as_mut().reset(tokio::time::Instant::now() + TRASH_PURGE_INTERVAL);
             },
             () = &mut app_sleep => {
                 if get_app_path(&mut app_check) {
@@ -356,6 +413,7 @@ pub async fn spawn_usb_handler(
             Some(serial) = disconnect_receiver.recv() => {
                 info!("[{}] Device Disconnected", serial);
                 devices.remove(&serial);
+                mixers.remove(&serial);
 
                 // If this device was actively doing a firmware update that's not complete, we should scream
                 // INCREDIBLY loudly (in the logs).. We will keep this device around though, the error will
@@ -370,18 +428,23 @@ pub async fn spawn_usb_handler(
                 change_found = true;
             },
             Some(serial) = event_receiver.recv() => {
-                if let Some(device) = devices.get_mut(&serial) {
-                    let result = device.monitor_inputs().await;
-                    if let Ok(changed) = result {
-                        change_found = changed;
-                    }
-
-                    if let Err(error) = result {
-                        warn!("Error Received from {}: {}", device.serial(), error);
-                    }
+                if let Some(device) = devices.get(&serial) {
+                    device.input_event();
+                } else if attaching {
+                    debug!("Input from {} while it's loading, read once it's ready", serial);
+                    early_input.insert(serial);
                 } else {
                     warn!("Cannot find registered device with serial: {}", serial);
                 }
+            }
+            Some(update) = update_rx.recv() => {
+                // A device that was removed meanwhile is gone from the status
+                if devices.contains_key(&update.serial) {
+                    mixers.insert(update.serial.clone(), update.status);
+                    device_changed = Some(update.serial);
+                }
+                // Answered once the status below is up to date
+                pending_reply = update.reply;
             }
             Some(event) = device_state_rx.recv() => {
                 match event {
@@ -393,8 +456,8 @@ pub async fn spawn_usb_handler(
                         shutdown_triggered = true;
 
                         // Flip through all the devices, send a shutdown signal..
-                        for device in devices.values_mut() {
-                            device.shutdown(avoid_write).await;
+                        for device in devices.values() {
+                            let _ = device.run(move |d| Box::pin(d.shutdown(avoid_write))).await;
                         }
 
                         // Send a notification that we're done here..
@@ -402,25 +465,27 @@ pub async fn spawn_usb_handler(
                     },
                     DeviceStateChange::Sleep(sender) => {
                         debug!("Received Sleep Notification");
-                        for device in devices.values_mut() {
-                            device.sleep().await;
+                        for device in devices.values() {
+                            let _ = device.run(|d| Box::pin(d.sleep())).await;
                         }
                         let _ = sender.send(());
                     },
                     DeviceStateChange::Command(command) => {
                         let mut serials: Vec<String> = devices.keys().cloned().collect();
                         serials.sort();
-                        if let Some(device) = serials.first().and_then(|s| devices.get_mut(s)) {
-                            if let Err(e) = device.perform_command(command).await {
-                                warn!("Unable to run the tray's command: {}", e);
-                            }
-                            change_found = true;
+                        if let Some(device) = serials.first().and_then(|s| devices.get(s)) {
+                            device.send(move |d| Box::pin(async move {
+                                if let Err(e) = d.perform_command(command).await {
+                                    warn!("Unable to run the tray's command: {}", e);
+                                }
+                                true
+                            }));
                         }
                     }
                     DeviceStateChange::Wake(sender) => {
                         debug!("Received Wake Notification");
-                        for device in devices.values_mut() {
-                            device.wake().await;
+                        for device in devices.values() {
+                            let _ = device.run(|d| Box::pin(d.wake())).await;
                         }
                         let _ = sender.send(());
 
@@ -482,6 +547,7 @@ pub async fn spawn_usb_handler(
                             }
                             DaemonCommand::SetAutoStartEnabled(enabled) => {
                                 let _ = sender.send(set_autostart(enabled));
+                                forget_autostart();
                                 change_found = true;
                             }
                             DaemonCommand::SetLogLevel(level) => {
@@ -561,12 +627,14 @@ pub async fn spawn_usb_handler(
                             DaemonCommand::MoveSamplePath(from, to) => {
                                 let base = settings.get_samples_directory().await;
                                 let profiles = settings.get_profile_directory().await;
+                                let backups = settings.get_backup_directory().await;
                                 // Renaming rewrites the saved profiles, which is slow: done in the
                                 // background, the result comes back through sample_job_rx.
+                                sample_jobs_running += 1;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
                                     let renamed = move_sample_path(&base, &from, &to)?;
                                     if let Some(renamed) = &renamed {
-                                        rename_in_saved_profiles(&profiles, renamed);
+                                        rename_in_saved_profiles(&profiles, &backups, renamed);
                                     }
                                     Ok(SampleJobOutput { renamed, ..Default::default() })
                                 });
@@ -578,12 +646,16 @@ pub async fn spawn_usb_handler(
                                 // them: they're put back if the file is restored.
                                 let names: HashSet<String> =
                                     sample_names_at(&base, &path).unwrap_or_default().into_iter().collect();
-                                let tracks: Vec<_> = devices
-                                    .values_mut()
-                                    .flat_map(|device| device.trashed_tracks(&names))
-                                    .collect();
+                                let mut tracks = Vec::new();
+                                for device in devices.values() {
+                                    let names = names.clone();
+                                    if let Ok(found) = device.run(move |d| Box::pin(async move { d.trashed_tracks(&names) })).await {
+                                        tracks.extend(found);
+                                    }
+                                }
                                 // Kept in the trash (with its gain setting), so it can be restored.
                                 // A move to another drive copies files, so it's done in the background.
+                                sample_jobs_running += 1;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
                                     trash_sample_path(&base, &backups, &path, tracks)?;
                                     info!("Moved sample path {} to the trash", path);
@@ -593,10 +665,17 @@ pub async fn spawn_usb_handler(
                             DaemonCommand::RestoreSampleTrash(id) => {
                                 let base = settings.get_samples_directory().await;
                                 let backups = settings.get_backup_directory().await;
+                                let profiles = settings.get_profile_directory().await;
+                                sample_jobs_running += 1;
                                 spawn_sample_job(sample_job_tx.clone(), None, sender, move || {
-                                    let (path, tracks) = restore_trash_item(&base, &backups, &id)?;
-                                    info!("Restored sample path {} from the trash", path);
-                                    Ok(SampleJobOutput { tracks, ..Default::default() })
+                                    let restored = restore_trash_item(&base, &backups, &id)?;
+                                    info!("Restored sample path {} from the trash", restored.path);
+                                    // Undoing an edit that renamed the sample: profiles go back to it
+                                    let renamed = restored.renamed.map(|(old_name, new_name)| RenamedSample { old_name, new_name });
+                                    if let Some(renamed) = &renamed {
+                                        rename_in_saved_profiles(&profiles, &backups, renamed);
+                                    }
+                                    Ok(SampleJobOutput { renamed, tracks: restored.tracks, ..Default::default() })
                                 });
                             }
                             DaemonCommand::RestoreProfileTrash(id) => {
@@ -657,13 +736,35 @@ pub async fn spawn_usb_handler(
                                     let backups = settings.get_backup_directory().await;
                                     let profiles = settings.get_profile_directory().await;
                                     // Decoding and writing audio takes a while: done in the background.
+                                    sample_jobs_running += 1;
                                     spawn_sample_job(sample_job_tx.clone(), Some(path.clone()), sender, move || {
                                         let renamed = edit_sample_file(&base, &backups, &path, &edit, save_as.as_deref())?;
                                         if let Some(renamed) = &renamed {
-                                            rename_in_saved_profiles(&profiles, renamed);
+                                            rename_in_saved_profiles(&profiles, &backups, renamed);
                                         }
+                                        // Replaced: the tracks playing it measured the old audio,
+                                        // they play the whole new file at its new gain
+                                        let edited = save_as.is_none().then(|| {
+                                            let name = match &renamed {
+                                                Some(renamed) => renamed.new_name.clone(),
+                                                None => path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string(),
+                                            };
+                                            let file = match &renamed {
+                                                Some(renamed) => base.join(Path::new(&path).with_file_name(&renamed.new_name)),
+                                                None => base.join(&path),
+                                            };
+                                            let gain = measure_gain(&file).unwrap_or(1.0);
+                                            reset_sample_in_saved_profiles(&profiles, &backups, &name, gain);
+                                            (name, gain)
+                                        });
                                         info!("Edited sample {} ({} part(s) removed, normalized: {})", path, edit.remove.len(), edit.normalize);
-                                        Ok(SampleJobOutput { renamed, ..Default::default() })
+                                        // A copy saved under a new name keeps the original's gain
+                                        let copied_gain = save_as.as_deref().map(|name| {
+                                            let name = name.trim();
+                                            let new_name = if name.to_ascii_lowercase().ends_with(".wav") { name.to_string() } else { format!("{name}.wav") };
+                                            (path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string(), new_name)
+                                        });
+                                        Ok(SampleJobOutput { renamed, copied_gain, edited, ..Default::default() })
                                     });
                                 }
                             }
@@ -698,18 +799,16 @@ pub async fn spawn_usb_handler(
                     },
 
                     DeviceCommand::RunDeviceCommand(serial, command, sender) => {
-                        if let Some(device) = devices.get_mut(&serial) {
-                            let result = match device.perform_command(command.clone()).await {
-                                Ok(result) => {
-                                    Ok(result)
-                                }
-                                Err(error) => {
+                        if let Some(device) = devices.get(&serial) {
+                            // Run by the device's task, the answer comes once the status is
+                            // up to date
+                            device.send_reply(true, sender, move |d| Box::pin(async move {
+                                let result = d.perform_command(command.clone()).await;
+                                if let Err(error) = &result {
                                     warn!("Error Executing: {:?}, {}", command, error);
-                                    Err(error)
                                 }
-                            };
-                            let _ = sender.send(result);
-                            change_found = true;
+                                result
+                            }));
                         } else {
                             let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
                         }
@@ -728,11 +827,16 @@ pub async fn spawn_usb_handler(
                             Ok(names) => {
                                 let names: HashSet<String> = names.into_iter().collect();
                                 // The loaded profiles may have changes that aren't saved yet.
-                                let loaded: BTreeSet<String> = devices
-                                    .values()
-                                    .filter(|device| device.profile().uses_sample_file(&names))
-                                    .map(|device| device.profile().name().to_string())
-                                    .collect();
+                                let mut loaded: BTreeSet<String> = BTreeSet::new();
+                                for device in devices.values() {
+                                    let check = names.clone();
+                                    let used = device.run(move |d| Box::pin(async move {
+                                        d.profile().uses_sample_file(&check).then(|| d.profile().name().to_string())
+                                    })).await;
+                                    if let Ok(Some(name)) = used {
+                                        loaded.insert(name);
+                                    }
+                                }
                                 // Reading every saved profile is slow, so it's done in the background.
                                 tokio::spawn(async move {
                                     let result = tokio::task::spawn_blocking(move || {
@@ -751,8 +855,8 @@ pub async fn spawn_usb_handler(
                         }
                     }
                     DeviceCommand::GetDeviceMicLevel(serial, sender) => {
-                        if let Some(device) = devices.get_mut(&serial) {
-                            let _ = sender.send(device.get_mic_level().await);
+                        if let Some(device) = devices.get(&serial) {
+                            device.send_reply(false, sender, |d| Box::pin(d.get_mic_level()));
                         } else {
                             let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
                         }
@@ -760,7 +864,7 @@ pub async fn spawn_usb_handler(
 
                     DeviceCommand::RunFirmwareUpdate(serial, file, force, sender) => {
                         let mut start_update = true;
-                        if let Some(device) = devices.get_mut(&serial) {
+                        if let Some(device) = devices.get(&serial) {
                             if let Some(state) = devices_firmware.get(&serial) {
                                 match state.status.state {
                                     UpdateState::Failed | UpdateState::Complete | UpdateState::Pause(_) => {
@@ -773,8 +877,13 @@ pub async fn spawn_usb_handler(
                             }
 
                             if start_update {
-                                let device_type = device.get_hardware_type();
-                                let current_firmware = device.get_firmware_version();
+                                let Ok((device_type, current_firmware)) = device
+                                    .run(|d| Box::pin(async move { (d.get_hardware_type(), d.get_firmware_version()) }))
+                                    .await
+                                else {
+                                    let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
+                                    continue;
+                                };
 
                                 // Create and run a firmware updater for this device
                                 let update_settings = FirmwareUpdateSettings {
@@ -835,7 +944,13 @@ pub async fn spawn_usb_handler(
                             match device.status.state {
                                 UpdateState::Complete | UpdateState::Failed | UpdateState::Pause(_) => {
                                     // We're at a point where this update can be stopped, nuke it from the firmware list..
-                                    devices_firmware.remove(&serial);
+                                    if let Some(state) = devices_firmware.remove(&serial) {
+                                        remove_uploaded_firmware(&state.settings.file);
+                                        // A download waiting for confirmation, never flashed
+                                        if let UpdateState::Pause(info) = &state.status.state {
+                                            remove_downloaded_firmware(&info.path);
+                                        }
+                                    }
                                     change_found = true;
 
                                     let _ = sender.send(Ok(()));
@@ -852,22 +967,42 @@ pub async fn spawn_usb_handler(
                 }
             },
             Some(done) = sample_job_rx.recv() => {
+                sample_jobs_running = sample_jobs_running.saturating_sub(1);
                 if let Some(key) = &done.key {
                     busy_samples.remove(key);
                 }
                 let result = match done.result {
                     Ok(output) => {
                         if let Some(renamed) = &output.renamed {
-                            for device in devices.values_mut() {
-                                device.rename_sample_file(&renamed.old_name, &renamed.new_name);
+                            for device in devices.values() {
+                                let (old, new) = (renamed.old_name.clone(), renamed.new_name.clone());
+                                let _ = device.run(move |d| Box::pin(async move {
+                                    d.rename_sample_file(&old, &new);
+                                })).await;
                             }
                             settings.rename_sample_gain(&renamed.old_name, &renamed.new_name).await;
                             settings.save().await;
                         }
-                        for device in devices.values_mut() {
-                            if let Err(e) = device.restore_trashed_tracks(&output.tracks).await {
-                                warn!("Unable to put the restored sample back on the sampler: {}", e);
+                        if let Some((original, copy)) = &output.copied_gain {
+                            let gain = settings.get_sample_gain_percent(original.clone()).await;
+                            settings.set_sample_gain_percent(copy.clone(), gain).await;
+                            settings.save().await;
+                        }
+                        if let Some((name, gain)) = &output.edited {
+                            for device in devices.values() {
+                                let name = name.clone();
+                                let gain = *gain;
+                                device.send(move |d| Box::pin(async move { d.sample_file_edited(&name, gain) }));
                             }
+                        }
+                        for device in devices.values() {
+                            let tracks = output.tracks.clone();
+                            device.send(move |d| Box::pin(async move {
+                                if let Err(e) = d.restore_trashed_tracks(&tracks).await {
+                                    warn!("Unable to put the restored sample back on the sampler: {}", e);
+                                }
+                                true
+                            }));
                         }
                         files = update_files(files, PathTypes::Samples, &mut file_manager, &settings).await;
                         change_found = true;
@@ -876,12 +1011,20 @@ pub async fn spawn_usb_handler(
                     Err(e) => Err(e),
                 };
                 let _ = done.sender.send(result);
+
+                // The renames are applied above, the files can be checked now
+                if sample_jobs_running == 0 && validate_pending {
+                    validate_pending = false;
+                    validate_samplers(&devices);
+                }
             }
             Some(path) = file_rx.recv() => {
                 // Notify devices if Samples have changed..
                 if path == PathTypes::Samples {
-                    for device in devices.values_mut() {
-                        let _ = device.validate_sampler().await;
+                    if sample_jobs_running > 0 {
+                        validate_pending = true;
+                    } else {
+                        validate_samplers(&devices);
                     }
                 }
 
@@ -892,7 +1035,7 @@ pub async fn spawn_usb_handler(
 
         if change_found {
             let new_status = get_daemon_status(
-                &devices,
+                &mixers,
                 &settings,
                 &http_settings,
                 &driver_interface,
@@ -902,28 +1045,79 @@ pub async fn spawn_usb_handler(
                 &app_check,
             )
             .await;
-
-            // Convert them to JSON..
-            let json_old = serde_json::to_value(&daemon_status).unwrap();
-            let json_new = serde_json::to_value(&new_status).unwrap();
-
-            let patch = diff(&json_old, &json_new);
-
-            // Only send a patch if something has changed..
-            if !patch.0.is_empty() {
-                let _ = broadcast_tx.send(PatchEvent { data: patch });
-            }
-
-            // Send the patch to the tokio broadcaster, for handling by clients..
-            daemon_status = new_status;
+            publish_status(
+                new_status,
+                &mut daemon_status,
+                &mut status_json,
+                &broadcast_tx,
+            );
+        } else if let Some(serial) = device_changed
+            && let Some(status) = mixers.get(&serial)
+        {
+            let mut new_status = daemon_status.clone();
+            new_status.mixers.insert(serial, status.clone());
+            crate::tray::update_tray_state(&new_status);
+            publish_status(
+                new_status,
+                &mut daemon_status,
+                &mut status_json,
+                &broadcast_tx,
+            );
         }
+        if let Some(reply) = pending_reply {
+            reply();
+        }
+    }
+}
+
+/// Sends what changed between the status as last sent and the new one (nothing when they're the
+/// same), then keeps the new one.
+fn publish_status(
+    new_status: DaemonStatus,
+    daemon_status: &mut DaemonStatus,
+    status_json: &mut serde_json::Value,
+    broadcast_tx: &tokio::sync::broadcast::Sender<PatchEvent>,
+) {
+    let Ok(json_new) = serde_json::to_value(&new_status) else {
+        warn!("Unable to serialise the status");
+        return;
+    };
+    let patch = diff(status_json, &json_new);
+    if !patch.0.is_empty() {
+        let _ = broadcast_tx.send(PatchEvent { data: patch });
+    }
+    *status_json = json_new;
+    *daemon_status = new_status;
+}
+
+// Whether autostart is set looks at the disk (shortcut, task, desktop file): it's checked at
+// most every few seconds, not on each status rebuild, and again right after it's changed.
+static AUTOSTART: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+
+fn autostart_enabled() -> bool {
+    let Ok(mut cached) = AUTOSTART.lock() else {
+        return has_autostart();
+    };
+    match *cached {
+        Some((checked, value)) if checked.elapsed() < Duration::from_secs(5) => value,
+        _ => {
+            let value = has_autostart();
+            *cached = Some((Instant::now(), value));
+            value
+        }
+    }
+}
+
+fn forget_autostart() {
+    if let Ok(mut cached) = AUTOSTART.lock() {
+        *cached = None;
     }
 }
 
 // Dis getting big..
 #[allow(clippy::too_many_arguments)]
 async fn get_daemon_status(
-    devices: &HashMap<String, Device<'_>>,
+    mixers: &HashMap<String, MixerStatus>,
     settings: &SettingsHandle,
     http_settings: &HttpSettings,
     driver_details: &DriverDetails,
@@ -942,7 +1136,7 @@ async fn get_daemon_status(
                 user_locale: settings.get_selected_locale().await,
                 system_locale: SYSTEM_LOCALE.clone(),
             },
-            autostart_enabled: has_autostart(),
+            autostart_enabled: autostart_enabled(),
             show_tray_icon: settings.get_show_tray_icon().await,
             tts_enabled: settings.get_tts_enabled().await,
             allow_network_access: settings.get_allow_network_access().await,
@@ -974,10 +1168,8 @@ async fn get_daemon_status(
             .insert(serial.to_owned(), state.status.clone());
     }
 
-    for (serial, device) in devices {
-        status
-            .mixers
-            .insert(serial.to_owned(), device.status().await.clone());
+    for (serial, mixer) in mixers {
+        status.mixers.insert(serial.to_owned(), mixer.clone());
     }
 
     crate::tray::update_tray_state(&status);
@@ -1023,6 +1215,10 @@ struct SampleJobOutput {
     renamed: Option<RenamedSample>,
     // Sampler tracks to put back (a sample restored from the trash)
     tracks: Vec<TrashedTrack>,
+    // A copy saved by the editor: (original name, copy name), the copy gets the same gain
+    copied_gain: Option<(String, String)>,
+    // A sample edited in place: (its name, its new gain), for the tracks loaded on the devices
+    edited: Option<(String, f64)>,
 }
 
 struct SampleJobDone {
@@ -1056,9 +1252,38 @@ fn spawn_sample_job<F>(
     });
 }
 
+/// The gain that brings a sample to the sampler's loudness, as when it's added to a button.
+fn measure_gain(file: &Path) -> Option<f64> {
+    let mut player =
+        goxlr_audio::player::Player::new(&file.to_path_buf(), None, None, None, None, None).ok()?;
+    let state = player.get_state();
+    player.calculate_gain();
+    if state.error.lock().ok()?.is_some() {
+        return None;
+    }
+    Some(
+        state
+            .calculated_gain
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Drops the sampler tracks whose file is gone, on every device.
+fn validate_samplers(devices: &HashMap<String, DeviceActor>) {
+    for device in devices.values() {
+        device.send(|d| {
+            Box::pin(async move {
+                let _ = d.validate_sampler().await;
+                true
+            })
+        });
+    }
+}
+
 /// Points the saved profiles at a renamed sample file (slow: every profile is read).
-fn rename_in_saved_profiles(profiles: &Path, renamed: &RenamedSample) {
-    let changed = rename_sample_in_saved_profiles(profiles, &renamed.old_name, &renamed.new_name);
+fn rename_in_saved_profiles(profiles: &Path, backups: &Path, renamed: &RenamedSample) {
+    let changed =
+        rename_sample_in_saved_profiles(profiles, backups, &renamed.old_name, &renamed.new_name);
     info!(
         "Renamed sample {} to {}, updated profiles: {:?}",
         renamed.old_name, renamed.new_name, changed
@@ -1264,7 +1489,7 @@ fn find_new_device(
     })
 }
 
-fn get_all_serials(existing_devices: &HashMap<String, Device>) -> Vec<String> {
+fn get_all_serials<T>(existing_devices: &HashMap<String, T>) -> Vec<String> {
     let mut serials: Vec<String> = vec![];
 
     for device in existing_devices {
@@ -1343,7 +1568,7 @@ async fn load_device(
     hardware: HardwareStatus,
     global_events: Sender<EventTriggers>,
     settings: &SettingsHandle,
-) -> Result<Device<'_>> {
+) -> Result<Device> {
     let serial_number = hardware.serial_number.clone();
     let device = Device::new(handled_device, hardware, settings, global_events).await?;
     settings
@@ -1437,6 +1662,25 @@ async fn check_firmware_versions(x: FwSender, source: FirmwareSource) {
 
     debug!("Firmware Update Process Finished");
     let _ = x.send(map).await;
+}
+
+/// Removes a firmware file the interface uploaded (to the temporary folder, named by the HTTP
+/// server), once its update is done or cleared. A file picked on disk is never touched.
+fn remove_uploaded_firmware(file: &Option<PathBuf>) {
+    let Some(file) = file else {
+        return;
+    };
+    let uploaded = file.parent() == Some(std::env::temp_dir().as_path())
+        && file
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("goxlr-firmware-"));
+    if uploaded && let Err(e) = fs::remove_file(file) {
+        warn!(
+            "Unable to remove the uploaded firmware {}: {}",
+            file.display(),
+            e
+        );
+    }
 }
 
 #[cfg(test)]

@@ -189,11 +189,11 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('goxlr-utility/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
       - name: Install cargo-deb and cargo-generate-rpm
-        run: cargo install --force cargo-deb cargo-generate-rpm
+        run: cargo install --locked --force cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
 
       - name: "Build Packages"
         run: ./ci/build-packages

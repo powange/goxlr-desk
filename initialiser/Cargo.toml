@@ -23,3 +23,6 @@ rusb = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1.6"
 xpc-connection-sys = { git = "https://github.com/dfrankland/xpc-connection-rs.git", rev = "cd4fb3d05edb4292ccb9566ae27cdeb874222d2a" }
+
+[lints]
+workspace = true

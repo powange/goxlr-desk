@@ -10,8 +10,11 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap};
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -39,6 +42,9 @@ pub struct PitchEncoderBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, PitchEncoder>,
     active_set: u8, // Not sure what this does?
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl PitchEncoderBase {
@@ -53,6 +59,7 @@ impl PitchEncoderBase {
             colour_map,
             preset_map: EnumMap::default(),
             active_set: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -64,7 +71,7 @@ impl PitchEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[PitchEncoder] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -78,12 +85,13 @@ impl PitchEncoderBase {
     ) -> Result<(), ParseError> {
         let mut preset = PitchEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "PITCH_STYLE" {
-                for style in PitchStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<PitchStyle>(&attr.value) {
+                    preset.style = style;
                 }
 
                 // Set the threshold based on the style..
@@ -92,16 +100,6 @@ impl PitchEncoderBase {
                     PitchStyle::Wide => preset.threshold = -26,
                 }
 
-                continue;
-            }
-
-            if attr.name == "PITCH_KNOB_POSITION" {
-                preset.knob_position = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-
-            if attr.name == "PITCH_RANGE" {
-                preset.range = attr.value.parse::<c_float>()? as u8;
                 continue;
             }
 
@@ -115,7 +113,7 @@ impl PitchEncoderBase {
                 continue;
             }
 
-            println!("[PitchEncoder] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         self.preset_map[preset_enum] = preset;
@@ -130,6 +128,7 @@ impl PitchEncoderBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -158,15 +157,11 @@ impl PitchEncoderBase {
         let mut attributes = HashMap::new();
         let value = &self.preset_map[preset];
 
-        attributes.insert(
-            "PITCH_KNOB_POSITION".to_string(),
-            format!("{}", value.knob_position),
-        );
+        value.write_numeric(&mut attributes);
         attributes.insert(
             "PITCH_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("PITCH_RANGE".to_string(), format!("{}", value.range));
         attributes.insert(
             "PITCH_SHIFT_THRESHOLD".to_string(),
             format!("{}", value.threshold()),
@@ -179,6 +174,7 @@ impl PitchEncoderBase {
             );
         }
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -199,13 +195,16 @@ impl PitchEncoderBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PitchEncoder {
     knob_position: i8,
     style: PitchStyle,
     range: u8,
     threshold: i8,
     inst_ratio: Option<u8>,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl PitchEncoder {
@@ -217,6 +216,7 @@ impl PitchEncoder {
 
             threshold: -26,
             inst_ratio: None,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -262,9 +262,7 @@ impl PitchEncoder {
         }
 
         // This is technically settings dependant, but these are the max ranges
-        if !(-24..=24).contains(&knob_position) {
-            return Err(anyhow!("Pitch Knob Position should be between -24 and 24"));
-        }
+        check_range(knob_position, ranges::PITCH_AMOUNT, "Pitch Knob Position")?;
 
         match self.style {
             PitchStyle::Narrow => self.knob_position = knob_position / 2,
@@ -336,9 +334,7 @@ impl PitchEncoder {
         self.inst_ratio
     }
     pub fn set_inst_ratio(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Character should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Character")?;
         self.inst_ratio = Some(value);
         Ok(())
     }
@@ -378,3 +374,8 @@ pub enum PitchStyle {
     #[strum(props(uiIndex = "1"))]
     Wide,
 }
+
+numeric_attributes!(PitchEncoder {
+    knob_position: i8 = "PITCH_KNOB_POSITION" in ranges::KNOB_CENTRED,
+    range: u8 = "PITCH_RANGE",
+});

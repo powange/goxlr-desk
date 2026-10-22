@@ -151,10 +151,13 @@ pub async fn run(tx: mpsc::Sender<EventTriggers>, mut stop: Shutdown) -> Result<
                 }
             }
             Some(signal) = conditional(&mut lock_result) => {
-                let args = signal.args().unwrap();
+                // A malformed message is skipped, not a reason to stop watching
+                let Ok(args) = signal.args() else {
+                    continue;
+                };
 
-                if args.changed.contains_key("LockedHint") {
-                    let value = bool::try_from(args.changed.get("LockedHint").unwrap())?;
+                if let Some(locked) = args.changed.get("LockedHint") {
+                    let value = bool::try_from(locked)?;
                     if value {
                         let _ = tx.send(EventTriggers::Lock).await;
                     } else {

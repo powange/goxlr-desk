@@ -26,6 +26,14 @@ license = "MIT"
 
 repository = "https://github.com/GoXLR-on-Linux/GoXLR-Utility"
 
+# The lint policy lives here, not only on the CI command line, so a local `cargo clippy` sees the
+# same thing (CI still adds `-D warnings` to turn them into errors).
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
 [workspace.dependencies]
 log = "0.4.28"
 
@@ -38,6 +46,7 @@ strum = { version = "0.27.2", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
 ### JSON Handling
+schemars = "1.2.3"
 serde_json = { version = "1.0.145" }
 json-patch = "4.1.0"
 
@@ -70,7 +79,6 @@ cfg-if = "1.0.3"
 rusb = "0.9.4"
 
 ### Lazy Statics
-lazy_static = "1.5.0"
 
 ### Regular Expressions
 fancy-regex = "0.16.2"
@@ -87,7 +95,7 @@ sysinfo = "0.37.2"
 ### Windows Specific
 windows = "0.62.2"
 winreg = "0.55.0"
-windres = "0.2.2"
+embed-resource = "3.0.12"
 
 ### Linux Specific
 nix = "0.30.1"

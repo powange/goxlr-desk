@@ -1,5 +1,6 @@
 use enum_map::Enum;
 use json_patch::Patch;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -20,7 +21,7 @@ use goxlr_types::{
     VodMode, WaterfallDirection,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum DaemonRequest {
     Ping,
     GetStatus,
@@ -52,7 +53,7 @@ pub enum DaemonResponse {
     NetworkAccess(NetworkAccess),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct NetworkAccess {
     // Whether the interface is reachable from the network (the setting applies at start)
     pub enabled: bool,
@@ -60,7 +61,7 @@ pub struct NetworkAccess {
     pub urls: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SampleUsage {
     // How many sample files are at the path (1 for a file, the content of a folder)
     pub files: usize,
@@ -68,7 +69,7 @@ pub struct SampleUsage {
     pub profiles: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebsocketRequest {
     pub id: u64,
     pub data: DaemonRequest,
@@ -80,13 +81,13 @@ pub struct WebsocketResponse {
     pub data: DaemonResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, JsonSchema)]
 pub enum ColourWay {
     Black,
     White,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, JsonSchema)]
 pub enum PathTypes {
     Profiles,
     MicProfiles,
@@ -97,7 +98,7 @@ pub enum PathTypes {
     Backups,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, JsonSchema)]
 pub enum UpdateState {
     Failed,
 
@@ -113,21 +114,21 @@ pub enum UpdateState {
     Complete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, JsonSchema)]
 pub struct FirmwareInfo {
     pub path: PathBuf,
     pub device_type: DeviceType,
     pub version: VersionNumber,
 }
 
-#[derive(Debug, Copy, Clone, Default, Enum, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Default, Enum, Serialize, Deserialize, Eq, PartialEq, JsonSchema)]
 pub enum FirmwareSource {
     #[default]
     Live,
     Beta,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq, JsonSchema)]
 pub enum LogLevel {
     Off,
     Error,
@@ -138,7 +139,7 @@ pub enum LogLevel {
     Trace,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum DaemonCommand {
     OpenUi,
     Activate,
@@ -185,7 +186,7 @@ pub enum DaemonCommand {
     HandleMacOSAggregates(bool),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SampleEdit {
     // Parts to remove, as (start, end) times in seconds
     #[serde(default)]
@@ -195,7 +196,7 @@ pub struct SampleEdit {
     pub normalize: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum GoXLRCommand {
     SetShutdownCommands(Vec<GoXLRCommand>),
     SetSleepCommands(Vec<GoXLRCommand>),
@@ -403,6 +404,170 @@ pub enum GoXLRCommand {
     SetMonitorMix(OutputDevice),
 }
 
+impl GoXLRCommand {
+    /// Whether running this command writes files or the settings. Every command is listed (no
+    /// catch-all), so a new one needs a decision here; command lists run at shutdown must not
+    /// write (see the daemon's execute_command_list).
+    pub fn writes_to_disk(&self) -> bool {
+        match self {
+            GoXLRCommand::LoadProfile(_, save) | GoXLRCommand::LoadMicProfile(_, save) => *save,
+
+            GoXLRCommand::SetShutdownCommands(..)
+            | GoXLRCommand::SetSleepCommands(..)
+            | GoXLRCommand::SetWakeCommands(..)
+            | GoXLRCommand::SaveScene(..)
+            | GoXLRCommand::DeleteScene(..)
+            | GoXLRCommand::SetSamplerPreBufferDuration(..)
+            | GoXLRCommand::SaveActivePreset(..)
+            | GoXLRCommand::NewProfile(..)
+            | GoXLRCommand::SaveProfile(..)
+            | GoXLRCommand::SaveProfileAs(..)
+            | GoXLRCommand::DeleteProfile(..)
+            | GoXLRCommand::RenameProfile(..)
+            | GoXLRCommand::DuplicateProfile(..)
+            | GoXLRCommand::NewMicProfile(..)
+            | GoXLRCommand::SaveMicProfile(..)
+            | GoXLRCommand::SaveMicProfileAs(..)
+            | GoXLRCommand::DeleteMicProfile(..)
+            | GoXLRCommand::RenameMicProfile(..)
+            | GoXLRCommand::DuplicateMicProfile(..)
+            | GoXLRCommand::SetMuteHoldDuration(..)
+            | GoXLRCommand::SetVCMuteAlsoMuteCM(..)
+            | GoXLRCommand::SetMonitorWithFx(..)
+            | GoXLRCommand::SetSamplerResetOnClear(..)
+            | GoXLRCommand::SetSamplerFadeDuration(..)
+            | GoXLRCommand::SetLockFaders(..)
+            | GoXLRCommand::SetVodMode(..) => true,
+
+            GoXLRCommand::RunScene(..)
+            | GoXLRCommand::SetFader(..)
+            | GoXLRCommand::SetFaderMuteFunction(..)
+            | GoXLRCommand::SetVolume(..)
+            | GoXLRCommand::SetMicrophoneType(..)
+            | GoXLRCommand::SetMicrophoneGain(..)
+            | GoXLRCommand::SetRouter(..)
+            | GoXLRCommand::SetCoughMuteFunction(..)
+            | GoXLRCommand::SetCoughIsHold(..)
+            | GoXLRCommand::SetSwearButtonVolume(..)
+            | GoXLRCommand::SetEqMiniGain(..)
+            | GoXLRCommand::SetEqMiniFreq(..)
+            | GoXLRCommand::SetEqGain(..)
+            | GoXLRCommand::SetEqFreq(..)
+            | GoXLRCommand::SetGateThreshold(..)
+            | GoXLRCommand::SetGateAttenuation(..)
+            | GoXLRCommand::SetGateAttack(..)
+            | GoXLRCommand::SetGateRelease(..)
+            | GoXLRCommand::SetGateActive(..)
+            | GoXLRCommand::SetCompressorThreshold(..)
+            | GoXLRCommand::SetCompressorRatio(..)
+            | GoXLRCommand::SetCompressorAttack(..)
+            | GoXLRCommand::SetCompressorReleaseTime(..)
+            | GoXLRCommand::SetCompressorMakeupGain(..)
+            | GoXLRCommand::SetElementDisplayMode(..)
+            | GoXLRCommand::SetDeeser(..)
+            | GoXLRCommand::SetAnimationMode(..)
+            | GoXLRCommand::SetAnimationMod1(..)
+            | GoXLRCommand::SetAnimationMod2(..)
+            | GoXLRCommand::SetAnimationWaterfall(..)
+            | GoXLRCommand::SetGlobalColour(..)
+            | GoXLRCommand::SetFaderDisplayStyle(..)
+            | GoXLRCommand::SetFaderColours(..)
+            | GoXLRCommand::SetAllFaderColours(..)
+            | GoXLRCommand::SetAllFaderDisplayStyle(..)
+            | GoXLRCommand::SetButtonColours(..)
+            | GoXLRCommand::SetButtonOffStyle(..)
+            | GoXLRCommand::SetButtonGroupColours(..)
+            | GoXLRCommand::SetButtonGroupOffStyle(..)
+            | GoXLRCommand::SetSimpleColour(..)
+            | GoXLRCommand::SetEncoderColour(..)
+            | GoXLRCommand::SetSampleColour(..)
+            | GoXLRCommand::SetSampleOffStyle(..)
+            | GoXLRCommand::LoadEffectPreset(..)
+            | GoXLRCommand::RenameActivePreset(..)
+            | GoXLRCommand::SetReverbStyle(..)
+            | GoXLRCommand::SetReverbAmount(..)
+            | GoXLRCommand::SetReverbDecay(..)
+            | GoXLRCommand::SetReverbEarlyLevel(..)
+            | GoXLRCommand::SetReverbTailLevel(..)
+            | GoXLRCommand::SetReverbPreDelay(..)
+            | GoXLRCommand::SetReverbLowColour(..)
+            | GoXLRCommand::SetReverbHighColour(..)
+            | GoXLRCommand::SetReverbHighFactor(..)
+            | GoXLRCommand::SetReverbDiffuse(..)
+            | GoXLRCommand::SetReverbModSpeed(..)
+            | GoXLRCommand::SetReverbModDepth(..)
+            | GoXLRCommand::SetEchoStyle(..)
+            | GoXLRCommand::SetEchoAmount(..)
+            | GoXLRCommand::SetEchoFeedback(..)
+            | GoXLRCommand::SetEchoTempo(..)
+            | GoXLRCommand::SetEchoDelayLeft(..)
+            | GoXLRCommand::SetEchoDelayRight(..)
+            | GoXLRCommand::SetEchoFeedbackLeft(..)
+            | GoXLRCommand::SetEchoFeedbackRight(..)
+            | GoXLRCommand::SetEchoFeedbackXFBLtoR(..)
+            | GoXLRCommand::SetEchoFeedbackXFBRtoL(..)
+            | GoXLRCommand::SetPitchStyle(..)
+            | GoXLRCommand::SetPitchAmount(..)
+            | GoXLRCommand::SetPitchCharacter(..)
+            | GoXLRCommand::SetGenderStyle(..)
+            | GoXLRCommand::SetGenderAmount(..)
+            | GoXLRCommand::SetMegaphoneStyle(..)
+            | GoXLRCommand::SetMegaphoneAmount(..)
+            | GoXLRCommand::SetMegaphonePostGain(..)
+            | GoXLRCommand::SetRobotStyle(..)
+            | GoXLRCommand::SetRobotGain(..)
+            | GoXLRCommand::SetRobotFreq(..)
+            | GoXLRCommand::SetRobotWidth(..)
+            | GoXLRCommand::SetRobotWaveform(..)
+            | GoXLRCommand::SetRobotPulseWidth(..)
+            | GoXLRCommand::SetRobotThreshold(..)
+            | GoXLRCommand::SetRobotDryMix(..)
+            | GoXLRCommand::SetHardTuneStyle(..)
+            | GoXLRCommand::SetHardTuneAmount(..)
+            | GoXLRCommand::SetHardTuneRate(..)
+            | GoXLRCommand::SetHardTuneWindow(..)
+            | GoXLRCommand::SetHardTuneSource(..)
+            | GoXLRCommand::ClearSampleProcessError(..)
+            | GoXLRCommand::SetSamplerFunction(..)
+            | GoXLRCommand::SetSamplerOrder(..)
+            | GoXLRCommand::AddSample(..)
+            | GoXLRCommand::SetSampleStartPercent(..)
+            | GoXLRCommand::SetSampleStopPercent(..)
+            | GoXLRCommand::RemoveSampleByIndex(..)
+            | GoXLRCommand::PlaySampleByIndex(..)
+            | GoXLRCommand::PlayNextSample(..)
+            | GoXLRCommand::StopSamplePlayback(..)
+            | GoXLRCommand::StartSampleRecording(..)
+            | GoXLRCommand::StopSampleRecording(..)
+            | GoXLRCommand::SetScribbleIcon(..)
+            | GoXLRCommand::SetScribbleText(..)
+            | GoXLRCommand::SetScribbleNumber(..)
+            | GoXLRCommand::SetScribbleInvert(..)
+            | GoXLRCommand::LoadProfileColours(..)
+            | GoXLRCommand::ReloadSettings(..)
+            | GoXLRCommand::SetActiveEffectPreset(..)
+            | GoXLRCommand::SetActiveSamplerBank(..)
+            | GoXLRCommand::SetMegaphoneEnabled(..)
+            | GoXLRCommand::SetRobotEnabled(..)
+            | GoXLRCommand::SetHardTuneEnabled(..)
+            | GoXLRCommand::SetFXEnabled(..)
+            | GoXLRCommand::SetFaderMuteState(..)
+            | GoXLRCommand::SetCoughMuteState(..)
+            | GoXLRCommand::SetSubMixEnabled(..)
+            | GoXLRCommand::SetSubMixVolume(..)
+            | GoXLRCommand::SetSubMixLinked(..)
+            | GoXLRCommand::SetSubMixOutputMix(..)
+            | GoXLRCommand::SetMonitorMix(..) => false,
+        }
+    }
+}
+
+/// The JSON Schema of what /api/command accepts (a DaemonRequest), for the people writing
+/// integrations (Stream Deck, OBS, scripts) and for their tools.
+pub fn request_schema() -> schemars::Schema {
+    schemars::schema_for!(DaemonRequest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +616,13 @@ mod tests {
             serde_json::to_string(&response).unwrap(),
             r#"{"id":7,"data":{"Error":"Nope"}}"#
         );
+    }
+
+    #[test]
+    fn the_request_schema_describes_the_commands() {
+        let schema = serde_json::to_string(&request_schema()).unwrap();
+        assert!(schema.contains("SetVolume"));
+        assert!(schema.contains("LoadProfile"));
+        assert!(schema.contains("SetCompressorRatio"));
     }
 }

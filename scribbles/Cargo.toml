@@ -16,3 +16,6 @@ image = { workspace = true }
 
 imageproc = "0.25.0"
 ab_glyph = "0.2.32"
+
+[lints]
+workspace = true

@@ -10,11 +10,11 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
-use lazy_static::lazy_static;
 use libloading::{Library, Symbol};
 use log::{debug, error, info, warn};
+use std::sync::LazyLock;
 use tokio::sync::mpsc::Sender;
 use widestring::U16CStr;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -25,7 +25,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateEventA, WaitForSingleObject};
 use windows::core::GUID;
 use winreg::RegKey;
-use winreg::enums::HKEY_CLASSES_ROOT;
+use winreg::enums::HKEY_LOCAL_MACHINE;
 
 use goxlr_types::VersionNumber;
 
@@ -51,27 +51,87 @@ type ReadDeviceNotification = unsafe extern "C" fn(u32, *const u32, *mut u8, u32
 type StatusCodeString = unsafe extern "C" fn(u32) -> *const i8;
 type CloseDevice = unsafe extern "C" fn(u32) -> u32;
 
+/// An error code from the TUSB driver, with its text. Errors are recognised by their code: the
+/// text depends on the driver's version.
+#[derive(Debug)]
+pub struct TStatus {
+    pub code: u32,
+    text: String,
+}
+
+/// The device handle isn't valid any more (TSTATUS_INVALID_HANDLE)
+pub const TSTATUS_INVALID_HANDLE: u32 = 0xEE00_0048;
+
+impl TStatus {
+    fn new(code: u32, text: String) -> Self {
+        Self { code, text }
+    }
+}
+
+impl std::fmt::Display for TStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:#x})", self.text, self.code)
+    }
+}
+
+impl std::error::Error for TStatus {}
+
+/// Whether an error is the driver saying the handle is no longer valid.
+pub fn is_invalid_handle(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<TStatus>()
+        .is_some_and(|status| status.code == TSTATUS_INVALID_HANDLE)
+}
+
 static GOXLR_GUID: GUID = GUID::from_u128(0x024D0372_641F_4B7B_8140_F4DFE458C982);
-lazy_static! {
-    // Initialise the Library..
-    static ref LIBRARY: Library = unsafe {
-       Library::new(locate_library().as_str()).expect("Unable to Load GoXLR API Driver")
-    };
-    pub static ref TUSB_INTERFACE: TUSBAudio<'static> = TUSBAudio::new().expect("Unable to Parse GoXLR API Driver");
+// The driver's library and its API, loaded once. A missing or broken driver is an error for
+// whoever needs it (the daemon reports it), never a panic.
+static LIBRARY: LazyLock<Result<Library, String>> = LazyLock::new(|| unsafe {
+    Library::new(locate_library().as_str())
+        .map_err(|e| format!("Unable to load the GoXLR API driver: {e}"))
+});
+static TUSB_INTERFACE: LazyLock<Result<TUSBAudio<'static>, String>> = LazyLock::new(|| {
+    TUSBAudio::new().map_err(|e| format!("Unable to use the GoXLR API driver: {e}"))
+});
+
+fn library() -> Result<&'static Library> {
+    LIBRARY.as_ref().map_err(|e| anyhow!("{e}"))
+}
+
+/// The driver's API, or why it can't be used.
+pub fn tusb_interface() -> Result<&'static TUSBAudio<'static>> {
+    TUSB_INTERFACE.as_ref().map_err(|e| anyhow!("{e}"))
 }
 
 fn locate_library() -> String {
-    let regpath = "CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
-    let classes_root = RegKey::predef(HKEY_CLASSES_ROOT);
-    if let Ok(folders) = classes_root.open_subkey(regpath) {
+    // HKLM only: HKEY_CLASSES_ROOT also reads the user's own classes (HKCU), which any program
+    // run by the user can change to load another DLL here. And only a DLL under Program Files,
+    // which needs an administrator to write.
+    let regpath =
+        "SOFTWARE\\Classes\\CLSID\\{024D0372-641F-4B7B-8140-F4DFE458C982}\\InprocServer32\\";
+    let program_files: Vec<PathBuf> = ["ProgramW6432", "ProgramFiles"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    let trusted = |path: &PathBuf| {
+        path.canonicalize()
+            .is_ok_and(|real| program_files.iter().any(|base| real.starts_with(base)))
+    };
+    let machine = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(folders) = machine.open_subkey(regpath)
         // Name is blank because we need the default key
-        if let Ok(api) = folders.get_value::<String, &str>("") {
-            // Check the file exists..
-            if PathBuf::from(&api).exists() {
-                debug!("Located API From Registry at  {}", api);
-                return api;
-            }
+        && let Ok(api) = folders.get_value::<String, &str>("")
+    {
+        let path = PathBuf::from(&api);
+        if path.exists() && trusted(&path) {
+            debug!("Located API From Registry at  {}", api);
+            return api;
         }
+        warn!(
+            "Ignoring the GoXLR API registered at {}, it's not under Program Files",
+            api
+        );
     }
     // If we get here, we didn't find it, return a default and hope for the best!
     debug!("GoXLR API not found in registry, using default path.");
@@ -113,29 +173,30 @@ pub struct TUSBAudio<'lib> {
 
 impl TUSBAudio<'_> {
     pub fn new() -> Result<Self> {
-        let get_api_version: Symbol<_> = unsafe { LIBRARY.get(b"TUSBAUDIO_GetApiVersion")? };
-        let check_api_version = unsafe { LIBRARY.get(b"TUSBAUDIO_CheckApiVersion")? };
+        let library = library()?;
+        let get_api_version: Symbol<_> = unsafe { library.get(b"TUSBAUDIO_GetApiVersion")? };
+        let check_api_version = unsafe { library.get(b"TUSBAUDIO_CheckApiVersion")? };
 
         let enumerate_devices =
-            unsafe { LIBRARY.get::<EnumerateDevices>(b"TUSBAUDIO_EnumerateDevices")? };
-        let open_device_by_index = unsafe { LIBRARY.get(b"TUSBAUDIO_OpenDeviceByIndex")? };
+            unsafe { library.get::<EnumerateDevices>(b"TUSBAUDIO_EnumerateDevices")? };
+        let open_device_by_index = unsafe { library.get(b"TUSBAUDIO_OpenDeviceByIndex")? };
 
-        let get_device_count = unsafe { LIBRARY.get(b"TUSBAUDIO_GetDeviceCount")? };
-        let get_device_id_string = unsafe { LIBRARY.get(b"TUSBAUDIO_GetDeviceInstanceIdString")? };
-        let get_device_properties = unsafe { LIBRARY.get(b"TUSBAUDIO_GetDeviceProperties")? };
-        let get_device_usb = unsafe { LIBRARY.get(b"TUSBAUDIO_GetUsbConfigDescriptor")? };
+        let get_device_count = unsafe { library.get(b"TUSBAUDIO_GetDeviceCount")? };
+        let get_device_id_string = unsafe { library.get(b"TUSBAUDIO_GetDeviceInstanceIdString")? };
+        let get_device_properties = unsafe { library.get(b"TUSBAUDIO_GetDeviceProperties")? };
+        let get_device_usb = unsafe { library.get(b"TUSBAUDIO_GetUsbConfigDescriptor")? };
 
-        let vendor_request_out = unsafe { LIBRARY.get(b"TUSBAUDIO_ClassVendorRequestOut")? };
-        let vendor_request_in = unsafe { LIBRARY.get(b"TUSBAUDIO_ClassVendorRequestIn")? };
+        let vendor_request_out = unsafe { library.get(b"TUSBAUDIO_ClassVendorRequestOut")? };
+        let vendor_request_in = unsafe { library.get(b"TUSBAUDIO_ClassVendorRequestIn")? };
 
         let register_device_notification =
-            unsafe { LIBRARY.get(b"TUSBAUDIO_RegisterDeviceNotification")? };
+            unsafe { library.get(b"TUSBAUDIO_RegisterDeviceNotification")? };
         let register_pnp_notification =
-            unsafe { LIBRARY.get(b"TUSBAUDIO_RegisterPnpNotification")? };
-        let read_device_notification = unsafe { LIBRARY.get(b"TUSBAUDIO_ReadDeviceNotification")? };
+            unsafe { library.get(b"TUSBAUDIO_RegisterPnpNotification")? };
+        let read_device_notification = unsafe { library.get(b"TUSBAUDIO_ReadDeviceNotification")? };
 
-        let status_code_string = unsafe { LIBRARY.get(b"TUSBAUDIO_StatusCodeStringA")? };
-        let close_device = unsafe { LIBRARY.get(b"TUSBAUDIO_CloseDevice")? };
+        let status_code_string = unsafe { library.get(b"TUSBAUDIO_StatusCodeStringA")? };
+        let close_device = unsafe { library.get(b"TUSBAUDIO_CloseDevice")? };
 
         debug!("Performing initial Enumeration..");
         unsafe { (enumerate_devices)() };
@@ -190,14 +251,15 @@ impl TUSBAudio<'_> {
     }
 
     pub fn get_driver_version(&self) -> Option<VersionNumber> {
-        match unsafe { LIBRARY.get::<GetDriverInfo>(b"TUSBAUDIO_GetDriverInfo") } {
+        let library = library().ok()?;
+        match unsafe { library.get::<GetDriverInfo>(b"TUSBAUDIO_GetDriverInfo") } {
             Ok(get_driver_info) => {
                 debug!("Fetching Versioning Information..");
                 let mut driver_info = DriverInfo::default();
                 let driver_info_ptr: *mut DriverInfo = &mut driver_info;
                 let result = unsafe { (get_driver_info)(driver_info_ptr) };
-                if result != 0 {
-                    warn!("Unable to Get Driver Info: {}", self.get_error(result));
+                if let Err(e) = self.status(result) {
+                    warn!("Unable to Get Driver Info: {}", e);
                     return None;
                 }
 
@@ -217,9 +279,22 @@ impl TUSBAudio<'_> {
 
     fn get_error(&self, error: u32) -> String {
         let res = unsafe { (self.status_code_string)(error) };
+        if res.is_null() {
+            return String::from("Unknown status");
+        }
+        // The driver returns a static, nul terminated string
         let text = unsafe { CStr::from_ptr(res) };
 
         text.to_string_lossy().to_string()
+    }
+
+    /// A status returned by the driver: Ok for success, otherwise a TStatus error (with the
+    /// driver's text), so every call can tell an invalid handle apart.
+    fn status(&self, code: u32) -> Result<(), TStatus> {
+        if code == 0 {
+            return Ok(());
+        }
+        Err(TStatus::new(code, self.get_error(code)))
     }
 
     // We need to mildly abuse inner mutability here, due to the nature of lazy_static..
@@ -272,10 +347,7 @@ impl TUSBAudio<'_> {
 
         // Attempt to get the Properties for this device..
         let result = unsafe { (self.get_device_properties)(handle, properties_ptr) };
-
-        if result != 0 {
-            bail!("Unable to Get Properties: {}", result);
-        }
+        self.status(result).context("Unable to Get Properties")?;
 
         Ok(properties)
     }
@@ -287,10 +359,7 @@ impl TUSBAudio<'_> {
         let result =
             unsafe { (self.get_device_id_string)(handle, buffer.as_mut_ptr(), buffer_len) };
 
-        if result != 0 {
-            let error = self.get_error(result);
-            bail!("Error Getting Device Id: {}", error);
-        }
+        self.status(result).context("Error Getting Device Id")?;
 
         let device_id = U16CStr::from_slice_truncate(&buffer)?;
         Ok(device_id.to_string_lossy())
@@ -330,15 +399,11 @@ impl TUSBAudio<'_> {
             )
         };
 
-        if result != 0 {
-            // Known Errors:
-            // 4009754628 - ?
-            // 3992977412 - Invalid Request
-            // 3992977480 - INVALID HANDLE!
-
-            //3992977411
-            bail!("{}", self.get_error(result));
-        }
+        // Known Errors:
+        // 4009754628 - ?
+        // 3992977412 - Invalid Request
+        // 3992977480 - INVALID HANDLE!
+        self.status(result)?;
 
         Ok(())
     }
@@ -379,9 +444,7 @@ impl TUSBAudio<'_> {
             )
         };
 
-        if result != 0 {
-            bail!("{}", self.get_error(result));
-        }
+        self.status(result)?;
 
         // Ok, Buffer2 contains a u32 containing the length of the returned response..
         let read_len = LittleEndian::read_u32(&buffer2[0..4]) as usize;
@@ -397,33 +460,47 @@ impl TUSBAudio<'_> {
         Ok(buffer)
     }
 
+    /// Opens a device by its identifier. The driver opens by position, and the list can change
+    /// in between (another GoXLR plugged, unplugged): the opened device's identifier is checked,
+    /// and on a mismatch the list is read again once.
     pub fn open_device_by_identifier(&self, identifier: String) -> Result<u32> {
-        let device_index = self
-            .discovered_devices
-            .lock()
-            .unwrap()
-            .iter()
-            .position(|id| identifier == id.clone())
-            .ok_or_else(|| anyhow!("Cannot Find Device"))?;
-        self.open_device_by_index(device_index.try_into()?)
+        for attempt in 0..2 {
+            if attempt > 0 {
+                self.detect_devices()?;
+            }
+            let device_index = self
+                .discovered_devices
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|id| identifier == *id)
+                .ok_or_else(|| anyhow!("Cannot Find Device"))?;
+            let handle = self.open_device_by_index(device_index.try_into()?)?;
+            match self.get_device_id_string(handle) {
+                Ok(opened) if opened == identifier => return Ok(handle),
+                _ => {
+                    warn!("Opened another device than {}, looking again", identifier);
+                    let _ = self.close_device(handle);
+                }
+            }
+        }
+        bail!(
+            "Unable to open {}, the device list keeps changing",
+            identifier
+        )
     }
 
     fn open_device_by_index(&self, device_index: u32) -> Result<u32> {
         let mut handle: u32 = 0;
         let ptr: *mut u32 = &mut handle;
         let result = unsafe { (self.open_device_by_index)(device_index, ptr) };
-        if result == 0 {
-            return Ok(handle);
-        }
-
-        bail!("Unable to Open Device: {}", result)
+        self.status(result).context("Unable to Open Device")?;
+        Ok(handle)
     }
 
     pub fn close_device(&self, handle: u32) -> Result<()> {
         let close = unsafe { (self.close_device)(handle) };
-        if close != 0 {
-            bail!("Unable to Close Handle: {}", close);
-        }
+        self.status(close).context("Unable to Close Handle")?;
         Ok(())
     }
 
@@ -435,13 +512,13 @@ impl TUSBAudio<'_> {
         terminator: Arc<AtomicBool>,
     ) -> Result<()> {
         // Open a Handle to the Device..
-        let mut handle = TUSB_INTERFACE.open_device_by_identifier(device_identifier.clone())?;
+        let mut handle = self.open_device_by_identifier(device_identifier.clone())?;
 
         // Register a new windows event, it's closed when this function returns..
         let event = match unsafe { CreateEventA(None, false, false, None) } {
             Ok(event) => EventGuard(event),
             Err(error) => {
-                let _ = TUSB_INTERFACE.close_device(handle);
+                let _ = self.close_device(handle);
                 bail!("Unable to create event: {}", error);
             }
         };
@@ -451,7 +528,7 @@ impl TUSBAudio<'_> {
         let result = unsafe { (self.register_device_notification)(handle, u32::MAX, event, 0) };
         if result != 0 {
             warn!("Unable to Register Notifications");
-            let _ = TUSB_INTERFACE.close_device(handle);
+            let _ = self.close_device(handle);
             bail!("Unable to register notifications");
         }
 
@@ -561,8 +638,7 @@ impl TUSBAudio<'_> {
                 debug!("Invalid Handle Detected, attempting recovery..");
 
                 // Handle appears broken, try making a new one..
-                let new_handle =
-                    TUSB_INTERFACE.open_device_by_identifier(device_identifier.clone());
+                let new_handle = self.open_device_by_identifier(device_identifier.clone());
 
                 // This one is broken too!
                 if new_handle.is_err() {
@@ -582,19 +658,19 @@ impl TUSBAudio<'_> {
                     break;
                 } else {
                     debug!("Handle Re-established, attempting to register for notifications..");
-                    let _ = TUSB_INTERFACE.close_device(handle);
+                    let _ = self.close_device(handle);
                     handle = new_handle?;
 
                     let result =
                         unsafe { (self.register_device_notification)(handle, u32::MAX, event, 0) };
                     if result != 0 {
-                        let _ = TUSB_INTERFACE.close_device(handle);
+                        let _ = self.close_device(handle);
                         bail!("Unable to register notifications");
                     }
                 }
             }
         }
-        let _ = TUSB_INTERFACE.close_device(handle);
+        let _ = self.close_device(handle);
 
         warn!("Event Thread Terminated");
         bail!("Thread Terminated!")
@@ -610,10 +686,10 @@ impl TUSBAudio<'_> {
 
         debug!("Spawning PnP Thread..");
         thread::spawn(|| -> Result<()> {
+            let tusb = tusb_interface()?;
             let event = unsafe { CreateEventA(None, false, false, None)? };
 
-            let result =
-                unsafe { (TUSB_INTERFACE.register_pnp_notification)(event, event, 0, 0, 0) };
+            let result = unsafe { (tusb.register_pnp_notification)(event, event, 0, 0, 0) };
             if result != 0 {
                 bail!("Unable to register notifications");
             }
@@ -626,7 +702,7 @@ impl TUSBAudio<'_> {
                 }
 
                 // We need to re-enumerate the devices..
-                let _ = TUSB_INTERFACE.detect_devices();
+                let _ = tusb.detect_devices();
             }
         });
 
@@ -646,6 +722,7 @@ impl TUSBAudio<'_> {
 
         thread::spawn(move || -> Result<()> {
             let mut ready_sender = Some(ready_tx);
+            let tusb = tusb_interface()?;
 
             loop {
                 // The API writes the required size (a ULONG) into this value.
@@ -684,9 +761,9 @@ impl TUSBAudio<'_> {
                 }
 
                 let count = output.split(|&v| v == 0).filter(|a| !a.is_empty()).count();
-                if count != TUSB_INTERFACE.get_devices().len() {
+                if count != tusb.get_devices().len() {
                     debug!("Device Change Detected.");
-                    let _ = TUSB_INTERFACE.detect_devices();
+                    let _ = tusb.detect_devices();
                 }
 
                 if let Some(sender) = ready_sender.take() {
@@ -819,7 +896,7 @@ impl DeviceHandle {
     pub fn from_device(device: GoXLRDevice) -> Result<Self> {
         // This is simple enough, iterate the devices until we find the one we want..
         if let Some(identifier) = device.identifier {
-            let handle = TUSB_INTERFACE.open_device_by_identifier(identifier)?;
+            let handle = tusb_interface()?.open_device_by_identifier(identifier)?;
             return Ok(Self {
                 handle,
                 closed: AtomicBool::new(false),
@@ -833,12 +910,12 @@ impl DeviceHandle {
         if self.closed.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
-        TUSB_INTERFACE.close_device(self.handle)
+        tusb_interface()?.close_device(self.handle)
     }
 
     pub fn send_request(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
         // Ok, need to work out what all this is, but still..
-        TUSB_INTERFACE.send_request(self.handle, request, value, index, data)
+        tusb_interface()?.send_request(self.handle, request, value, index, data)
     }
 
     pub fn read_response(
@@ -848,15 +925,15 @@ impl DeviceHandle {
         index: u16,
         length: usize,
     ) -> Result<Vec<u8>> {
-        TUSB_INTERFACE.read_response(self.handle, request, value, index, length)
+        tusb_interface()?.read_response(self.handle, request, value, index, length)
     }
 
     pub fn get_device_id_string(&self) -> Result<String> {
-        TUSB_INTERFACE.get_device_id_string(self.handle)
+        tusb_interface()?.get_device_id_string(self.handle)
     }
 
     pub fn get_properties(&self) -> Result<Properties> {
-        TUSB_INTERFACE.get_properties_by_handle(self.handle)
+        tusb_interface()?.get_properties_by_handle(self.handle)
     }
 }
 
@@ -909,6 +986,16 @@ pub struct Properties {
 }
 
 impl Properties {
+    /// The device's release number (bcdDevice), as major, minor, sub minor.
+    pub fn revision(&self) -> (u8, u8, u8) {
+        let bcd = self.revision_number as u16;
+        (
+            (bcd >> 8) as u8,
+            ((bcd >> 4) & 0x0f) as u8,
+            (bcd & 0x0f) as u8,
+        )
+    }
+
     pub fn vendor_id(&self) -> i32 {
         self.vendor_id
     }
@@ -941,11 +1028,18 @@ impl Default for Properties {
 }
 
 pub fn get_devices() -> Vec<GoXLRDevice> {
-    let _ = TUSB_INTERFACE.spawn_pnp_handle_win32();
+    let tusb = match tusb_interface() {
+        Ok(tusb) => tusb,
+        Err(e) => {
+            warn!("{}", e);
+            return vec![];
+        }
+    };
+    let _ = tusb.spawn_pnp_handle_win32();
     let mut list = Vec::new();
 
     // Ok, this is slightly different now..
-    let devices = TUSB_INTERFACE.get_devices();
+    let devices = tusb.get_devices();
     for device in devices {
         list.push(GoXLRDevice {
             bus_number: 0,
@@ -957,7 +1051,7 @@ pub fn get_devices() -> Vec<GoXLRDevice> {
 }
 
 pub fn get_version() -> Option<VersionNumber> {
-    TUSB_INTERFACE.get_driver_version()
+    tusb_interface().ok()?.get_driver_version()
 }
 
 pub struct EventChannelReceiver {

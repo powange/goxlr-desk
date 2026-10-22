@@ -5,11 +5,11 @@ use strum::EnumProperty;
 use strum::IntoEnumIterator;
 
 use anyhow::Result;
-use log::warn;
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::ColourMap;
 use crate::components::sample::SampleBank;
 use crate::profile::Attribute;
@@ -43,6 +43,9 @@ pub struct Context {
     selected_id: Option<u8>,
     selected_sample: SampleBank, // These two should probably map to enums somewhere, matched up against
     selected_effects: Preset,    // the relevant sections of the tags (for quickly pulling presets)
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl Context {
@@ -56,6 +59,7 @@ impl Context {
             selected_id: None,
             selected_sample: SampleBank::A,
             selected_effects: Preset::Preset1,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -96,7 +100,7 @@ impl Context {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                warn!("[{}] Unparsed Attribute: {}", self.element_name, attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -132,6 +136,7 @@ impl Context {
 
         self.colour_map.write_colours(&mut attributes);
 
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

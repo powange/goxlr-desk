@@ -8,6 +8,7 @@ use anyhow::Result;
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 
+use crate::components::UnknownAttributes;
 use crate::components::colours::ColourMap;
 use crate::components::mixer::FullChannelList::LineOut;
 use crate::profile::Attribute;
@@ -35,6 +36,9 @@ pub struct Mixers {
     mixer_table: RoutingTable,
     volume_table: EnumMap<FullChannelList, u8>,
     colour_map: ColourMap,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl Default for Mixers {
@@ -93,6 +97,7 @@ impl Mixers {
             mixer_table,
             volume_table,
             colour_map: ColourMap::new("mixerTree".to_string()),
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -117,7 +122,7 @@ impl Mixers {
                 }
 
                 if !found {
-                    println!("Unable to find Channel: {channel}");
+                    self.unknown.keep(attr);
                 }
                 continue;
             }
@@ -133,6 +138,7 @@ impl Mixers {
                     let value: u16 = attr.value.parse()?;
 
                     // We need to find the two matching channels..
+                    let mut found = false;
                     for input_channel in InputChannels::iter() {
                         if input_channel.get_str("Name").unwrap() == input {
                             // Borrow this section of the mixer table before checkout outputs..
@@ -142,9 +148,13 @@ impl Mixers {
                                 if output_channel.get_str("Name").unwrap() == output {
                                     // Matched the output, store the value.
                                     table[output_channel] = value;
+                                    found = true;
                                 }
                             }
                         }
+                    }
+                    if !found {
+                        self.unknown.keep(attr);
                     }
                 }
                 continue;
@@ -152,7 +162,7 @@ impl Mixers {
 
             // Check to see if this is a colour related attribute..
             if !self.colour_map.read_colours(attr)? {
-                println!("[MIXER] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -187,6 +197,7 @@ impl Mixers {
         self.colour_map.write_colours(&mut attributes);
 
         // Set the attributes into the XML object..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }

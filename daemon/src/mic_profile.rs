@@ -1,18 +1,17 @@
 use crate::files::{can_create_new_file, named_file_path, new_named_file_path};
-use crate::profile::ProfileAdapter;
+use crate::profile::{ProfileAdapter, hard_muted};
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian};
 use enum_map::EnumMap;
 use goxlr_ipc::{Compressor, Equaliser, EqualiserMini, NoiseGate};
-use goxlr_profile_loader::components::mute::MuteFunction;
 use goxlr_profile_loader::mic_profile::MicProfileSettings;
 use goxlr_types::{
     CompressorAttackTime, CompressorRatio, CompressorReleaseTime, DisplayMode, EffectKey,
     EqFrequencies, GateTimes, MicrophoneParamKey, MicrophoneType, MiniEqFrequencies,
 };
+use hashlink::LinkedHashSet;
 use log::warn;
-use ritelinked::LinkedHashSet;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
@@ -674,8 +673,9 @@ impl MicProfileAdapter {
             MicrophoneParamKey::GateThreshold => self.i8_to_f32(self.profile.gate().threshold()),
             MicrophoneParamKey::GateAttack => self.u8_to_f32(self.profile.gate().attack()),
             MicrophoneParamKey::GateRelease => self.u8_to_f32(self.profile.gate().release()),
-            MicrophoneParamKey::GateAttenuation => self
-                .i8_to_f32(self.gate_attenuation_from_percent(self.profile.gate().attenuation())),
+            MicrophoneParamKey::GateAttenuation => self.i8_to_f32(gate_attenuation_from_percent(
+                self.profile.gate().attenuation(),
+            )),
             MicrophoneParamKey::CompressorThreshold => {
                 self.i8_to_f32(self.profile.compressor().threshold())
             }
@@ -775,13 +775,13 @@ impl MicProfileAdapter {
             let (muted_to_x, muted_to_all, mute_function) = profile.get_mute_button_state(fader);
 
             // Return whether we're muted or not by the fader
-            muted_to_all || (muted_to_x && mute_function == MuteFunction::All)
+            hard_muted(muted_to_x, muted_to_all, mute_function)
         } else {
             false
         };
 
         // Check all the cases where we might be muted to all, and return.
-        if muted_to_all || (muted_to_x && mute_function == MuteFunction::All) || muted_by_fader {
+        if hard_muted(muted_to_x, muted_to_all, mute_function) || muted_by_fader {
             1
         } else {
             0
@@ -796,9 +796,9 @@ impl MicProfileAdapter {
             EffectKey::GateMode => self.profile.gate_mode().into(),
             EffectKey::GateEnabled => 1, // Used for 'Mic Testing' in the UI
             EffectKey::GateThreshold => self.profile.gate().threshold().into(),
-            EffectKey::GateAttenuation => self
-                .gate_attenuation_from_percent(self.profile.gate().attenuation())
-                .into(),
+            EffectKey::GateAttenuation => {
+                gate_attenuation_from_percent(self.profile.gate().attenuation()).into()
+            }
             EffectKey::GateAttack => self.profile.gate().attack().into(),
             EffectKey::GateRelease => self.profile.gate().release().into(),
             EffectKey::MicCompSelect => self.profile.comp_select().into(),
@@ -1056,23 +1056,10 @@ impl MicProfileAdapter {
         return_value
     }
 
-    /*
-    Gate attenuation is an interesting one, it's stored and represented as a percent,
-    but implemented as a non-linear array, so we're going to implement this the same way
-    the Windows client does.
-     */
-    fn gate_attenuation_from_percent(&self, value: u8) -> i8 {
-        let index = value as f32 * 0.24;
-
-        if value > 99 {
-            return GATE_ATTENUATION[25];
-        }
-
-        GATE_ATTENUATION[index as usize]
-    }
-
-    pub fn get_mic_keys(&self) -> HashSet<EffectKey> {
-        let mut keys = HashSet::new();
+    /// The microphone's keys, always in this order (like get_fx_keys, the order they're sent in
+    /// can matter to the device).
+    pub fn get_mic_keys(&self) -> LinkedHashSet<EffectKey> {
+        let mut keys = LinkedHashSet::new();
         keys.insert(EffectKey::DeEsser);
         keys.insert(EffectKey::GateThreshold);
         keys.insert(EffectKey::GateAttack);
@@ -1262,5 +1249,38 @@ impl MicProfileAdapter {
 
     pub fn get_deesser(&self) -> u8 {
         self.profile.deess()
+    }
+}
+
+/// Gate attenuation is stored and shown as a percent, but the device takes one of the steps of
+/// GATE_ATTENUATION, the same way the official app does: checked against a USB capture of it
+/// (98% -> -30 dB, 95% -> -28, 86% -> -26, 77% -> -24, 100% -> -61). The -32 dB step isn't
+/// reachable there either.
+fn gate_attenuation_from_percent(value: u8) -> i8 {
+    if value > 99 {
+        return GATE_ATTENUATION[25];
+    }
+    GATE_ATTENUATION[(value as f32 * 0.24) as usize]
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn gate_attenuation_matches_the_official_app() {
+        // Sent by the official app (USB capture, 22/10)
+        for (percent, db) in [
+            (98, -30),
+            (95, -28),
+            (92, -28),
+            (86, -26),
+            (81, -25),
+            (77, -24),
+            (100, -61),
+        ] {
+            assert_eq!(gate_attenuation_from_percent(percent), db, "{percent}%");
+        }
+        assert_eq!(gate_attenuation_from_percent(0), -6);
     }
 }

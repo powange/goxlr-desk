@@ -1,15 +1,18 @@
 use crate::audio::{AudioOutput, AudioSpecification, OpenOutputStream};
 use crate::cpal::cpal_config::CpalConfiguration;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use cpal::Stream;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use log::{debug, warn};
 use rb::{Producer, RB, RbConsumer, RbInspector, RbProducer, SpscRb};
 use rubato::{FftFixedIn, Resampler};
+
+// How long the device may not take any sample before playback gives up
+const STALL_TIMEOUT: Duration = Duration::from_secs(2);
 use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Create a 50ms Buffer Size for playback, this should be short enough to ensure there aren't
 // any obvious delays when playing samples.
@@ -31,7 +34,6 @@ struct CpalResampler {
     input_buffer: Vec<f32>,
     input: Vec<Vec<f32>>,
     output: Vec<Vec<f32>>,
-    interleaved: Vec<f32>,
 }
 
 impl OpenOutputStream for CpalPlayback {
@@ -123,7 +125,6 @@ impl OpenOutputStream for CpalPlayback {
                 input_buffer,
                 input,
                 output,
-                interleaved: vec![],
             })
         } else {
             None
@@ -152,77 +153,68 @@ impl AudioOutput for CpalPlayback {
             return Ok(());
         }
 
-        let out_samples = if let Some(resampler) = &mut self.resampler {
-            // First thing we need to do, is append these samples to the input buffer..
-            //dst.extend(src.iter().map(|&s| s.into_sample()));
+        let resampled;
+        let out_samples: &[f32] = if let Some(resampler) = &mut self.resampler {
+            // Queue the samples, then resample in blocks of exactly the size the resampler takes.
+            // What's left waits for the next packet: packets vary in size (Vorbis, the last one of
+            // a file), and dropping the excess made clicks and jumps.
             resampler.input_buffer.extend(samples);
-
-            let required_samples = resampler.input[0].capacity() * resampler.input.len();
-            if resampler.input_buffer.len() < required_samples {
-                // Don't do anything with these samples, we're not ready.
-                return Ok(());
-            }
-
-            // So, first problem we run into here, is that our samples are already
-            // interleaved, and our resampler expects them to not be, so lets split them.
-            resampler.input[0] = resampler.input_buffer.iter().step_by(2).copied().collect();
-            resampler.input[1] = resampler
-                .input_buffer
-                .iter()
-                .skip(1)
-                .step_by(2)
-                .copied()
-                .collect();
-
-            // Attempt to perform the resample
-            let result = resampler.resampler.process_into_buffer(
-                &resampler.input,
-                &mut resampler.output,
-                None,
-            );
-
-            // Regardless of whether this works or not, we should clear our buffer, lest we get stuck.
-            resampler.input_buffer.clear();
-
-            match result {
-                Ok(resample_result) => {
-                    // We need to re-interleave the results, channels * channel length
-                    let channels = resampler.output.len();
-
-                    // Get the 'needed_len' from the resample result, it tells us how many samples
-                    // are coming out of the result, then multiply by channels.
-                    let length = resample_result.1 * channels;
-
-                    if resampler.interleaved.len() != length {
-                        resampler.interleaved.resize(length, 0_f32);
-                    }
-
-                    // Iterate over each frame, and replace the samples
-                    for (i, frame) in resampler.interleaved.chunks_exact_mut(channels).enumerate() {
-                        for (channel, sample) in frame.iter_mut().enumerate() {
-                            *sample = resampler.output[channel][i];
-                        }
-                    }
-
-                    // Send back the result as a slice
-                    resampler.interleaved.as_slice()
+            let channels = resampler.input.len();
+            let mut output = vec![];
+            loop {
+                let required = resampler.resampler.input_frames_next() * channels;
+                if resampler.input_buffer.len() < required {
+                    break;
                 }
-                Err(err) => {
-                    debug!("Resampling Failed: {}, falling back", err);
-                    samples
+                let block: Vec<f32> = resampler.input_buffer.drain(..required).collect();
+
+                // The samples are interleaved, the resampler wants one list per channel.
+                for (channel, input) in resampler.input.iter_mut().enumerate() {
+                    input.clear();
+                    input.extend(block.iter().skip(channel).step_by(channels).copied());
+                }
+
+                // A failure is an error: playing the block unresampled would be at the wrong rate
+                let (_, frames) = resampler
+                    .resampler
+                    .process_into_buffer(&resampler.input, &mut resampler.output, None)
+                    .map_err(|e| anyhow!("Resampling failed: {}", e))?;
+
+                // Interleave the result again
+                output.reserve(frames * channels);
+                for frame in 0..frames {
+                    for channel in resampler.output.iter() {
+                        output.push(channel[frame]);
+                    }
                 }
             }
+            resampled = output;
+            &resampled
         } else {
             // No resampler needed, send back the samples
             samples
         };
 
+        // Waits for room in the playback buffer, but not for ever: a device that stops calling
+        // back without an error would otherwise freeze this player (and never see a stop).
         let mut position = 0;
-        while let Some(written) = self
-            .buffer_producer
-            .write_blocking(out_samples.split_at(position).1)
-        {
-            position += written;
+        let mut waiting_since = Instant::now();
+        while position < out_samples.len() {
+            if self.stream_closed.load(Ordering::Relaxed) {
+                bail!("The audio stream was closed");
+            }
+            match self
+                .buffer_producer
+                .write_blocking_timeout(&out_samples[position..], Duration::from_millis(100))
+            {
+                Ok(Some(written)) => {
+                    position += written;
+                    waiting_since = Instant::now();
+                }
+                Ok(None) => break,
+                Err(_) if waiting_since.elapsed() < STALL_TIMEOUT => {}
+                Err(_) => bail!("The audio device stopped taking samples"),
+            }
         }
 
         Ok(())
@@ -243,9 +235,10 @@ impl AudioOutput for CpalPlayback {
 
         // Make sure the playback buffer is empty, to prevent premature pausing at
         // the end of playback
+        let started = Instant::now();
         while !self.buffer.is_empty() {
-            // Make sure the Stream hasn't closed while handling the buffer..
-            if self.stream_closed.load(Ordering::Relaxed) {
+            // Make sure the Stream hasn't closed while handling the buffer, or stalled..
+            if self.stream_closed.load(Ordering::Relaxed) || started.elapsed() > STALL_TIMEOUT {
                 return;
             }
 

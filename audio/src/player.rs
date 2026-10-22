@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 
 use core::default::Default;
 use ebur128::{EbuR128, Mode};
-use log::debug;
+use log::{debug, warn};
 use std::fs::File;
 use std::io::ErrorKind::UnexpectedEof;
 use std::path::PathBuf;
@@ -90,7 +90,8 @@ impl Player {
             hint.with_extension(extension_str);
         }
 
-        let media_source = Box::new(File::open(file).unwrap());
+        // A sample removed or unreadable is an error for this playback, not a panic
+        let media_source = Box::new(File::open(file).map_err(Error::IoError)?);
         let stream = MediaSourceStream::new(media_source, Default::default());
 
         let format_options = Default::default();
@@ -150,7 +151,8 @@ impl Player {
 
         if let Some(rate) = sample_rate {
             if self.process_only {
-                ebu_r128 = Some(EbuR128::new(channels as u32, rate, Mode::I)?);
+                // Measured as it's played: a mono file comes out on both channels.
+                ebu_r128 = Some(EbuR128::new(channels.max(2) as u32, rate, Mode::I)?);
             } else {
                 if let Some(fade_duration) = self.fade_duration {
                     // When fading out, we need work out the number of samples related to the fade
@@ -164,8 +166,11 @@ impl Player {
                     //
                     // This should have the volume at 0 after 48,000 iterations, at which point
                     // we terminate.
+                    // The fade is applied to the output, which is stereo for a mono file.
+                    let output_channels = channels.max(2);
                     fade_amount = Some(
-                        1.0 / ((rate as f32 * (fade_duration as f32 / 1000f32)) * channels as f32),
+                        1.0 / ((rate as f32 * (fade_duration as f32 / 1000f32))
+                            * output_channels as f32),
                     );
                 }
 
@@ -287,6 +292,10 @@ impl Player {
                         buf.copy_interleaved_ref(decoded);
                         let mut samples = buf.samples().to_vec();
 
+                        // Positions (start, stop, progress) count the file's own samples, before
+                        // a mono file is doubled to stereo.
+                        let source_samples = samples.len() as u64;
+
                         if mono_playback {
                             let mut buffer = vec![];
                             samples.iter().for_each(|s| {
@@ -298,7 +307,7 @@ impl Player {
 
                         if let Some(ref mut ebu_r128) = ebu_r128 {
                             ebu_r128.add_frames_f32(samples.as_slice())?;
-                            samples_processed += samples.len() as u64;
+                            samples_processed += source_samples;
 
                             let progress = Player::processed(frames, samples_processed, channels);
                             if self.progress.load(Ordering::Relaxed) != progress {
@@ -345,11 +354,15 @@ impl Player {
                         }
 
                         // Flush the samples to the Audio Stream..
-                        if let Some(audio_output) = &mut audio_output {
-                            audio_output.write(&samples).unwrap()
+                        // The device can go away (unplugged, default output changed): end this
+                        // playback with an error rather than panic.
+                        if let Some(audio_output) = &mut audio_output
+                            && let Err(e) = audio_output.write(&samples)
+                        {
+                            break 'main Err(Error::IoError(std::io::Error::other(e.to_string())));
                         }
 
-                        samples_processed += samples.len() as u64;
+                        samples_processed += source_samples;
 
                         // Calculate the Current Processing Percent..
                         let progress = Player::processed(frames, samples_processed, channels);
@@ -387,19 +400,26 @@ impl Player {
                                 track_id,
                             };
 
-                            // Seek the reader backwards to the start..
-                            samples_processed = match reader.seek(SeekMode::Accurate, seek_time) {
-                                Ok(seeked_to) => seeked_to.actual_ts * channels as u64,
-                                Err(e) => {
-                                    debug!("Error Seeking: {}", e);
-                                    0
+                            // Seek the reader backwards to the start, and reset the decoder as the
+                            // loops do. A failed seek leaves the position as it is.
+                            match reader.seek(SeekMode::Accurate, seek_time) {
+                                Ok(seeked_to) => {
+                                    decoder.reset();
+                                    samples_processed = seeked_to.actual_ts * channels as u64;
                                 }
-                            };
+                                Err(e) => debug!("Error Seeking: {}", e),
+                            }
 
                             // Set the back to FALSE
                             self.restart_track.store(false, Ordering::Relaxed);
                         }
                     }
+                }
+                // A damaged packet is skipped (Symphonia documents decode errors as
+                // recoverable), the rest of the file still plays.
+                Err(Error::DecodeError(e)) => {
+                    warn!("Skipping a damaged audio packet: {}", e);
+                    continue;
                 }
                 Err(err) => break Err(err),
             }
@@ -497,4 +517,73 @@ pub struct PlayerState {
 
     // Specifically for calculating the gain..
     pub calculated_gain: Arc<AtomicF64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One second of a 440 Hz tone at 8 kHz, as mono or as the same signal on both channels.
+    fn tone(path: &std::path::Path, channels: u16) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for frame in 0..8000 {
+            let value =
+                ((frame as f32 * 440.0 * std::f32::consts::TAU / 8000.0).sin() * 8000.0) as i16;
+            for _ in 0..channels {
+                writer.write_sample(value).unwrap();
+            }
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn measure(path: &PathBuf) -> (f64, u8) {
+        let mut player = Player::new(path, None, None, None, None, None).unwrap();
+        let state = player.get_state();
+        player.calculate_gain();
+        assert!(state.error.lock().unwrap().is_none());
+        (
+            state.calculated_gain.load(Ordering::Relaxed),
+            state.progress.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn mono_files_are_measured_like_stereo() {
+        let dir = std::env::temp_dir().join(format!("goxlr-player-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mono, stereo) = (dir.join("mono.wav"), dir.join("stereo.wav"));
+        tone(&mono, 1);
+        tone(&stereo, 2);
+
+        let (mono_gain, mono_progress) = measure(&mono);
+        let (stereo_gain, stereo_progress) = measure(&stereo);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Progress ends at 100%, not 200%, and the loudness doesn't depend on the layout.
+        assert!((99..=100).contains(&mono_progress), "{mono_progress}");
+        assert!((99..=100).contains(&stereo_progress), "{stereo_progress}");
+        let ratio = mono_gain / stereo_gain;
+        assert!((0.8..1.25).contains(&ratio), "{mono_gain} vs {stereo_gain}");
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error() {
+        assert!(
+            Player::new(
+                &PathBuf::from("/nonexistent/sample.wav"),
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
 }

@@ -41,6 +41,8 @@ the
 * Fedora Atomic or Bazzite users please check the instructions
   [here](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Fedora-Atomic-&-Bazzite)
 * Windows users can also aquire the GoXLR Utility via `winget`
+* On Windows on ARM, spoken messages use Windows' own voice: the NVDA and System Access
+  libraries the Utility talks to screen readers with are only available for x64
 
 <sup>1</sup> Windows requires the official device drivers provided by TC-Helicon. If you have the official app
 installed you don't need to do anything, otherwise download the latest drivers from 
@@ -94,9 +96,25 @@ and change the UI Handler there.
 
 ## Building
 
-Build instructions and other useful information can be found on the
+Building from source needs Rust 1.88 or later (see `rust-version` in `Cargo.toml`). On Linux, a few system
+packages are needed too, on Debian / Ubuntu:
+
+```
+sudo apt-get install build-essential pkg-config libdbus-1-dev libspeechd-dev libpulse-dev
+```
+
+(On Fedora: `dbus-devel speech-dispatcher-devel pulseaudio-libs-devel pkgconf-pkg-config`.) Then:
+
+```
+cargo build --release
+```
+
+The binaries land in `target/release/`. On Linux, the udev rules in `50-goxlr.rules` need to be copied to
+`/etc/udev/rules.d/` so the GoXLR can be used without root. The web interface is embedded from
+`daemon/web-content/`, built from the [UI repository](https://github.com/GoXLR-on-Linux/goxlr-ui).
+
+More information can be found on the
 project's [wiki](https://github.com/GoXLR-on-Linux/goxlr-utility/wiki/Compilation-Guide).
-While it's a little sparse at the moment, over time it should grow, and requests / feedback are always welcome!
 
 ## Disclaimer
 

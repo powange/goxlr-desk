@@ -19,13 +19,12 @@ use anyhow::{Context, Result, anyhow, bail};
 // use futures::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 
-use crate::sample_trash::{list_trash, restore_trash_item, trash_sample_path};
-use glob::{MatchOptions, Pattern, glob, glob_with};
+use crate::sample_trash::{list_trash, restore_trash_item, trash_replaced_sample};
 use goxlr_audio::editor::{DecodedAudio, MAX_EDIT_SECONDS, probe_duration};
 use goxlr_ipc::PathTypes;
 use goxlr_ipc::SampleEdit;
 use goxlr_profile_loader::atomic::atomic_write;
-use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::io::BufWriter;
 use tokio::sync::mpsc;
@@ -232,6 +231,7 @@ impl FileManager {
 }
 
 // How long the file watcher waits for things to settle before reporting a change.
+const WATCHER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub async fn spawn_file_notification_service(
@@ -239,14 +239,24 @@ pub async fn spawn_file_notification_service(
     sender: Sender<PathTypes>,
     mut shutdown_signal: Shutdown,
 ) -> Result<()> {
-    let watcher = create_watcher();
-    if let Err(error) = watcher {
-        warn!("Error Creating the File Watcher, aborting: {:?}", error);
-        bail!("Error Creating the File Watcher: {:?}", error);
-    }
-
-    // Create the worker..
-    let (mut watcher, mut rx) = watcher.unwrap();
+    // Without a watcher the lists aren't refreshed by themselves, but the GoXLR keeps working:
+    // the daemon carries on and the watcher is tried again (the system may be out of inotify
+    // instances for a while).
+    let (mut watcher, mut rx) = loop {
+        match create_watcher() {
+            Ok(created) => break created,
+            Err(error) => {
+                warn!(
+                    "Unable to create the file watcher, retrying in a minute: {:?}",
+                    error
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(WATCHER_RETRY) => {}
+                    () = shutdown_signal.recv() => return Ok(()),
+                }
+            }
+        }
+    };
 
     // Add the Paths to the Watcher..
     if let Err(error) = watcher.watch(&paths.profiles, RecursiveMode::NonRecursive) {
@@ -287,22 +297,30 @@ pub async fn spawn_file_notification_service(
                     match result {
                         Ok(event) => {
                             match event.kind {
-                                // Triggered on the Creation of a file / folder..
-                                EventKind::Create(CreateKind::File) |
-                                EventKind::Create(CreateKind::Folder) |
-                                EventKind::Create(CreateKind::Any) |
+                                // Triggered on the Creation or Removal of a file / folder,
+                                // whatever the backend calls it (some report 'Other')..
+                                EventKind::Create(_) |
+                                EventKind::Remove(_) |
 
-                                // Triggered on the Removal of a File / Folder
-                                EventKind::Remove(RemoveKind::File) |
-                                EventKind::Remove(RemoveKind::Folder) |
-                                EventKind::Remove(RemoveKind::Any) |
+                                // Triggered on Rename / Move of a file (FSEvents reports these
+                                // as RenameMode::Any)
+                                EventKind::Modify(ModifyKind::Name(_)) |
 
-                                // Triggered on Rename / Move of a file
-                                EventKind::Modify(ModifyKind::Name(RenameMode::From)) |
-                                EventKind::Modify(ModifyKind::Name(RenameMode::To)) |
-                                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                                // A file written in place: only samples, whose size and length
+                                // are listed (a recording is created empty, then written until
+                                // it stops; the list is read again once the writes settle)
+                                EventKind::Modify(ModifyKind::Data(_)) |
+                                EventKind::Modify(ModifyKind::Any) |
+                                EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+                                    let written = !matches!(
+                                        event.kind,
+                                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+                                    );
 
                                     for path in &event.paths {
+                                        if written && !path.starts_with(&paths.samples) {
+                                            continue;
+                                        }
                                         // Hidden temporary files (.name.tmp, .name.import) come
                                         // and go during writes, the final rename is what counts.
                                         let hidden = path
@@ -360,31 +378,42 @@ fn create_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Resu
     Ok((watcher, rx))
 }
 
-/// Lists files with the given extensions below a path, keyed by their path relative to it.
+/// Every file below a directory, without following links (a link to a parent folder would loop,
+/// and one leading elsewhere would take files from outside it).
+fn walk_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            walk_files(&entry.path(), files);
+        } else if kind.is_file() {
+            files.push(entry.path());
+        }
+    }
+}
+
+/// Lists files with the given extensions (any case) below a path, keyed by their path relative
+/// to it.
 pub(crate) fn recursive_file_list(
     path: PathBuf,
     extensions: Vec<&str>,
 ) -> BTreeMap<String, String> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-
-    // Escape the directory, so names like '[Bob]' aren't treated as patterns.
-    let base = Pattern::escape(&path.to_string_lossy());
-    // 'Intro.WAV' is a sample too.
-    let options = MatchOptions {
-        case_sensitive: false,
-        ..MatchOptions::new()
-    };
-    for extension in extensions {
-        let format = format!("{base}/**/*.{extension}");
-        if let Ok(files) = glob_with(format.as_str(), options) {
-            // Skip entries that can't be read (eg. a folder without permission).
-            paths.extend(files.filter_map(|file| file.ok()));
-        }
-    }
+    let mut paths = Vec::new();
+    walk_files(&path, &mut paths);
 
     let mut map: BTreeMap<String, String> = BTreeMap::new();
-    // Ok, we need to split stuff up..
     for file_path in paths {
+        let wanted = file_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extensions.iter().any(|e| e.eq_ignore_ascii_case(extension)));
+        if !wanted {
+            continue;
+        }
         if let (Ok(relative), Some(name)) = (file_path.strip_prefix(&path), file_path.file_name()) {
             map.insert(
                 relative.to_string_lossy().to_string(),
@@ -402,13 +431,15 @@ fn collect_folders(base: &Path, directory: &Path, folders: &mut Vec<String>) {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Ok(relative) = path.strip_prefix(base) {
-                folders.push(relative.to_string_lossy().to_string());
-            }
-            collect_folders(base, &path, folders);
+        // Links aren't followed: one pointing to a parent folder would loop.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
         }
+        let path = entry.path();
+        if let Ok(relative) = path.strip_prefix(base) {
+            folders.push(relative.to_string_lossy().to_string());
+        }
+        collect_folders(base, &path, folders);
     }
 }
 
@@ -465,7 +496,29 @@ pub(crate) fn sample_path(base: &Path, relative: &str) -> Result<PathBuf> {
     if parts == 0 {
         bail!("Invalid path: {:?}", relative);
     }
+    if !resolves_inside(base, &path) {
+        bail!("{:?} leads outside of the samples folder", relative);
+    }
     Ok(path)
+}
+
+/// Whether a path, once links are resolved, is still inside `base`. The part that doesn't exist
+/// yet (a file about to be created) is checked through its closest existing parent.
+fn resolves_inside(base: &Path, path: &Path) -> bool {
+    let Ok(base) = base.canonicalize() else {
+        // No samples folder yet: nothing below it can be a link
+        return true;
+    };
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return resolved.starts_with(&base);
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Like `sample_path`, for a path that's about to be created: its last part must be a valid
@@ -585,6 +638,14 @@ pub fn move_sample_path(base: &Path, from: &str, to: &str) -> Result<Option<Rena
             if sample_name_used(base, &new_name, Some(&source)) {
                 bail!("A sample named {} already exists", new_name);
             }
+            // Profiles only know the name: with two files of that name (copied by hand), the
+            // profiles playing the other one would be renamed too.
+            if sample_name_used(base, &old_name, Some(&source)) {
+                bail!(
+                    "Another sample is also named {}, rename or move it first so the profiles stay right",
+                    old_name
+                );
+            }
             renamed = Some(RenamedSample { old_name, new_name });
         }
     }
@@ -660,6 +721,12 @@ pub fn sample_names_at(base: &Path, relative: &str) -> Result<Vec<String>> {
 /// original file or as a new file named `save_as` next to it. When replacing, the original is
 /// moved to the trash in `backups` first, so it can be restored. Replacing a file that isn't a
 /// WAV gives it a .wav name, which is returned so profiles can follow it.
+fn new_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 pub fn edit_sample_file(
     base: &Path,
     backups: &Path,
@@ -692,6 +759,14 @@ pub fn edit_sample_file(
     let (Some(old_name), Some(new_name)) = (name_of(&source), name_of(&target)) else {
         bail!("Invalid file name");
     };
+    // A copy under the source's own name would overwrite it with no copy in the trash: that's
+    // what "replace" is for, and it keeps the original.
+    if save_as.is_some() && (target == source || is_case_change(&source, &target)) {
+        bail!(
+            "{} is the file being edited, choose another name or replace it",
+            new_name_of(&target)
+        );
+    }
     // Replacing 'X.WAV' writes 'X.wav', the same file on Windows and macOS.
     let same_file = save_as.is_none() && is_case_change(&source, &target);
     if target != source && !same_file {
@@ -722,7 +797,14 @@ pub fn edit_sample_file(
     // Keep the original in the trash when replacing it, the edit can then be undone.
     let replacing = save_as.is_none();
     if replacing {
-        trash_sample_path(base, backups, relative, vec![])?;
+        // Noting where the edit goes, so restoring the original undoes it
+        let mut edited: Vec<&str> = relative
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .collect();
+        edited.pop();
+        edited.push(&new_name);
+        trash_replaced_sample(base, backups, relative, &edited.join("/"))?;
     }
 
     let written = atomic_write(&target, |file| audio.write_wav(BufWriter::new(file)));
@@ -839,13 +921,15 @@ pub fn find_file_in_path(path: PathBuf, file: PathBuf) -> Option<PathBuf> {
         return None;
     }
 
-    // Both parts are escaped, so names like 'Song [Live].wav' are matched literally.
-    let format = format!(
-        "{}/**/{}",
-        Pattern::escape(&path.to_string_lossy()),
-        Pattern::escape(&file.to_string_lossy())
-    );
-    glob(format.as_str()).ok()?.find_map(|file| file.ok())
+    // The first file (in a stable order) whose path ends with the requested one.
+    let mut files = Vec::new();
+    walk_files(&path, &mut files);
+    files.sort();
+    files.into_iter().find(|candidate| {
+        candidate
+            .strip_prefix(&path)
+            .is_ok_and(|relative| relative.ends_with(&file))
+    })
 }
 
 pub fn create_path(path: &Path) -> Result<()> {
@@ -935,15 +1019,9 @@ pub fn extract_defaults(file_type: PathTypes, path: &Path) -> Result<()> {
 
     let mut binary_path = None;
 
-    // There are three possible places to check for this, the CWD, the binary WD, and $PATH
-    let cwd = std::env::current_dir()?.join(binary_name.clone());
-    if cwd.exists() {
-        binary_path.replace(cwd);
-    }
-
-    if binary_path.is_none()
-        && let Some(parent) = std::env::current_exe()?.parent()
-    {
+    // Next to the daemon, then on $PATH (not the current folder: this can be asked for remotely,
+    // and would run whatever program of that name sits there)
+    if let Some(parent) = std::env::current_exe()?.parent() {
         let bin = parent.join(binary_name.clone());
         if bin.exists() {
             binary_path.replace(bin);
@@ -1159,6 +1237,78 @@ mod sample_edit_tests {
 }
 
 #[cfg(test)]
+mod edit_undo_tests {
+    use super::*;
+    use crate::sample_trash::list_trash;
+
+    #[test]
+    fn restoring_the_original_undoes_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(&base).unwrap();
+        let audio = DecodedAudio {
+            sample_rate: 8000,
+            channels: 1,
+            samples: (0..8000).map(|i| (i % 40) as f32 / 100.0).collect(),
+            bits_per_sample: Some(16),
+        };
+        atomic_write(base.join("intro.wav"), |file| {
+            audio.write_wav(BufWriter::new(file))
+        })
+        .unwrap();
+        let original = fs::read(base.join("intro.wav")).unwrap();
+
+        let edit = SampleEdit {
+            remove: vec![(0.0, 0.5)],
+            normalize: false,
+        };
+        edit_sample_file(&base, &backups, "intro.wav", &edit, None).unwrap();
+        assert_ne!(fs::read(base.join("intro.wav")).unwrap(), original);
+
+        // The original is in the trash; restoring it puts it back and trashes the edit
+        let id = list_trash(&backups)[0].id.clone();
+        let restored = restore_trash_item(&base, &backups, &id).unwrap();
+        assert_eq!(restored.path, "intro.wav");
+        assert!(restored.renamed.is_none());
+        assert_eq!(fs::read(base.join("intro.wav")).unwrap(), original);
+        assert_eq!(list_trash(&backups).len(), 1);
+    }
+
+    #[test]
+    fn a_restore_that_cant_happen_keeps_the_edited_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, backups) = (dir.path().join("samples"), dir.path().join("backups"));
+        fs::create_dir_all(base.join("Other")).unwrap();
+        let audio = DecodedAudio {
+            sample_rate: 8000,
+            channels: 1,
+            samples: (0..8000).map(|i| (i % 40) as f32 / 100.0).collect(),
+            bits_per_sample: Some(16),
+        };
+        atomic_write(base.join("intro.wav"), |file| {
+            audio.write_wav(BufWriter::new(file))
+        })
+        .unwrap();
+        let edit = SampleEdit {
+            remove: vec![(0.0, 0.5)],
+            normalize: false,
+        };
+        // Saving a copy under the source's name is refused (it would overwrite it)
+        assert!(edit_sample_file(&base, &backups, "intro.wav", &edit, Some("intro")).is_err());
+        edit_sample_file(&base, &backups, "intro.wav", &edit, None).unwrap();
+        let edited = fs::read(base.join("intro.wav")).unwrap();
+
+        // Another sample took the original's name meanwhile: the restore is refused, and the
+        // edited version stays where it is
+        fs::write(base.join("Other/intro.wav"), b"other").unwrap();
+        let id = list_trash(&backups)[0].id.clone();
+        assert!(restore_trash_item(&base, &backups, &id).is_err());
+        assert_eq!(fs::read(base.join("intro.wav")).unwrap(), edited);
+        assert_eq!(list_trash(&backups).len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod lookup_tests {
     use super::*;
 
@@ -1278,6 +1428,34 @@ mod name_tests {
         assert_eq!(fs::read(base.join("Intro.wav")).unwrap(), b"intro");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn links_are_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let base = dir.path().join("samples");
+        fs::create_dir_all(base.join("Jingles")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(base.join("Jingles/intro.wav"), b"").unwrap();
+        fs::write(outside.join("secret.wav"), b"").unwrap();
+        // A loop back to the samples folder, and a way out of it
+        std::os::unix::fs::symlink(&base, base.join("Jingles/loop")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("away")).unwrap();
+
+        let names: Vec<String> = recursive_file_list(base.clone(), SAMPLE_EXTENSIONS.to_vec())
+            .into_values()
+            .collect();
+        assert_eq!(names, vec!["intro.wav".to_string()]);
+        let mut folders = Vec::new();
+        collect_folders(&base, &base, &mut folders);
+        assert_eq!(folders, vec!["Jingles".to_string()]);
+
+        assert!(sample_path(&base, "away/secret.wav").is_err());
+        assert!(sample_path(&base, "away/new.wav").is_err());
+        assert!(sample_path(&base, "Jingles/new.wav").is_ok());
+        assert!(find_file_in_path(base.clone(), PathBuf::from("secret.wav")).is_none());
+    }
+
     #[test]
     fn rename_and_duplicate_named_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -1326,5 +1504,57 @@ mod name_tests {
         restore_latest_trash_of(&base, &backups, "intro.wav");
         assert_eq!(fs::read(base.join("intro.wav")).unwrap(), b"original");
         assert!(list_trash(&backups).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::*;
+    use std::io::Write;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, timeout};
+
+    /// A recording is created empty, then written: the samples are listed again after the
+    /// writes, so its size and length show up.
+    #[tokio::test]
+    async fn written_samples_are_listed_again() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = FilePaths {
+            profiles: root.path().join("profiles"),
+            mic_profiles: root.path().join("mic"),
+            presets: root.path().join("presets"),
+            icons: root.path().join("icons"),
+            samples: root.path().join("samples"),
+            backups: root.path().join("backups"),
+        };
+        for dir in [
+            &paths.profiles,
+            &paths.mic_profiles,
+            &paths.presets,
+            &paths.icons,
+            &paths.samples,
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        let shutdown = crate::shutdown::Shutdown::new();
+        tokio::spawn(spawn_file_notification_service(
+            paths.clone(),
+            tx,
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let path = paths.samples.join("Recording.wav");
+        let mut file = File::create(&path).unwrap();
+        let created = timeout(Duration::from_secs(3), rx.recv()).await.unwrap();
+        assert_eq!(created, Some(PathTypes::Samples));
+
+        file.write_all(&[0; 4096]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let written = timeout(Duration::from_secs(3), rx.recv()).await;
+        assert_eq!(written.ok().flatten(), Some(PathTypes::Samples));
+        shutdown.trigger();
     }
 }

@@ -38,3 +38,6 @@ libpulse-simple-binding = "2.28.1"
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = "0.16.0"
 rubato = "0.16.1"
+
+[lints]
+workspace = true

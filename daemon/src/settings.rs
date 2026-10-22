@@ -34,9 +34,15 @@ pub fn network_token() -> Option<String> {
     NETWORK_TOKEN.lock().ok()?.clone()
 }
 
-fn publish_token(token: &Option<String>) {
+/// The token other machines must present: none while network access is off, so turning it off
+/// cuts them at once (without waiting for a restart).
+fn publish_token(settings: &Settings) {
+    let token = match settings.allow_network_access {
+        Some(true) => settings.network_token.clone(),
+        _ => None,
+    };
     if let Ok(mut current) = NETWORK_TOKEN.lock() {
-        current.clone_from(token);
+        *current = token;
     }
 }
 
@@ -62,11 +68,26 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Settings which stay with the computer when a backup is restored on it.
+const MACHINE_SETTINGS: &[&str] = &[
+    "network_token",
+    "allow_network_access",
+    "profile_directory",
+    "mic_profile_directory",
+    "samples_directory",
+    "presets_directory",
+    "icons_directory",
+    "logs_directory",
+    "backup_directory",
+];
+
 #[derive(Debug, Clone)]
 pub struct SettingsHandle {
     path: PathBuf,
     data_dir: PathBuf,
     settings: Arc<RwLock<Settings>>,
+    // One save at a time, so an older snapshot never overwrites a newer one
+    save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 enum Paths {
@@ -170,62 +191,88 @@ impl SettingsHandle {
             settings.logs_directory = None;
         }
 
-        if settings.log_level.is_none() {
-            settings.log_level = Some(LogLevel::Debug);
-        }
-
-        if settings.open_ui_on_launch.is_none() {
-            settings.open_ui_on_launch = Some(false);
-        }
-
-        if settings.firmware_source.is_none() {
-            settings.firmware_source = Some(Default::default());
-        }
-
-        if settings.show_tray_icon.is_none() {
-            settings.show_tray_icon = Some(true);
-        }
-
-        if settings.tts_enabled.is_none() {
-            settings.tts_enabled = Some(false);
-        }
-
-        if settings.allow_network_access.is_none() {
-            settings.allow_network_access = Some(false);
-        }
-
-        if settings.macos_handle_aggregates.is_none() {
-            settings.macos_handle_aggregates = Some(true);
-        }
-
-        if settings.devices.is_none() {
-            settings.devices = Some(Default::default());
-        }
+        settings.fill_defaults();
 
         // Network access needs a token for other machines.
         if settings.allow_network_access == Some(true) && settings.network_token.is_none() {
             settings.network_token = Some(new_token());
         }
-        publish_token(&settings.network_token);
+        publish_token(&settings);
 
         let handle = SettingsHandle {
             path,
             data_dir: data_dir.to_path_buf(),
             settings: Arc::new(RwLock::new(settings)),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         handle.save().await;
         Ok(handle)
     }
 
+    /// Writes the settings. They're serialised under a read lock, then written (with fsync) on
+    /// a blocking thread, so the runtime and the other readers don't wait for the disk.
     pub async fn save(&self) {
-        let settings = self.settings.write().await;
-        if let Err(e) = settings.write(&self.path) {
+        let _saving = self.save_lock.lock().await;
+        let snapshot = {
+            let settings = self.settings.read().await;
+            serde_json::to_vec_pretty(&*settings)
+        };
+        let contents = match snapshot {
+            Ok(contents) => contents,
+            Err(e) => {
+                error!("Couldn't serialise the settings: {}", e);
+                return;
+            }
+        };
+        let path = self.path.clone();
+        let written =
+            tokio::task::spawn_blocking(move || Settings::write_bytes(&path, &contents)).await;
+        let result = written.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+        if let Err(e) = result {
             error!(
                 "Couldn't save settings to {}: {}",
                 self.path.to_string_lossy(),
                 e
             );
         }
+    }
+
+    /// The settings for a backup: without what belongs to this computer (the folders) or is a
+    /// secret (the network token), see `restore_backup_json`.
+    pub async fn backup_json(&self) -> Result<Vec<u8>> {
+        let mut value = serde_json::to_value(&*self.settings.read().await)?;
+        if let Some(object) = value.as_object_mut() {
+            for key in MACHINE_SETTINGS {
+                object.remove(*key);
+            }
+        }
+        Ok(serde_json::to_vec_pretty(&value)?)
+    }
+
+    /// Applies settings from a backup, keeping this computer's folders, network token and
+    /// network access (a restore never opens the interface to the network by itself).
+    pub async fn restore_backup_json(&self, json: &[u8]) -> Result<()> {
+        let mut incoming: serde_json::Value =
+            serde_json::from_slice(json).context("The settings in the backup can't be read")?;
+        let Some(object) = incoming.as_object_mut() else {
+            anyhow::bail!("The settings in the backup can't be read");
+        };
+        {
+            let mut settings = self.settings.write().await;
+            let current = serde_json::to_value(&*settings)?;
+            for key in MACHINE_SETTINGS {
+                match current.get(*key) {
+                    Some(value) => object.insert(key.to_string(), value.clone()),
+                    None => object.remove(*key),
+                };
+            }
+            let mut restored: Settings = serde_json::from_value(incoming)
+                .context("The settings in the backup can't be read")?;
+            restored.fill_defaults();
+            *settings = restored;
+        }
+        self.save().await;
+        Ok(())
     }
 
     fn get_default_path(&self, suffix: Paths) -> PathBuf {
@@ -292,7 +339,7 @@ impl SettingsHandle {
         if enabled && settings.network_token.is_none() {
             settings.network_token = Some(new_token());
         }
-        publish_token(&settings.network_token);
+        publish_token(&settings);
     }
 
     pub async fn get_network_token(&self) -> Option<String> {
@@ -304,7 +351,7 @@ impl SettingsHandle {
         let mut settings = self.settings.write().await;
         let token = new_token();
         settings.network_token = Some(token.clone());
-        publish_token(&settings.network_token);
+        publish_token(&settings);
         token
     }
 
@@ -709,6 +756,36 @@ impl SettingsHandle {
         commands.clone_into(&mut entry.wake_commands);
     }
 
+    /// A profile (or mic profile) was renamed: the shutdown, sleep and wake actions of every
+    /// device loading it now load it by its new name. Returns whether any changed.
+    pub async fn rename_profile_in_power_commands(&self, from: &str, to: &str, mic: bool) -> bool {
+        let mut settings = self.settings.write().await;
+        let mut changed = false;
+        for device in settings.devices.iter_mut().flat_map(|d| d.values_mut()) {
+            let lists = [
+                &mut device.shutdown_commands,
+                &mut device.sleep_commands,
+                &mut device.wake_commands,
+            ];
+            for command in lists.into_iter().flat_map(|list| list.iter_mut()) {
+                let name = match command {
+                    GoXLRCommand::LoadProfile(name, _) | GoXLRCommand::LoadProfileColours(name)
+                        if !mic =>
+                    {
+                        name
+                    }
+                    GoXLRCommand::LoadMicProfile(name, _) if mic => name,
+                    _ => continue,
+                };
+                if name == from {
+                    *name = to.to_string();
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     pub async fn set_device_sampler_pre_buffer(&self, device_serial: &str, duration: u16) {
         let mut settings = self.settings.write().await;
         let entry = settings
@@ -844,6 +921,42 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The values every accessor expects to find: missing ones (an older file, a settings.json
+    /// from a backup) take their defaults.
+    fn fill_defaults(&mut self) {
+        if self.log_level.is_none() {
+            self.log_level = Some(LogLevel::Debug);
+        }
+
+        if self.open_ui_on_launch.is_none() {
+            self.open_ui_on_launch = Some(false);
+        }
+
+        if self.firmware_source.is_none() {
+            self.firmware_source = Some(Default::default());
+        }
+
+        if self.show_tray_icon.is_none() {
+            self.show_tray_icon = Some(true);
+        }
+
+        if self.tts_enabled.is_none() {
+            self.tts_enabled = Some(false);
+        }
+
+        if self.allow_network_access.is_none() {
+            self.allow_network_access = Some(false);
+        }
+
+        if self.macos_handle_aggregates.is_none() {
+            self.macos_handle_aggregates = Some(true);
+        }
+
+        if self.devices.is_none() {
+            self.devices = Some(Default::default());
+        }
+    }
+
     pub fn read(path: &Path) -> Result<Option<Settings>> {
         match File::open(path) {
             Ok(reader) => {
@@ -910,7 +1023,13 @@ impl Settings {
         }
     }
 
+    #[cfg(test)]
     pub fn write(&self, path: &Path) -> Result<()> {
+        Self::write_bytes(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    fn write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+        use std::io::Write;
         debug!("Saving Settings");
         if let Some(parent) = path.parent()
             && let Err(e) = create_dir_all(parent)
@@ -922,7 +1041,7 @@ impl Settings {
             ))?;
         }
 
-        let write = |file: &File| Ok(serde_json::to_writer_pretty(file, self)?);
+        let write = |mut file: &File| Ok(file.write_all(contents)?);
         atomic_write(path, write)?;
 
         // Keep a copy of these known good settings, used if the main file ever can't be read.
@@ -1043,5 +1162,79 @@ mod tests {
         assert!(Settings::read(&path).unwrap().is_none());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renamed_profiles_follow_in_power_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = SettingsHandle::load(dir.path().join("settings.json"))
+            .await
+            .unwrap();
+        handle
+            .set_device_sleep_commands(
+                "S1",
+                vec![
+                    GoXLRCommand::LoadProfile("Old".into(), false),
+                    GoXLRCommand::LoadMicProfile("Old".into(), false),
+                ],
+            )
+            .await;
+        handle
+            .set_device_wake_commands("S2", vec![GoXLRCommand::LoadProfileColours("Old".into())])
+            .await;
+
+        assert!(
+            handle
+                .rename_profile_in_power_commands("Old", "New", false)
+                .await
+        );
+        let sleep = format!("{:?}", handle.get_device_sleep_commands("S1").await);
+        // The mic profile of the same name isn't the one renamed
+        assert!(sleep.contains("LoadProfile(\"New\"") && sleep.contains("LoadMicProfile(\"Old\""));
+        let wake = format!("{:?}", handle.get_device_wake_commands("S2").await);
+        assert!(wake.contains("\"New\""));
+        assert!(
+            !handle
+                .rename_profile_in_power_commands("Gone", "X", false)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn backups_keep_this_computers_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"selected_locale": "fr_FR", "network_token": "secret", "profile_directory": "/here"}"#,
+        )
+        .unwrap();
+        let handle = SettingsHandle::load(path).await.unwrap();
+
+        // What goes in a backup: no secret, no folders
+        let json = String::from_utf8(handle.backup_json().await.unwrap()).unwrap();
+        assert!(json.contains("fr_FR"));
+        assert!(!json.contains("secret") && !json.contains("/here"));
+
+        // What comes back from one: applied, except what belongs to this computer
+        let incoming = r#"{"selected_locale": "de_DE", "allow_network_access": true,
+            "network_token": "other", "profile_directory": "/there"}"#;
+        handle
+            .restore_backup_json(incoming.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(handle.get_selected_locale().await.as_deref(), Some("de_DE"));
+        assert!(!handle.get_allow_network_access().await);
+        assert_eq!(handle.get_network_token().await.as_deref(), Some("secret"));
+        assert_eq!(handle.get_profile_directory().await, PathBuf::from("/here"));
+        assert!(handle.restore_backup_json(b"[1, 2]").await.is_err());
+
+        // Missing or null values take their defaults, the accessors don't panic
+        handle
+            .restore_backup_json(br#"{"devices": null, "log_level": null}"#)
+            .await
+            .unwrap();
+        assert_eq!(handle.get_device_hold_time("S123").await, 500);
+        assert_eq!(handle.get_log_level().await, LogLevel::Debug);
     }
 }

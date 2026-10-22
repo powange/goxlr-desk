@@ -60,7 +60,7 @@ impl SubMixer {
                 }
 
                 if !found {
-                    println!("Unable to find Channel: {channel}");
+                    log::warn!("Unable to find Channel: {channel}");
                 }
                 continue;
             }

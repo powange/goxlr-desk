@@ -1,3 +1,4 @@
+use crate::settings::SettingsHandle;
 use actix_cors::Cors;
 use actix_multipart::Multipart;
 use actix_web::body::MessageBody;
@@ -22,6 +23,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use sysinfo::System;
@@ -44,7 +46,7 @@ use goxlr_types::FaderName;
 use crate::primary_worker::{DeviceCommand, DeviceSender};
 use crate::servers::server_packet::handle_packet;
 
-const WEB_CONTENT: Dir = include_dir!("./daemon/web-content/");
+const WEB_CONTENT: Dir = include_dir!("$CARGO_MANIFEST_DIR/web-content/");
 
 // Firmware files are a few megabytes, anything far beyond this isn't a firmware.
 const MAX_FIRMWARE_SIZE: usize = 64 * 1024 * 1024;
@@ -71,20 +73,16 @@ fn same_token(given: &str, token: &str) -> bool {
             == 0
 }
 
-/// The token a request presents: its cookie, a `token` query parameter, or a Bearer header.
-/// Returns it with whether it came from the query (the cookie is then set on the response).
+/// The token a request presents: a `token` query parameter (a link just opened), a Bearer
+/// header, or the cookie a link set earlier, in that order: an old cookie never hides the new
+/// link. Returns it with whether it came from the query (the cookie is then set on the response).
 fn presented_token(req: &ServiceRequest) -> Option<(String, bool)> {
-    let cookie = req
-        .headers()
-        .get_all(header::COOKIE)
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
-            let (name, value) = pair.trim().split_once('=')?;
-            (name == ACCESS_COOKIE).then(|| value.to_string())
-        });
-    if let Some(cookie) = cookie {
-        return Some((cookie, false));
+    if let Some(token) = req
+        .query_string()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+    {
+        return Some((token.to_string(), true));
     }
     if let Some(value) = req
         .headers()
@@ -94,10 +92,14 @@ fn presented_token(req: &ServiceRequest) -> Option<(String, bool)> {
     {
         return Some((token.trim().to_string(), false));
     }
-    req.query_string()
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("token="))
-        .map(|token| (token.to_string(), true))
+    req.headers()
+        .get_all(header::COOKIE)
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == ACCESS_COOKIE).then(|| (value.to_string(), false))
+        })
 }
 
 /// Commands a client without an origin (the Stream Deck plugin, but also any web page through
@@ -275,9 +277,11 @@ impl RequestSource {
                 DaemonRequest::RunFirmwareUpdate(_, Some(_), _) => {
                     return Some("A firmware file on disk can only be flashed from this computer");
                 }
+                // Restarting is what applies a network access change: it's managed here too
                 DaemonRequest::GetNetworkAccess
                 | DaemonRequest::Daemon(DaemonCommand::RegenerateNetworkToken)
-                | DaemonRequest::Daemon(DaemonCommand::SetAllowNetworkAccess(_)) => {
+                | DaemonRequest::Daemon(DaemonCommand::SetAllowNetworkAccess(_))
+                | DaemonRequest::Daemon(DaemonCommand::RestartDaemon) => {
                     return Some("Network access can only be managed from this computer");
                 }
                 _ => {}
@@ -342,7 +346,7 @@ async fn check_request_source(
             );
             return Err(ErrorUnauthorized(
                 "This GoXLR Utility needs an access link. On the computer running it, open \
-                 System > Utility Settings and use the network access link shown there.",
+                 System > Integrations and use the network access link shown there.",
             ));
         }
         if let (Some(token), Some((_, true))) = (token, presented) {
@@ -365,6 +369,7 @@ struct AppData {
     usb_tx: DeviceSender,
     broadcast_tx: BroadcastSender<PatchEvent>,
     file_paths: FilePaths,
+    settings: SettingsHandle,
 
     scribble_state: EnumMap<FaderName, ScribbleState>,
 }
@@ -381,6 +386,7 @@ pub async fn spawn_http_server(
     broadcast_tx: tokio::sync::broadcast::Sender<PatchEvent>,
     settings: HttpSettings,
     file_paths: FilePaths,
+    daemon_settings: SettingsHandle,
 ) {
     // Imports interrupted by a crash leave hidden temporary files, remove them.
     crate::files::remove_stale_imports(&file_paths.samples);
@@ -390,6 +396,7 @@ pub async fn spawn_http_server(
         broadcast_tx: broadcast_tx.clone(),
         usb_tx: usb_tx.clone(),
         file_paths: file_paths.clone(),
+        settings: daemon_settings,
         scribble_state: EnumMap::default(),
     }));
     let policy = Data::new(RequestPolicy::new(
@@ -411,6 +418,7 @@ pub async fn spawn_http_server(
             .service(websocket)
             .service(execute_command)
             .service(get_devices)
+            .service(get_schema)
             .service(get_sample)
             .service(get_scribble)
             .service(get_path)
@@ -485,12 +493,26 @@ async fn websocket(
     let mut usb_tx = data.usb_tx.clone();
     let mut broadcast_rx = data.broadcast_tx.subscribe();
 
+    // Another machine came in with the token of the moment: when access is turned off or the
+    // token changes, its socket is closed (its next requests are refused anyway).
+    let remote_token = (!source.local_peer).then(crate::settings::network_token);
+    let mut access_check = tokio::time::interval(ACCESS_CHECK_INTERVAL);
+
     // Spawn the handler (this is now where we do stuff)
     actix_web::rt::spawn(async move {
         let mut msg_stream = msg_stream.aggregate_continuations();
 
         let close_reason = loop {
             tokio::select! {
+                _ = access_check.tick(), if remote_token.is_some() => {
+                    let current = crate::settings::network_token();
+                    if current.is_none() || current != *remote_token.as_ref().unwrap_or(&None) {
+                        break Some(CloseReason {
+                            code: CloseCode::Policy,
+                            description: Some(String::from("Network access was turned off or its link changed")),
+                        });
+                    }
+                }
                 received = broadcast_rx.recv() => {
                     let patch = match received {
                         Ok(patch) => patch,
@@ -660,13 +682,21 @@ async fn execute_command(
         return HttpResponse::Ok().json(DaemonResponse::Error(reason.to_string()));
     }
 
-    let mut data = app_data.write().await;
+    // The sender is cloned so a slow command doesn't hold the lock every request waits on.
+    let mut usb_tx = app_data.read().await.usb_tx.clone();
 
     // Errors propagate weirdly in the javascript world, so send all as OK, and handle there.
-    match handle_packet(request.0, &mut data.usb_tx).await {
+    match handle_packet(request.0, &mut usb_tx).await {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(error) => HttpResponse::Ok().json(DaemonResponse::Error(error.to_string())),
     }
+}
+
+/// The JSON Schema of the requests /api/command accepts.
+#[get("/api/schema")]
+async fn get_schema() -> HttpResponse {
+    static SCHEMA: LazyLock<schemars::Schema> = LazyLock::new(goxlr_ipc::request_schema);
+    HttpResponse::Ok().json(&*SCHEMA)
 }
 
 #[get("/api/get-devices")]
@@ -717,55 +747,62 @@ async fn get_scribble(
     let final_height = 64;
 
     // Now we need to grab the DaemonResponse to get the layout of the scribble
-    let mut data = app_data.write().await;
+    let (mut usb_tx, icons) = {
+        let data = app_data.read().await;
+        (data.usb_tx.clone(), data.file_paths.icons.clone())
+    };
     let request = DaemonRequest::GetStatus;
 
     // Pull out the scribble configuration from the Daemon Status
-    let scribble = handle_packet(request, &mut data.usb_tx)
-        .await
-        .ok()
-        .and_then(|response| match response {
-            DaemonResponse::Status(status) => status
-                .mixers
-                .get(serial)
-                .and_then(|mixer| mixer.fader_status[fader].scribble.clone()),
-            _ => None,
-        });
+    let scribble =
+        handle_packet(request, &mut usb_tx)
+            .await
+            .ok()
+            .and_then(|response| match response {
+                DaemonResponse::Status(status) => status
+                    .mixers
+                    .get(serial)
+                    .and_then(|mixer| mixer.fader_status[fader].scribble.clone()),
+                _ => None,
+            });
 
     if scribble.is_none() {
         return HttpResponse::NotFound().finish();
     }
 
-    let state = &data.scribble_state[fader];
-    if state.scribble_config == scribble && state.png_data.is_some() {
+    let cached = {
+        let data = app_data.read().await;
+        let state = &data.scribble_state[fader];
+        (state.scribble_config == scribble)
+            .then(|| state.png_data.clone())
+            .flatten()
+    };
+    if let Some(png_data) = cached {
         // If we already have the PNG data, return it.
-        if let Some(png_data) = &data.scribble_state[fader].png_data {
-            debug!("Returning Cached Scribble Image for {} - {}", serial, fader);
-            let mime_type = ContentType(IMAGE_PNG);
-            let mut builder = HttpResponse::Ok();
-            builder.insert_header(mime_type);
-            return builder.body(png_data.clone());
-        }
+        debug!("Returning Cached Scribble Image for {} - {}", serial, fader);
+        let mime_type = ContentType(IMAGE_PNG);
+        let mut builder = HttpResponse::Ok();
+        builder.insert_header(mime_type);
+        return builder.body(png_data);
     } else if let Some(scribble) = scribble {
         debug!("Building Scribble Image for {} - {}", serial, fader);
-        let scribble_path = data.file_paths.icons.clone();
+        let icon_path = scribble.file_name.as_ref().map(|file| icons.join(file));
 
-        let mut icon_path = None;
-        if let Some(file) = &scribble.file_name {
-            icon_path = Some(scribble_path.join(file));
-        }
-
-        let png = get_scribble_png(
-            icon_path,
+        // Drawing reads the icon and encodes a PNG, off the web server's workers
+        let (bottom, left, inverted) = (
             scribble.bottom_text.clone(),
             scribble.left_text.clone(),
             scribble.inverted,
-            final_width,
-            final_height,
         );
+        let png = web::block(move || {
+            get_scribble_png(icon_path, bottom, left, inverted, final_width, final_height)
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))
+        .and_then(|result| result);
 
         if let Ok(png) = png {
-            data.scribble_state[fader] = ScribbleState {
+            app_data.write().await.scribble_state[fader] = ScribbleState {
                 scribble_config: Some(scribble.clone()),
                 png_data: Some(png.clone()),
             };
@@ -784,7 +821,11 @@ async fn get_scribble(
 }
 
 #[get("/files/samples/{sample}")]
-async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) -> HttpResponse {
+async fn get_sample(
+    sample: web::Path<String>,
+    app_data: Data<RwLock<AppData>>,
+    req: HttpRequest,
+) -> HttpResponse {
     // Get the Base Samples Path..
     let sample_path = {
         let data = app_data.read().await;
@@ -800,41 +841,58 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     }
 
     debug!("Attempting to Find {:?} in {:?}", path, sample_path);
-    // Searching the samples folder and reading the file both block, keep them off the workers.
-    let found = web::block(move || {
-        let path = find_file_in_path(sample_path, path)?;
-        debug!("Found at {:?}", path);
-        // The file may have been removed, or be unreadable, since it was found.
-        match fs::read(&path) {
-            Ok(contents) => Some((path, contents)),
-            Err(error) => {
-                warn!("Unable to read sample {:?}: {}", path, error);
-                None
-            }
-        }
-    })
-    .await;
+    // Searching the samples folder blocks, keep it off the workers.
+    let found = web::block(move || find_file_in_path(sample_path, path)).await;
+    let Ok(Some(path)) = found else {
+        return HttpResponse::NotFound().finish();
+    };
+    debug!("Found at {:?}", path);
 
-    match found {
-        Ok(Some((path, contents))) => {
-            let mime_type = MimeGuess::from_path(path).first_or_octet_stream();
-            let mut builder = HttpResponse::Ok();
-            builder.insert_header(ContentType(mime_type));
-            builder.body(contents)
+    // Streamed from the disk, with Range requests (seeking in a long sample). A sample can be
+    // edited in place: the browser must check it's unchanged (cheap, with the ETag) before
+    // playing a copy it kept, or it plays the audio from before the edit.
+    match actix_files::NamedFile::open_async(&path).await {
+        Ok(file) => {
+            let mut response = file
+                .set_content_type(MimeGuess::from_path(&path).first_or_octet_stream())
+                .disable_content_disposition()
+                .into_response(&req);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            );
+            response
         }
-        _ => HttpResponse::NotFound().finish(),
+        // The file may have been removed, or be unreadable, since it was found.
+        Err(error) => {
+            warn!("Unable to read sample {:?}: {}", path, error);
+            HttpResponse::NotFound().finish()
+        }
     }
 }
+
+// How often a socket from another machine checks it's still allowed
+const ACCESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+// A backup or restore never takes this long: older temporary files were left behind
+const BACKUP_TEMP_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 static BACKUP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A temporary file for a backup being made or restored, in the backups folder. Files left by
-/// earlier ones (Windows can't remove a file still open) are removed first.
+/// earlier ones (Windows can't remove a file still open) are removed first, once they're old
+/// enough not to belong to a backup or restore still running.
 fn backup_temp_file(backups: &Path, kind: &str) -> PathBuf {
     if let Ok(entries) = fs::read_dir(backups) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".backup-") && name.ends_with(".zip") {
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > BACKUP_TEMP_LIFETIME);
+            if name.starts_with(".backup-") && name.ends_with(".zip") && stale {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -853,15 +911,20 @@ async fn export_backup(
     query: web::Query<HashMap<String, String>>,
     app_data: Data<RwLock<AppData>>,
 ) -> HttpResponse {
-    let paths = app_data.read().await.file_paths.clone();
+    let (paths, settings) = {
+        let data = app_data.read().await;
+        (data.file_paths.clone(), data.settings.clone())
+    };
     let samples = query.get("samples").is_some_and(|value| value == "1");
     let temp = backup_temp_file(&paths.backups, "export");
+    let settings = settings.backup_json().await.ok();
 
     let written = {
         let temp = temp.clone();
         web::block(move || -> Result<()> {
             let file = std::fs::File::create(&temp)?;
-            crate::backup::write_backup(&paths, samples, std::io::BufWriter::new(file))
+            let sink = std::io::BufWriter::new(file);
+            crate::backup::write_backup(&paths, samples, settings.as_deref(), sink)
         })
         .await
     };
@@ -894,9 +957,13 @@ async fn export_backup(
 /// are kept in the backups folder.
 #[post("/files/backup-restore")]
 async fn restore_backup(mut payload: Multipart, app_data: Data<RwLock<AppData>>) -> HttpResponse {
-    let (paths, mut usb_tx) = {
+    let (paths, settings, mut usb_tx) = {
         let data = app_data.read().await;
-        (data.file_paths.clone(), data.usb_tx.clone())
+        (
+            data.file_paths.clone(),
+            data.settings.clone(),
+            data.usb_tx.clone(),
+        )
     };
     let Some(Ok(mut field)) = payload.next().await else {
         return HttpResponse::BadRequest().json(DaemonResponse::Error("No file sent".into()));
@@ -925,15 +992,27 @@ async fn restore_backup(mut payload: Multipart, app_data: Data<RwLock<AppData>>)
 
     let restored = {
         let temp = temp.clone();
-        web::block(move || -> Result<crate::backup::RestoreSummary> {
-            crate::backup::restore_backup(&paths, std::fs::File::open(&temp)?)
-        })
+        web::block(
+            move || -> Result<(crate::backup::RestoreSummary, Option<Vec<u8>>)> {
+                crate::backup::restore_backup(&paths, std::fs::File::open(&temp)?)
+            },
+        )
         .await
     };
     let _ = fs::remove_file(&temp);
 
     match restored {
-        Ok(Ok(summary)) => {
+        Ok(Ok((mut summary, settings_json))) => {
+            if let Some(json) = settings_json {
+                match settings.restore_backup_json(&json).await {
+                    Ok(()) => summary.settings = true,
+                    Err(e) => {
+                        return HttpResponse::Ok().json(DaemonResponse::Error(format!(
+                            "The files were restored, but not the settings: {e}"
+                        )));
+                    }
+                }
+            }
             // Refresh the samples list (profiles are seen by the file watcher)
             let _ = handle_packet(
                 DaemonRequest::Daemon(DaemonCommand::ApplySampleChange),
@@ -1116,12 +1195,38 @@ async fn import_samples(
     query: web::Query<HashMap<String, String>>,
     mut payload: Multipart,
     app_data: Data<RwLock<AppData>>,
+    req: HttpRequest,
 ) -> HttpResponse {
     let folder = query.get("folder").cloned().unwrap_or_default();
     let (base, mut usb_tx) = {
         let data = app_data.read().await;
         (data.file_paths.samples.clone(), data.usb_tx.clone())
     };
+
+    // Refuse an import that can't fit, rather than fill the disk part way through
+    let size = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(size) = size {
+        let free = {
+            let base = base.clone();
+            web::block(move || available_space(&base))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(free) = free
+            && size + FREE_SPACE_MARGIN > free
+        {
+            return HttpResponse::Ok().json(DaemonResponse::Error(format!(
+                "Not enough free disk space for this import ({} MB needed, {} MB free)",
+                size / (1024 * 1024),
+                free / (1024 * 1024)
+            )));
+        }
+    }
 
     let mut imported = 0;
     let mut total = 0;
@@ -1183,6 +1288,21 @@ async fn import_samples(
     } else {
         HttpResponse::Ok().json(DaemonResponse::Error(errors.join("\n")))
     }
+}
+
+// Space left free on the disk after an import
+const FREE_SPACE_MARGIN: u64 = 100 * 1024 * 1024;
+
+/// The free space of the disk holding a folder (the disk with the longest mount point above it).
+fn available_space(path: &Path) -> Option<u64> {
+    let path = path.canonicalize().ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
 }
 
 static IMPORT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1365,10 +1485,10 @@ async fn default(req: HttpRequest) -> HttpResponse {
 }
 
 async fn get_status(app_data: Data<RwLock<AppData>>) -> Result<DaemonStatus> {
-    let mut data = app_data.write().await;
+    let mut usb_tx = app_data.read().await.usb_tx.clone();
     let request = DaemonRequest::GetStatus;
 
-    let result = handle_packet(request, &mut data.usb_tx).await?;
+    let result = handle_packet(request, &mut usb_tx).await?;
     match result {
         DaemonResponse::Status(status) => Ok(status),
         _ => Err(anyhow!("Unexpected Daemon Status Result: {:?}", result)),
@@ -1469,6 +1589,19 @@ mod tests {
                 .is_some()
         );
         assert!(remote.refused_reason(&DaemonRequest::GetStatus).is_none());
+    }
+
+    #[test]
+    fn a_new_link_wins_over_an_old_cookie() {
+        let req = actix_web::test::TestRequest::default()
+            .uri("/?token=new")
+            .insert_header((header::COOKIE, "goxlr_access=old"))
+            .to_srv_request();
+        assert_eq!(presented_token(&req), Some((String::from("new"), true)));
+        let req = actix_web::test::TestRequest::default()
+            .insert_header((header::COOKIE, "other=1; goxlr_access=old"))
+            .to_srv_request();
+        assert_eq!(presented_token(&req), Some((String::from("old"), false)));
     }
 
     #[test]

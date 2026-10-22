@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+goxlr-types = { path = "../types" }
 # Common Workspace
 log = { workspace = true }
 anyhow = { workspace = true }
@@ -18,6 +19,9 @@ enum-map = { workspace = true }
 
 enum-map-derive = "0.17.0"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
-ritelinked = "0.3.2"
+hashlink = "0.12.2"
 quick-xml = "0.42.0"
 fastrand = "2.3.0"
+
+[lints]
+workspace = true

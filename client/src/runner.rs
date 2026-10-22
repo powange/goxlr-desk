@@ -10,6 +10,7 @@ use crate::cli::{Cli, DeviceSettings};
 use crate::microphone::apply_microphone_controls;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use enum_map::EnumMap;
 use goxlr_ipc::GoXLRCommand;
 use goxlr_ipc::client::Client;
 use goxlr_ipc::clients::ipc::ipc_client::IPCClient;
@@ -30,6 +31,13 @@ pub async fn run_cli() -> Result<()> {
     let mut client: Box<dyn Client>;
 
     if let Some(url) = cli.use_http {
+        // The client talks plain HTTP (the daemon serves no TLS)
+        if url.starts_with("https://") {
+            return Err(anyhow!(
+                "HTTPS isn't supported, use the http:// address of the utility"
+            ));
+        }
+        let url = url.trim_end_matches('/');
         client = Box::new(WebClient::new(format!("{url}/api/command")));
     } else {
         let connection = connect_daemon()
@@ -42,7 +50,28 @@ pub async fn run_cli() -> Result<()> {
 
     client.poll_status().await?;
 
-    let serial = if let Some(serial) = &cli.device {
+    // Only commands need a device: --status and --status-json cover every device, and are what
+    // one runs to find out what's connected.
+    let mic_controls = &cli.microphone_controls;
+    let needs_device = cli.subcommands.is_some()
+        || mic_controls.dynamic_gain.is_some()
+        || mic_controls.condenser_gain.is_some()
+        || mic_controls.jack_gain.is_some();
+
+    if let Some(serial) = &cli.device
+        && !client.status().mixers.contains_key(serial)
+    {
+        let known: Vec<&String> = client.status().mixers.keys().collect();
+        return Err(anyhow!(
+            "No GoXLR with the serial {} is connected (connected: {:?})",
+            serial,
+            known
+        ));
+    }
+
+    let serial = if !needs_device {
+        String::new()
+    } else if let Some(serial) = &cli.device {
         serial.to_owned()
     } else if client.status().mixers.is_empty() {
         return Err(anyhow!("No GoXLR Devices are Connected."));
@@ -1039,6 +1068,16 @@ pub async fn run_cli() -> Result<()> {
         }
     }
 
+    if cli.status_http {
+        client.poll_status().await?;
+        let http = &client.status().config.http_settings;
+        if http.enabled {
+            println!("Web interface: http://localhost:{}/", http.port);
+        } else {
+            println!("Web interface: disabled");
+        }
+    }
+
     if cli.status_json {
         client.poll_status().await?;
         println!("{}", serde_json::to_string_pretty(client.status())?);
@@ -1137,31 +1176,49 @@ fn print_mixer_info(mixer: &MixerStatus) {
         }
     }
 
+    print!("{}", format_routing_table(&mixer.router));
+}
+
+/// The routing as a table: an X where an input goes to an output, blank otherwise.
+fn format_routing_table(router: &EnumMap<InputDevice, EnumMap<OutputDevice, bool>>) -> String {
     let max_col_len = OutputDevice::iter()
         .map(|s| s.to_string().len())
         .max()
         .unwrap_or_default();
+    let mut table = String::new();
     let mut table_width = max_col_len + 1;
-    print!(" {}", " ".repeat(max_col_len));
+    table.push_str(&format!(" {}", " ".repeat(max_col_len)));
     for input in InputDevice::iter() {
         let col_name = input.to_string();
-        print!(" |{col_name}|");
+        table.push_str(&format!(" |{col_name}|"));
         table_width += col_name.len() + 3;
     }
-    println!();
-    println!("{}", "-".repeat(table_width));
+    table.push('\n');
+    table.push_str(&"-".repeat(table_width));
+    table.push('\n');
 
     for output in OutputDevice::iter() {
         let row_name = output.to_string();
-        print!("|{}{}|", " ".repeat(max_col_len - row_name.len()), row_name,);
+        table.push_str(&format!(
+            "|{}{}|",
+            " ".repeat(max_col_len - row_name.len()),
+            row_name
+        ));
         for input in InputDevice::iter() {
-            let col_name = input.to_string();
-            let len = col_name.len() + 1;
-            print!("{}X{} ", " ".repeat(len / 2), " ".repeat(len - (len / 2)));
+            let len = input.to_string().len() + 1;
+            let mark = if router[input][output] { "X" } else { " " };
+            table.push_str(&format!(
+                "{}{}{} ",
+                " ".repeat(len / 2),
+                mark,
+                " ".repeat(len - (len / 2))
+            ));
         }
-        println!();
+        table.push('\n');
     }
-    println!("{}", "-".repeat(table_width));
+    table.push_str(&"-".repeat(table_width));
+    table.push('\n');
+    table
 }
 
 /// Connects to the daemon: the named pipe on Windows (as before), otherwise this user's socket,
@@ -1182,4 +1239,23 @@ async fn connect_daemon() -> Result<LocalSocketStream> {
         }
     }
     Err(last_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routing_table_shows_only_the_routes() {
+        let mut router: EnumMap<InputDevice, EnumMap<OutputDevice, bool>> = Default::default();
+        router[InputDevice::Microphone][OutputDevice::BroadcastMix] = true;
+        let table = format_routing_table(&router);
+        // One route: one X, in the stream mix row
+        assert_eq!(table.matches('X').count(), 1);
+        let row = table
+            .lines()
+            .find(|line| line.contains(&OutputDevice::BroadcastMix.to_string()))
+            .unwrap();
+        assert!(row.contains('X'));
+    }
 }

@@ -74,12 +74,8 @@ impl TTS {
     any normal behaviours because TTS didn't work.
      */
     pub async fn speak_tts(&mut self, message: String) {
-        if self.settings.get_tts_enabled().await.is_none() {
-            // TTS isn't available..
-            return;
-        }
-
-        if !self.settings.get_tts_enabled().await.unwrap() {
+        // Not available (None), or turned off..
+        if self.settings.get_tts_enabled().await != Some(true) {
             return;
         }
 
@@ -88,6 +84,12 @@ impl TTS {
                 Ok(mut tts) => {
                     if cfg!(target_os = "macos") {
                         let _ = tts.set_rate(tts.max_rate());
+                    }
+                    if cfg!(all(windows, target_arch = "aarch64")) {
+                        // The screen reader libraries (NVDA, System Access) only exist for x64
+                        info!(
+                            "Windows on ARM: speaking with Windows' own voice, not the screen reader"
+                        );
                     }
                     tts
                 }

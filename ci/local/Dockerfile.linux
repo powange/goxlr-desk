@@ -1,0 +1,16 @@
+# The Linux packages (see build.sh), built on Debian bookworm: binaries linked on an older glibc
+# (2.36) also run on Ubuntu 22.04 and Debian 12, as those from the release workflow do. The
+# Windows image (Dockerfile) needs a newer clang, so the two are separate.
+FROM rust:1.98-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang jq git ca-certificates \
+        pkg-config libdbus-1-dev libspeechd-dev libpulse-dev libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install --locked -j 4 cargo-deb@3.8.0 cargo-generate-rpm@0.21.1 \
+    && rm -rf /usr/local/cargo/registry
+
+ENV CARGO_HOME=/cache/cargo
+
+WORKDIR /src

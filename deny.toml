@@ -5,8 +5,6 @@
 # Crates flagged as unmaintained, with no known vulnerability. Each one stays listed here until it
 # can be removed or replaced, remove the entry once that's done.
 ignore = [
-    { id = "RUSTSEC-2024-0388", reason = "derivative: used by goxlr-types, can be replaced by plain derives (audit L23)" },
-    { id = "RUSTSEC-2025-0141", reason = "bincode: enabled by an unused tokio-serde feature in goxlr-ipc (audit L23)" },
     { id = "RUSTSEC-2021-0139", reason = "ansi_term: build-time only, clap 2 via bindgen 0.58 for the macOS xpc-connection-sys" },
     { id = "RUSTSEC-2024-0375", reason = "atty: build-time only, clap 2 via bindgen 0.58 for the macOS xpc-connection-sys" },
     { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro used by dependencies of the image crate" },

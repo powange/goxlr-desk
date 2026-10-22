@@ -1,4 +1,5 @@
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, value_parser};
+use goxlr_types::effect_ranges as ranges;
 
 use goxlr_types::{
     AnimationMode, Button, ButtonColourGroups, ButtonColourOffStyle, ChannelName,
@@ -29,6 +30,7 @@ pub struct Cli {
     #[arg(long)]
     pub status_json: bool,
 
+    /// Display the address of the web interface
     #[arg(long)]
     pub status_http: bool,
 
@@ -46,24 +48,25 @@ pub struct Cli {
 #[derive(Debug, Args)]
 pub struct MicrophoneControls {
     /// Set the gain of the plugged in dynamic (XLR) microphone.
-    /// Value is in decibels and recommended to be lower than 72dB.
-    #[arg(long)]
+    /// Value is in decibels, 0 to 72. The active microphone type doesn't change.
+    #[arg(value_parser = clap::value_parser!(u16).range(0..=72), long)]
     pub dynamic_gain: Option<u16>,
 
     /// Set the gain of the plugged in condenser (XLR with phantom power) microphone.
-    /// Value is in decibels and recommended to be lower than 72dB.
-    #[arg(long)]
+    /// Value is in decibels, 0 to 72. The active microphone type doesn't change.
+    #[arg(value_parser = clap::value_parser!(u16).range(0..=72), long)]
     pub condenser_gain: Option<u16>,
 
     /// Set the gain of the plugged in jack (3.5mm) microphone.
-    /// Value is in decibels and recommended to be lower than 72dB.
-    #[arg(long)]
+    /// Value is in decibels, 0 to 72. The active microphone type doesn't change.
+    #[arg(value_parser = clap::value_parser!(u16).range(0..=72), long)]
     pub jack_gain: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum SubCommands {
+    /// Firmware updates
     Firmware {
         #[command(subcommand)]
         command: FirmwareCommands,
@@ -144,11 +147,13 @@ pub enum SubCommands {
         command: EffectsCommands,
     },
 
+    /// Sampler banks, buttons and playback
     Sampler {
         #[clap[subcommand]]
         command: SamplerCommands,
     },
 
+    /// Device and utility settings
     Settings {
         #[clap[subcommand]]
         command: DeviceSettings,
@@ -163,7 +168,7 @@ fn percent_value(s: &str) -> Result<u8, String> {
 
     let value = value.unwrap();
     if value > 100 {
-        return Err(String::from("Value must be lower than 100"));
+        return Err(String::from("Value must be between 0 and 100"));
     }
     Ok(value)
 }
@@ -186,9 +191,12 @@ fn percent_value_float(s: &str) -> Result<f32, String> {
 #[command(arg_required_else_help = true)]
 #[allow(clippy::enum_variant_names)]
 pub enum FirmwareCommands {
+    /// Update the firmware, from a file or the latest release when no path is given
     FirmwareUpdate { path: Option<PathBuf> },
 
+    /// Continue an update paused awaiting confirmation
     ContinueFirmwareUpdate,
+    /// Clear the state of a finished or failed update
     ClearFirmwareUpdate,
 }
 
@@ -393,6 +401,7 @@ pub enum EqualiserCommands {
         #[arg(allow_hyphen_values = true)]
         value: f32,
     },
+    /// Set the Gain of an Equaliser frequency
     Gain {
         #[arg(value_enum)]
         /// The Frequency to Modify
@@ -441,23 +450,27 @@ pub enum NoiseGateCommands {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum CompressorCommands {
-    /// Activation Threshold in dB [-24 - 0]
+    /// Activation Threshold in dB [-40 - 0]
     Threshold {
-        #[arg(allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true, value_parser = value_parser!(i8).range(-40..=0))]
         value: i8,
     },
+    /// Set the Compressor Ratio
     Ratio {
         #[arg(value_enum)]
         value: CompressorRatio,
     },
+    /// Set the Compressor Attack Time
     Attack {
         #[arg(value_enum)]
         value: CompressorAttackTime,
     },
+    /// Set the Compressor Release Time
     Release {
         #[arg(value_enum)]
         value: CompressorReleaseTime,
     },
+    /// Set the Compressor Make-Up Gain (dB)
     MakeUp {
         #[arg(allow_hyphen_values = true)]
         value: i8,
@@ -792,41 +805,48 @@ pub enum AllFaderCommands {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum EffectsCommands {
-    LoadEffectPreset {
-        name: String,
-    },
-    RenameActivePreset {
-        name: String,
-    },
+    /// Load an Effect Preset from the presets directory
+    LoadEffectPreset { name: String },
+    /// Rename the active Effect Preset
+    RenameActivePreset { name: String },
+    /// Save the active Effect Preset to the presets directory
     SaveActivePreset,
+    /// Switch the active Effect Preset
     SetActivePreset {
         #[arg(value_enum)]
         preset: EffectBankPresets,
     },
+    /// Reverb settings
     Reverb {
         #[command(subcommand)]
         command: Reverb,
     },
+    /// Echo settings
     Echo {
         #[command(subcommand)]
         command: Echo,
     },
+    /// Pitch settings
     Pitch {
         #[command(subcommand)]
         command: Pitch,
     },
+    /// Gender settings
     Gender {
         #[command(subcommand)]
         command: Gender,
     },
+    /// Megaphone settings
     Megaphone {
         #[command(subcommand)]
         command: Megaphone,
     },
+    /// Robot settings
     Robot {
         #[command(subcommand)]
         command: Robot,
     },
+    /// Hard Tune settings
     HardTune {
         #[command(subcommand)]
         command: HardTune,
@@ -850,59 +870,79 @@ pub enum Reverb {
     },
 
     /// Set the Reverb Amount
-    Amount { amount: u8 },
+    Amount {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        amount: u8,
+    },
 
     /// Set the Reverb Decay
-    Decay { decay: u16 },
+    Decay {
+        /// Between 10 and 20000
+        #[arg(value_parser = value_parser!(u16).range(ranges::REVERB_DECAY_MILLIS))]
+        decay: u16,
+    },
 
     /// Set the Reverb Early Level
     EarlyLevel {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -25 and 0
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_LEVEL), allow_hyphen_values = true)]
         level: i8,
     },
 
     /// Set the Reverb Tail Level
     TailLevel {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -25 and 0
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_LEVEL), allow_hyphen_values = true)]
         level: i8,
     },
 
     /// Set the Reverb Pre-Delay
-    PreDelay { delay: u8 },
+    PreDelay {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::REVERB_PREDELAY))]
+        delay: u8,
+    },
 
     /// Set the Reverb Low 'Colour'
     LowColour {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -50 and 50
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_COLOUR), allow_hyphen_values = true)]
         colour: i8,
     },
 
     /// Set the Reverb High 'Colour'
     HighColour {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -50 and 50
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_COLOUR), allow_hyphen_values = true)]
         colour: i8,
     },
 
     /// Set the Reverb High Factor
     HighFactor {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -25 and 25
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_HIGH_FACTOR), allow_hyphen_values = true)]
         factor: i8,
     },
 
     /// Set the Reverb Diffuse Level
     Diffuse {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -50 and 50
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_DIFFUSE), allow_hyphen_values = true)]
         diffuse: i8,
     },
 
     /// Set the Reverb Mod Speed
     ModSpeed {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -25 and 25
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_MOD), allow_hyphen_values = true)]
         speed: i8,
     },
 
     /// Set the Reverb Mod Depth
     ModDepth {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -25 and 25
+        #[arg(value_parser = value_parser!(i8).range(ranges::REVERB_MOD), allow_hyphen_values = true)]
         depth: i8,
     },
 }
@@ -917,25 +957,53 @@ pub enum Echo {
     },
 
     /// Set the Echo Amount (Percentage)
-    Amount { amount: u8 },
+    Amount {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        amount: u8,
+    },
 
     /// Set the Echo Feedback Level
-    Feedback { feedback: u8 },
+    Feedback {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        feedback: u8,
+    },
 
     /// Set the Echo Tempo (only valid if 'Style' is 'ClassicSlap')
-    Tempo { tempo: u16 },
+    Tempo {
+        /// Between 45 and 300
+        #[arg(value_parser = value_parser!(u16).range(ranges::ECHO_TEMPO))]
+        tempo: u16,
+    },
 
     /// Set the Reverb Left Delay (only valid if 'Style' is not 'ClassicSlap')
-    DelayLeft { delay: u16 },
+    DelayLeft {
+        /// Between 0 and 2500
+        #[arg(value_parser = value_parser!(u16).range(ranges::ECHO_DELAY))]
+        delay: u16,
+    },
 
     /// Set the Reverb Right Delay (only valid if 'Style' is not 'ClassicSlap')
-    DelayRight { delay: u16 },
+    DelayRight {
+        /// Between 0 and 2500
+        #[arg(value_parser = value_parser!(u16).range(ranges::ECHO_DELAY))]
+        delay: u16,
+    },
 
     /// Set the Echo XFB from Left to Right
-    FeedbackXFBLtoR { feedback: u8 },
+    FeedbackXFBLtoR {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        feedback: u8,
+    },
 
     /// Set the Echo XFB from Right to Left
-    FeedbackXFBRtoL { feedback: u8 },
+    FeedbackXFBRtoL {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        feedback: u8,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -949,23 +1017,31 @@ pub enum Pitch {
 
     /// Set the pitch Amount
     Amount {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -24 and 24 (Wide), -12 and 12 (Narrow), less with Hard Tune on
+        #[arg(value_parser = value_parser!(i8).range(ranges::PITCH_AMOUNT), allow_hyphen_values = true)]
         amount: i8,
     },
 
     /// Set the Pitch Character
-    Character { character: u8 },
+    Character {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        character: u8,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum Gender {
+    /// Set the Gender Style
     Style {
         #[arg(value_enum)]
         style: GenderStyle,
     },
+    /// Set the Gender Amount
     Amount {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -12 and 12 (Narrow), -25 and 25 (Medium), -50 and 50 (Wide)
+        #[arg(value_parser = value_parser!(i8).range(ranges::GENDER_AMOUNT), allow_hyphen_values = true)]
         amount: i8,
     },
 }
@@ -980,11 +1056,16 @@ pub enum Megaphone {
     },
 
     /// Set the Megaphone Amount
-    Amount { amount: u8 },
+    Amount {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        amount: u8,
+    },
 
     /// Set the Post Processing Gain
     PostGain {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -20 and 20
+        #[arg(value_parser = value_parser!(i8).range(ranges::MEGAPHONE_POST_GAIN), allow_hyphen_values = true)]
         gain: i8,
     },
 
@@ -1010,8 +1091,8 @@ pub enum Robot {
         #[arg(value_enum)]
         range: RobotRange,
 
-        /// The Gain Value
-        #[arg(allow_hyphen_values = true)]
+        /// The Gain Value (Between -12 and 12)
+        #[arg(value_parser = value_parser!(i8).range(ranges::ROBOT_GAIN), allow_hyphen_values = true)]
         gain: i8,
     },
 
@@ -1020,7 +1101,8 @@ pub enum Robot {
         /// The Frequency Range
         #[arg(value_enum)]
         range: RobotRange,
-        /// The frequency Value
+        /// The frequency Value (Low: 0 to 88, Medium: 86 to 184, High: 182 to 240)
+        #[arg(value_parser = value_parser!(u8).range(ranges::ROBOT_FREQ))]
         frequency: u8,
     },
     /// Sets the Robot Bandwidth
@@ -1028,24 +1110,35 @@ pub enum Robot {
         /// The Bandwidth Range
         #[arg(value_enum)]
         range: RobotRange,
-        /// The Bandwidth Value
+        /// The Bandwidth Value (Between 0 and 32)
+        #[arg(value_parser = value_parser!(u8).range(ranges::ROBOT_WIDTH))]
         bandwidth: u8,
     },
     /// Sets the Robot Waveform
-    WaveForm { waveform: u8 },
+    WaveForm {
+        /// Between 0 and 3
+        #[arg(value_parser = value_parser!(u8).range(ranges::ROBOT_WAVEFORM))]
+        waveform: u8,
+    },
 
     /// Sets the Robot Pulse Width
-    PulseWidth { width: u8 },
+    PulseWidth {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        width: u8,
+    },
 
     /// Sets the Robot Activation Threshold
     Threshold {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -36 and 0
+        #[arg(value_parser = value_parser!(i8).range(ranges::ROBOT_LEVEL), allow_hyphen_values = true)]
         threshold: i8,
     },
 
     /// Sets the Robot Dry Mix
     DryMix {
-        #[arg(allow_hyphen_values = true)]
+        /// Between -36 and 0
+        #[arg(value_parser = value_parser!(i8).range(ranges::ROBOT_LEVEL), allow_hyphen_values = true)]
         dry_mix: i8,
     },
 
@@ -1066,13 +1159,25 @@ pub enum HardTune {
     },
 
     /// Sets the Hard Tune Amount
-    Amount { amount: u8 },
+    Amount {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        amount: u8,
+    },
 
     /// Sets the Hard Tune Rate
-    Rate { rate: u8 },
+    Rate {
+        /// Between 0 and 100
+        #[arg(value_parser = value_parser!(u8).range(ranges::PERCENTAGE))]
+        rate: u8,
+    },
 
     /// Sets the Hard Tune Window
-    Window { window: u16 },
+    Window {
+        /// Between 0 and 600
+        #[arg(value_parser = value_parser!(u16).range(ranges::HARDTUNE_WINDOW))]
+        window: u16,
+    },
 
     /// Sets the Hard Tune Source
     Source {
@@ -1090,6 +1195,7 @@ pub enum HardTune {
 #[derive(Subcommand, Debug)]
 #[command(arg_required_else_help = true)]
 pub enum SamplerCommands {
+    /// Add a sample file to a button
     Add {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1100,6 +1206,7 @@ pub enum SamplerCommands {
         file: String,
     },
 
+    /// Remove a sample from a button, by its position
     RemoveByIndex {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1110,6 +1217,7 @@ pub enum SamplerCommands {
         index: usize,
     },
 
+    /// Play a button's sample, by its position
     PlayByIndex {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1120,6 +1228,7 @@ pub enum SamplerCommands {
         index: usize,
     },
 
+    /// Play the next sample on a button
     PlayNextTrack {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1128,6 +1237,7 @@ pub enum SamplerCommands {
         button: SampleButtons,
     },
 
+    /// Stop a button's playback
     StopPlayback {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1136,6 +1246,7 @@ pub enum SamplerCommands {
         button: SampleButtons,
     },
 
+    /// Set how a button plays its samples
     PlaybackMode {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1147,6 +1258,7 @@ pub enum SamplerCommands {
         mode: SamplePlaybackMode,
     },
 
+    /// Set the order a button plays its samples in
     PlaybackOrder {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1158,6 +1270,7 @@ pub enum SamplerCommands {
         mode: SamplePlayOrder,
     },
 
+    /// Set where a sample starts playing (percentage)
     StartPercent {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1172,6 +1285,7 @@ pub enum SamplerCommands {
         start_position: f32,
     },
 
+    /// Set where a sample stops playing (percentage)
     StopPercent {
         #[arg(value_enum)]
         bank: SampleBank,
@@ -1186,6 +1300,7 @@ pub enum SamplerCommands {
         stop_position: f32,
     },
 
+    /// Switch the active Sample Bank
     SetActiveBank {
         #[arg(value_enum)]
         preset: SampleBank,

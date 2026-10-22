@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::raw::c_float;
 use std::str::FromStr;
 
 use enum_map::EnumMap;
@@ -11,10 +10,13 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap, ColourOffStyle};
 use crate::components::hardtune::HardTuneSource::All;
 use crate::components::hardtune::HardTuneStyle::Natural;
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -42,6 +44,9 @@ pub struct HardtuneEffectBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, HardTuneEffect>,
     source: HardTuneSource,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl HardtuneEffectBase {
@@ -58,6 +63,7 @@ impl HardtuneEffectBase {
             colour_map,
             preset_map: EnumMap::default(),
             source: HardTuneSource::Music,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -70,7 +76,7 @@ impl HardtuneEffectBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[hardTuneEffect] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -84,50 +90,27 @@ impl HardtuneEffectBase {
     ) -> Result<(), ParseError> {
         let mut preset = HardTuneEffect::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "hardtuneEffectstate" {
                 preset.state = matches!(attr.value.as_str(), "1");
                 continue;
             }
             if attr.name == "HARDTUNE_STYLE" {
-                for style in HardTuneStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<HardTuneStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
 
-            if attr.name == "HARDTUNE_KEYSOURCE" {
-                preset.key_source = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_AMOUNT" {
-                preset.amount = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_WINDOW" {
-                preset.window = attr.value.parse::<c_float>()? as u16;
-                continue;
-            }
-            if attr.name == "HARDTUNE_RATE" {
-                preset.rate = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_SCALE" {
-                preset.scale = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-            if attr.name == "HARDTUNE_PITCH_AMT" {
-                preset.pitch_amt = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
             if attr.name == "HARDTUNE_SOURCE" {
                 preset.source = Some(HardTuneSource::from_str(&attr.value)?);
                 continue;
             }
 
-            println!("[HardTuneEffect] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         self.preset_map[preset_enum] = preset;
@@ -142,6 +125,7 @@ impl HardtuneEffectBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -182,23 +166,13 @@ impl HardtuneEffectBase {
             "HARDTUNE_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert(
-            "HARDTUNE_KEYSOURCE".to_string(),
-            format!("{}", value.key_source),
-        );
-        attributes.insert("HARDTUNE_AMOUNT".to_string(), format!("{}", value.amount));
-        attributes.insert("HARDTUNE_WINDOW".to_string(), format!("{}", value.window));
-        attributes.insert("HARDTUNE_RATE".to_string(), format!("{}", value.rate));
-        attributes.insert("HARDTUNE_SCALE".to_string(), format!("{}", value.scale));
-        attributes.insert(
-            "HARDTUNE_PITCH_AMT".to_string(),
-            format!("{}", value.pitch_amt),
-        );
+        value.write_numeric(&mut attributes);
 
         if let Some(source) = &value.source {
             attributes.insert("HARDTUNE_SOURCE".to_string(), source.to_string());
         }
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -219,7 +193,7 @@ impl HardtuneEffectBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct HardTuneEffect {
     // State here determines if the hardtune is on or off when this preset is loaded.
     state: bool,
@@ -232,6 +206,9 @@ pub struct HardTuneEffect {
     scale: u8,
     pitch_amt: u8,
     source: Option<HardTuneSource>,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl HardTuneEffect {
@@ -246,6 +223,7 @@ impl HardTuneEffect {
             scale: 0,
             pitch_amt: 0,
             source: None,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -280,9 +258,7 @@ impl HardTuneEffect {
         self.amount
     }
     pub fn set_amount(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Amount should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Amount")?;
         self.amount = value;
         Ok(())
     }
@@ -291,9 +267,7 @@ impl HardTuneEffect {
         self.window
     }
     pub fn set_window(&mut self, value: u16) -> Result<()> {
-        if value > 600 {
-            return Err(anyhow!("Window should be between 0 and 600"));
-        }
+        check_range(value, ranges::HARDTUNE_WINDOW, "Window")?;
         self.window = value;
         Ok(())
     }
@@ -302,9 +276,7 @@ impl HardTuneEffect {
         self.rate
     }
     pub fn set_rate(&mut self, value: u8) -> Result<()> {
-        if value > 100 {
-            return Err(anyhow!("Rate should be a percentage"));
-        }
+        check_range(value, ranges::PERCENTAGE, "Rate")?;
         self.rate = value;
         Ok(())
     }
@@ -415,3 +387,12 @@ impl HardtunePreset {
         }
     }
 }
+
+numeric_attributes!(HardTuneEffect {
+    key_source: u8 = "HARDTUNE_KEYSOURCE",
+    amount: u8 = "HARDTUNE_AMOUNT" in ranges::PERCENTAGE,
+    window: u16 = "HARDTUNE_WINDOW" in ranges::HARDTUNE_WINDOW,
+    rate: u8 = "HARDTUNE_RATE" in ranges::PERCENTAGE,
+    scale: u8 = "HARDTUNE_SCALE",
+    pitch_amt: u8 = "HARDTUNE_PITCH_AMT",
+});

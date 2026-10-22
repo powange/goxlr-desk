@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::raw::c_float;
 
 use enum_map::{Enum, EnumMap};
 use strum::{EnumIter, EnumProperty, IntoEnumIterator};
@@ -10,8 +9,11 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 use crate::Preset;
+use crate::components::UnknownAttributes;
 use crate::components::colours::{Colour, ColourMap};
+use crate::components::{check_range, style_from_index};
 use crate::profile::Attribute;
+use goxlr_types::effect_ranges as ranges;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -39,6 +41,9 @@ pub struct GenderEncoderBase {
     colour_map: ColourMap,
     preset_map: EnumMap<Preset, GenderEncoder>,
     active_set: u8, // Not sure what this does?
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl GenderEncoderBase {
@@ -53,6 +58,7 @@ impl GenderEncoderBase {
             colour_map,
             preset_map: EnumMap::default(),
             active_set: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
@@ -64,7 +70,7 @@ impl GenderEncoderBase {
             }
 
             if !self.colour_map.read_colours(attr)? {
-                println!("[GenderEncoder] Unparsed Attribute: {}", attr.name);
+                self.unknown.keep(attr);
             }
         }
 
@@ -78,27 +84,18 @@ impl GenderEncoderBase {
     ) -> Result<(), ParseError> {
         let mut preset = GenderEncoder::new();
         for attr in attributes {
+            if preset.read_numeric(&attr.name, &attr.value)? {
+                continue;
+            }
+
             if attr.name == "GENDER_STYLE" {
-                for style in GenderStyle::iter() {
-                    if style.get_str("uiIndex").unwrap() == attr.value {
-                        preset.style = style;
-                        break;
-                    }
+                if let Some(style) = style_from_index::<GenderStyle>(&attr.value) {
+                    preset.style = style;
                 }
                 continue;
             }
 
-            if attr.name == "GENDER_KNOB_POSITION" {
-                preset.knob_position = attr.value.parse::<c_float>()? as i8;
-                continue;
-            }
-
-            if attr.name == "GENDER_RANGE" {
-                preset.range = attr.value.parse::<c_float>()? as u8;
-                continue;
-            }
-
-            println!("[GenderEncoder] Unparsed Child Attribute: {}", attr.name);
+            preset.unknown.keep(attr);
         }
 
         self.preset_map[preset_enum] = preset;
@@ -113,6 +110,7 @@ impl GenderEncoderBase {
         self.colour_map.write_colours(&mut attributes);
 
         // Write out the attributes etc for this element, but don't close it yet..
+        self.unknown.write_to(&mut attributes);
         for (key, value) in &attributes {
             elem.push_attribute((key.as_str(), value.as_str()));
         }
@@ -141,16 +139,13 @@ impl GenderEncoderBase {
         let mut attributes = HashMap::new();
         let value = &self.preset_map[preset];
 
-        attributes.insert(
-            "GENDER_KNOB_POSITION".to_string(),
-            format!("{}", value.knob_position),
-        );
+        value.write_numeric(&mut attributes);
         attributes.insert(
             "GENDER_STYLE".to_string(),
             value.style.get_str("uiIndex").unwrap().to_string(),
         );
-        attributes.insert("GENDER_RANGE".to_string(), format!("{}", value.range));
 
+        value.unknown.write_to(&mut attributes);
         attributes
     }
 
@@ -171,11 +166,14 @@ impl GenderEncoderBase {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GenderEncoder {
     knob_position: i8,
     style: GenderStyle,
     range: u8,
+
+    // Attributes this version doesn't know, written back as they were
+    unknown: UnknownAttributes,
 }
 
 impl GenderEncoder {
@@ -184,54 +182,30 @@ impl GenderEncoder {
             knob_position: 0,
             style: GenderStyle::Narrow,
             range: 0,
+            unknown: UnknownAttributes::default(),
         }
     }
 
     pub fn amount(&self) -> i8 {
-        // Amount is dependent on Style, and knob position, lets work with positive numbers.
-        let knob_position = self.knob_position as f32; // Between -24 and 24..
-
-        match self.style {
-            GenderStyle::Narrow => ((12. * knob_position) / 24.).round() as i8,
-            GenderStyle::Medium => ((25. * knob_position) / 24.).round() as i8,
-            GenderStyle::Wide => ((50. * knob_position) / 24.).round() as i8,
-        }
+        amount_at(self.style, self.knob_position)
     }
 
+    /// Moves the knob to the position showing the amount closest to `amount` (the knob has 49
+    /// positions, Medium and Wide have more amounts than that).
     pub fn set_amount(&mut self, amount: i8) -> Result<()> {
-        match self.style {
-            GenderStyle::Narrow => {
-                if !(-12..=12).contains(&amount) {
-                    return Err(anyhow!(
-                        "Amount should be between -12 and 12 (Style: Narrow)"
-                    ));
-                }
-                let base = amount as i32 + 12;
-                let percent = base * 48 / 24;
-                self.knob_position = (percent - 24) as i8;
-                Ok(())
-            }
-            GenderStyle::Medium => {
-                if !(-25..=25).contains(&amount) {
-                    return Err(anyhow!(
-                        "Amount should be between -25 and 25 (Style: Medium)"
-                    ));
-                }
-                let base = amount as i32 + 25;
-                let percent = base * 48 / 50;
-                self.knob_position = (percent - 24) as i8;
-                Ok(())
-            }
-            GenderStyle::Wide => {
-                if !(-50..=50).contains(&amount) {
-                    return Err(anyhow!("Amount should be between -50 and 50 (Style: Wide)"));
-                }
-                let base = amount as i32 + 50;
-                let percent = base * 48 / 100;
-                self.knob_position = (percent - 24) as i8;
-                Ok(())
-            }
+        let max = max_amount(self.style);
+        if !(-max..=max).contains(&amount) {
+            return Err(anyhow!(
+                "Amount should be between -{} and {} (Style: {:?})",
+                max,
+                max,
+                self.style
+            ));
         }
+        self.knob_position = (-24..=24)
+            .min_by_key(|position| (amount_at(self.style, *position) as i16 - amount as i16).abs())
+            .unwrap_or(0);
+        Ok(())
     }
 
     pub fn knob_position(&self) -> i8 {
@@ -239,9 +213,7 @@ impl GenderEncoder {
     }
 
     pub fn set_knob_position(&mut self, knob_position: i8) -> Result<()> {
-        if !(-24..=24).contains(&knob_position) {
-            return Err(anyhow!("Gender Knob Position should be between -24 and 24"));
-        }
+        check_range(knob_position, ranges::KNOB_CENTRED, "Gender Knob Position")?;
 
         self.knob_position = knob_position;
         Ok(())
@@ -258,7 +230,20 @@ impl GenderEncoder {
     }
 }
 
-#[derive(Default, Debug, EnumIter, Enum, EnumProperty)]
+fn max_amount(style: GenderStyle) -> i8 {
+    match style {
+        GenderStyle::Narrow => 12,
+        GenderStyle::Medium => 25,
+        GenderStyle::Wide => 50,
+    }
+}
+
+/// The amount shown for a knob position (-24 to 24).
+fn amount_at(style: GenderStyle, knob_position: i8) -> i8 {
+    ((max_amount(style) as f32 * knob_position as f32) / 24.).round() as i8
+}
+
+#[derive(Default, Debug, EnumIter, Enum, EnumProperty, Clone, Copy)]
 pub enum GenderStyle {
     #[default]
     #[strum(props(uiIndex = "0"))]
@@ -269,4 +254,44 @@ pub enum GenderStyle {
 
     #[strum(props(uiIndex = "2"))]
     Wide,
+}
+
+numeric_attributes!(GenderEncoder {
+    knob_position: i8 = "GENDER_KNOB_POSITION" in ranges::KNOB_CENTRED,
+    range: u8 = "GENDER_RANGE",
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amounts_land_on_the_closest_position() {
+        for style in GenderStyle::iter() {
+            let mut encoder = GenderEncoder::new();
+            encoder.set_style(style);
+            // An amount shown and sent back stays the same (and so does the position, when
+            // each position shows its own amount: Narrow has two positions per amount).
+            for position in -24..=24 {
+                encoder.set_knob_position(position).unwrap();
+                let amount = encoder.amount();
+                encoder.set_amount(amount).unwrap();
+                assert_eq!(encoder.amount(), amount, "{style:?} {position}");
+                if max_amount(style) >= 24 {
+                    assert_eq!(encoder.knob_position(), position, "{style:?} {amount}");
+                }
+            }
+            // Any amount is shown as the closest one available.
+            let max = max_amount(style);
+            for amount in -max..=max {
+                encoder.set_amount(amount).unwrap();
+                let shown = encoder.amount();
+                let best = (-24..=24)
+                    .map(|p| (amount_at(style, p) - amount).abs())
+                    .min()
+                    .unwrap();
+                assert_eq!((shown - amount).abs(), best, "{style:?} {amount}");
+            }
+        }
+    }
 }

@@ -18,7 +18,8 @@ pub struct CpalRecord {
 
     // Use a shared read buffer..
     buffer_consumer: Consumer<f32>,
-    read_buffer: [f32; BUFFER_SIZE],
+    // On the heap: 768 KB built in place would land on the stack (1 MB on Windows) in debug
+    read_buffer: Box<[f32]>,
 }
 
 // Set max 'interim' buffer size to 2s. This defines the maximum time between the audio being
@@ -77,7 +78,7 @@ impl OpenInputStream for CpalRecord {
             stream,
             stream_closed,
 
-            read_buffer: [0.0; BUFFER_SIZE],
+            read_buffer: vec![0.0; BUFFER_SIZE].into_boxed_slice(),
             buffer_consumer,
         }))
     }
