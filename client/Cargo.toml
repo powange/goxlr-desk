@@ -37,6 +37,8 @@ interprocess = { workspace = true }
 clap = { workspace = true }
 
 [build-dependencies]
+# The Windows icon and version information (ci/windows_resource.rs)
+embed-resource = { workspace = true }
 goxlr-types = { path = "../types", features = ["clap"] }
 
 clap = { workspace = true }

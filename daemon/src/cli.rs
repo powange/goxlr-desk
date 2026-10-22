@@ -51,7 +51,8 @@ pub struct Cli {
 }
 
 fn default_config_location() -> PathBuf {
-    let proj_dirs = ProjectDirs::from("org", "GoXLR-on-Linux", "GoXLR-Utility")
+    // Same as settings::project_dirs (this file is also built by build.rs, without it)
+    let proj_dirs = ProjectDirs::from("org", "GoXLR-Desk", "GoXLR-Desk")
         .expect("Couldn't find project directory");
 
     proj_dirs.config_dir().join("settings.json")

@@ -37,10 +37,10 @@ sudo cp target/release/goxlr-launcher /usr/bin/
 
 sudo chmod 755 /usr/bin/goxlr-client /usr/bin/goxlr-daemon /usr/bin/goxlr-defaults /usr/bin/goxlr-launcher
 
-sudo cp daemon/resources/goxlr-utility.png /usr/share/icons/hicolor/48x48/apps/
-sudo cp daemon/resources/goxlr-utility.svg /usr/share/icons/hicolor/scalable/apps/
-sudo cp daemon/resources/goxlr-utility-large.png /usr/share/pixmaps/goxlr-utility.png
-sudo chmod 644 /usr/share/icons/hicolor/48x48/apps/goxlr-utility.png /usr/share/icons/hicolor/scalable/apps/goxlr-utility.svg /usr/share/pixmaps/goxlr-utility.png
+sudo cp daemon/resources/goxlr-desk.png /usr/share/icons/hicolor/48x48/apps/
+sudo cp daemon/resources/goxlr-desk.svg /usr/share/icons/hicolor/scalable/apps/
+sudo cp daemon/resources/goxlr-desk-large.png /usr/share/pixmaps/goxlr-desk.png
+sudo chmod 644 /usr/share/icons/hicolor/48x48/apps/goxlr-desk.png /usr/share/icons/hicolor/scalable/apps/goxlr-desk.svg /usr/share/pixmaps/goxlr-desk.png
 
 sudo cp 50-goxlr.rules /etc/udev/rules.d/
 sudo chmod 644 /etc/udev/rules.d/50-goxlr.rules

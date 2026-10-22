@@ -6,12 +6,12 @@
         <false/>
 
         <key>Label</key>
-        <string>com.github.goxlr-on-linux.goxlr-utility.initialiser.full</string>
+        <string>com.github.powange.goxlr-desk.initialiser.full</string>
 
         <!-- Launch the Initialiser with XPC Settings -->
         <key>ProgramArguments</key>
         <array>
-            <string>/Library/Application Support/com.github.goxlr-on-linux.goxlr-utility/goxlr-initialiser</string>
+            <string>/Library/Application Support/com.github.powange.goxlr-desk/goxlr-initialiser</string>
             <string>--xpc</string>
         </array>
 

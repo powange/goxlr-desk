@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::{env, fs};
 
-const AUTOSTART_FILENAME: &str = "goxlr-daemon.desktop";
+const AUTOSTART_FILENAME: &str = "goxlr-desk.desktop";
 
 static STARTUP_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(get_startup_dir);
 
@@ -42,8 +42,8 @@ pub fn create_startup_link() -> Result<()> {
             let mut conf = Ini::new();
             conf.with_section(Some("Desktop Entry"))
                 .set("Type", "Application")
-                .set("Name", "GoXLR Utility")
-                .set("Comment", "A Tool for Configuring a GoXLR")
+                .set("Name", "GoXLR Desk")
+                .set("Comment", "Configure and control a GoXLR or GoXLR Mini")
                 .set("Path", parent.to_string_lossy())
                 .set("Exec", executable.to_string_lossy())
                 .set("Terminal", "false");

@@ -3,7 +3,7 @@
 <plist>
     <dict>
         <key>Label</key>
-        <string>com.github.goxlr-on-linux.goxlr-utility</string>
+        <string>com.github.powange.goxlr-desk</string>
 
         <key>ProgramArguments</key>
         <array>

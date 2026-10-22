@@ -17,9 +17,8 @@ ui_source() {
     fi
     git -C /cache/ui fetch --quiet origin
     git -C /cache/ui checkout --quiet --force "$UI_COMMIT"
-    # As in the release workflow: files can be dropped on the page
-    local conf=/cache/ui/src-tauri/tauri.conf.json
-    jq '.app.windows[0].dragDropEnabled = false' "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+    # As in the release workflow: made GoXLR Desk's app (name, icons, drag and drop)
+    bash /src/ci/rebrand-ui-wrapper.sh /cache/ui
 }
 
 download() { # url file
@@ -59,10 +58,10 @@ build_windows() { # target suffix vc_redist_url
     rm -rf "$stage" && mkdir -p "$stage/target/release" "$stage/daemon/resources" "$stage/ci"
     cp -r /src/ci/nsis "$stage/ci/"
     cp /src/LICENSE /src/LICENSE-3RD-PARTY "$stage/"
-    cp /src/daemon/resources/goxlr-utility.ico "$stage/daemon/resources/"
+    cp /src/daemon/resources/goxlr-desk.ico "$stage/daemon/resources/"
     local bin=/src/target/$target/release
     for file in goxlr-daemon.exe goxlr-client.exe goxlr-client-quiet.exe goxlr-defaults.exe \
-                goxlr-launcher.exe goxlr-utility-ui.exe; do
+                goxlr-launcher.exe goxlr-desk-ui.exe; do
         cp "$bin/$file" "$stage/target/release/"
     done
     # Screen reader DLLs (tolk), next to the binaries. They only exist for x64: the ARM installer
@@ -79,7 +78,7 @@ build_windows() { # target suffix vc_redist_url
     cp /cache/downloads/MicrosoftEdgeWebview2Setup.exe "$stage/ci/nsis/"
     cp "/cache/downloads/vc_redist$suffix.exe" "$stage/ci/nsis/vc_redist.exe"
 
-    makensis -V2 "-DPRODUCT_VERSION=$VERSION$suffix" "$stage/ci/nsis/goxlr-utility.nsi"
+    makensis -V2 "-DPRODUCT_VERSION=$VERSION$suffix" "$stage/ci/nsis/goxlr-desk.nsi"
     cp "$stage/ci/Output/"*.exe "$OUT/"
 }
 

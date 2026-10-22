@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<!-- The desktop app's page while it waits for GoXLR Desk (copied by ci/rebrand-ui-wrapper.sh).
+     Everything is inline: it shows before anything else is reachable. -->
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>GoXLR Desk</title>
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            background-color: #121618;
+            color: #f2f5f5;
+            font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        }
+
+        main {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 22px;
+        }
+
+        .name {
+            font-size: 44px;
+            line-height: 1;
+            letter-spacing: -.01em;
+        }
+
+        .name .device {
+            font-weight: 400;
+            color: #b7c1c2;
+        }
+
+        .name .product {
+            font-weight: 700;
+        }
+
+        .status {
+            margin: 0;
+            font-size: 15px;
+            color: #9aa6a8;
+        }
+
+        /* The sliders move up and down while loading */
+        .slider {
+            animation: slide 1.6s ease-in-out infinite alternate;
+        }
+
+        .slider:nth-of-type(2) { animation-delay: -.4s; }
+        .slider:nth-of-type(3) { animation-delay: -.8s; }
+        .slider:nth-of-type(4) { animation-delay: -1.2s; }
+
+        @keyframes slide {
+            from { transform: translateY(-5px); }
+            to { transform: translateY(5px); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .slider { animation: none; }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <svg width="128" height="128" viewBox="0 0 64 64" role="img" aria-label="GoXLR Desk">
+        <rect x="2" y="2" width="60" height="60" rx="14" fill="#0d1416" stroke="#22303a"/>
+        <g stroke="#34474b" stroke-width="3" stroke-linecap="round">
+            <line x1="17" y1="14" x2="17" y2="50"/>
+            <line x1="27" y1="14" x2="27" y2="50"/>
+            <line x1="37" y1="14" x2="37" y2="50"/>
+            <line x1="47" y1="14" x2="47" y2="50"/>
+        </g>
+        <g fill="#4cc3c6">
+            <rect class="slider" x="12" y="31" width="10" height="6" rx="2"/>
+            <rect class="slider" x="22" y="19" width="10" height="6" rx="2"/>
+            <rect class="slider" x="32" y="37" width="10" height="6" rx="2"/>
+            <rect class="slider" x="42" y="25" width="10" height="6" rx="2"/>
+        </g>
+    </svg>
+    <div class="name"><span class="device">GoXLR </span><span class="product">Desk</span></div>
+    <p class="status" id="status">Loading…</p>
+</main>
+<script>
+    if ((navigator.language || "").toLowerCase().startsWith("fr")) {
+        document.documentElement.lang = "fr";
+        document.getElementById("status").textContent = "Chargement…";
+    }
+</script>
+</body>
+</html>

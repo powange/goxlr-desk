@@ -23,11 +23,11 @@ pub async fn handle_tray(mut stop: Shutdown, tx: mpsc::Sender<EventTriggers>) ->
     let tmp_file_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute() && dir.is_dir())
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("goxlr-utility-{}", nix_uid())))
-        .join("goxlr-utility");
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("goxlr-desk-{}", nix_uid())))
+        .join("goxlr-desk");
 
     // Extract the icon to a temporary directory, and pass its path..
-    let tmp_file_path = tmp_file_dir.join("goxlr-utility-icon.png");
+    let tmp_file_path = tmp_file_dir.join("goxlr-desk-icon.png");
     if !tmp_file_dir.exists() {
         fs::create_dir_all(&tmp_file_dir)?;
     }
@@ -96,7 +96,7 @@ impl GoXLRTray {
 
 impl Tray for GoXLRTray {
     fn id(&self) -> String {
-        "goxlr-utility".to_string()
+        "goxlr-desk".to_string()
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -108,7 +108,7 @@ impl Tray for GoXLRTray {
     }
 
     fn title(&self) -> String {
-        String::from("GoXLR Utility")
+        String::from("GoXLR Desk")
     }
 
     fn status(&self) -> Status {
@@ -127,12 +127,12 @@ impl Tray for GoXLRTray {
         if let Some(file) = self.icon.file_stem() {
             return file.to_string_lossy().to_string();
         }
-        "goxlr-utility".to_string()
+        "goxlr-desk".to_string()
     }
 
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
-            title: String::from("GoXLR Utility"),
+            title: String::from("GoXLR Desk"),
             description: String::from("A Tool for Configuring a GoXLR"),
             ..Default::default()
         }

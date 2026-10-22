@@ -21,7 +21,7 @@ use winrt_toast_reborn::{Audio, Toast, ToastDuration, ToastManager};
 
 const GOXLR_APP_NAME: &str = "GoXLR App.exe";
 const GOXLR_BETA_APP_NAME: &str = "GoXLR Beta App.exe";
-const AUTOSTART_FILENAME: &str = "GoXLR Utility.lnk";
+const AUTOSTART_FILENAME: &str = "GoXLR Desk.lnk";
 
 static STARTUP_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(get_startup_dir);
 
@@ -40,7 +40,7 @@ pub fn perform_platform_preflight() -> Result<()> {
 
     if get_utility_count() > 1 {
         error!("Daemon Process already running, Failing Preflight");
-        bail!("The GoXLR Utility is already running, please stop it and try again.");
+        bail!("GoXLR Desk (or GoXLR Utility) is already running, please stop it and try again.");
     }
 
     Ok(())
@@ -50,7 +50,7 @@ pub fn display_error(message: String) {
     let message = HSTRING::from(message);
 
     unsafe {
-        MessageBoxW(None, &message, w!("GoXLR Utility"), MB_OK | MB_ICONERROR);
+        MessageBoxW(None, &message, w!("GoXLR Desk"), MB_OK | MB_ICONERROR);
     }
 }
 
@@ -141,8 +141,8 @@ fn throw_notification() {
     let manager = ToastManager::new(ToastManager::POWERSHELL_AUM_ID);
 
     let mut toast = Toast::new();
-    toast.text1("GoXLR Utility Daemon Terminated");
-    toast.text2("Please stop the official app before using the Utility");
+    toast.text1("GoXLR Desk Stopped");
+    toast.text2("Please stop the official app before using GoXLR Desk");
     toast.audio(Audio::new(Sound::SMS));
     toast.duration(ToastDuration::Short);
 
@@ -151,7 +151,7 @@ fn throw_notification() {
 
 // Autostart is a scheduled task run at logon: Windows runs the Startup folder's shortcuts minutes
 // after logon (5 to 6 measured), a logon task starts right away. The shortcut is the fallback.
-const AUTOSTART_TASK: &str = "GoXLR Utility";
+const AUTOSTART_TASK: &str = "GoXLR Desk";
 
 // No console window flashes when PowerShell or schtasks run
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -188,7 +188,7 @@ fn create_autostart_task() -> Result<()> {
          $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 4 \
            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew; \
          Register-ScheduledTask -TaskName '{task}' -Action $action -Trigger $trigger \
-           -Principal $principal -Settings $settings -Description 'Starts the GoXLR Utility at logon.' -Force | Out-Null",
+           -Principal $principal -Settings $settings -Description 'Starts GoXLR Desk at logon.' -Force | Out-Null",
         exe = quote(&executable),
         dir = quote(&directory),
         task = AUTOSTART_TASK,

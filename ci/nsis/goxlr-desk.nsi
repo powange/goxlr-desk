@@ -3,11 +3,11 @@ Unicode True
 
 ; Before we start, lets define some variables..
 !define /ifndef PRODUCT_VERSION "0.0.0"
-!define PRODUCT_NAME "GoXLR Utility"
-!define PRODUCT_PUBLISHER "The GoXLR on Linux Team"
-!define PRODUCT_WEBSITE "https://github.com/goxlr-on-linux/goxlr-utility/"
+!define PRODUCT_NAME "GoXLR Desk"
+!define PRODUCT_PUBLISHER "GoXLR Desk contributors"
+!define PRODUCT_WEBSITE "https://github.com/powange/goxlr-desk/"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
-!define PRODUCT_REGKEY "Software\GoXLR Utility"
+!define PRODUCT_REGKEY "Software\GoXLR Desk"
 
 ; Basic Modern User Interface 2 Setup..
 !include "MUI2.nsh"
@@ -16,8 +16,8 @@ Unicode True
 !include "x64.nsh"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "../../daemon/resources/goxlr-utility.ico"
-!define MUI_UNICON "../../daemon/resources/goxlr-utility.ico"
+!define MUI_ICON "../../daemon/resources/goxlr-desk.ico"
+!define MUI_UNICON "../../daemon/resources/goxlr-desk.ico"
 
 ; Perform the Initial Stuff..
 !define MUI_CUSTOMFUNCTION_GUIINIT DoInit
@@ -46,7 +46,7 @@ Var StartMenuFolder ;Start menu folder
 ; Ask for any 'Extras' after we're finished..
 Page custom PerformActions PerformActionsLeave
 
-; The next step is handling if the GoXLR Utility is already running..
+; The next step is handling if the GoXLR Desk is already running..
 Page custom IsUtilRunning
 
 ; Run the Install!
@@ -68,8 +68,8 @@ FunctionEnd
 
 ; -- UI End
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-OutFile "../Output/goxlr-utility-${PRODUCT_VERSION}.exe"
-InstallDir "$PROGRAMFILES64\GoXLR Utility"
+OutFile "../Output/goxlr-desk-${PRODUCT_VERSION}.exe"
+InstallDir "$PROGRAMFILES64\GoXLR Desk"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUnInstDetails show
@@ -80,7 +80,7 @@ ShowUnInstDetails show
 Function DoInit
 ${If} ${RunningX64}
 ${Else}
-    MessageBox MB_OK|MB_ICONSTOP  "The GoXLR Utility is only available on 64bit Systems"
+    MessageBox MB_OK|MB_ICONSTOP  "The GoXLR Desk is only available on 64bit Systems"
     Abort
 ${EndIf}
 
@@ -198,8 +198,8 @@ Var USE_APP
 !insertmacro GetRegKeys ""
 !insertmacro GetRegKeys "un."
 
-; The name of the logon task the Utility creates for autostart (daemon/src/platform/windows.rs)
-!define AUTOSTART_TASK "GoXLR Utility"
+; The name of the logon task GoXLR Desk creates for autostart (daemon/src/platform/windows.rs)
+!define AUTOSTART_TASK "GoXLR Desk"
 
 Function .onInit
     Call GetRegKeys
@@ -216,7 +216,7 @@ Function .onInit
     ${EndIf}
 
     ; Autostart: what's really in place (the logon task, or the Startup shortcut of earlier
-    ; versions), whatever was chosen at the last install; the Utility's own setting changes it.
+    ; versions), whatever was chosen at the last install; GoXLR Desk's own setting changes it.
     ; On a first install, on.
     StrCpy $AUTO_START 1
     ${If} $InstallDirSet == 1
@@ -227,7 +227,7 @@ Function .onInit
             StrCpy $AUTO_START 1
         ${EndIf}
         SetShellVarContext current
-        ${If} ${FileExists} "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+        ${If} ${FileExists} "$SMPROGRAMS\Startup\GoXLR Desk.lnk"
             StrCpy $AUTO_START 1
         ${EndIf}
     ${EndIf}
@@ -273,7 +273,7 @@ FunctionEnd
 
 Function IsUtilRunning
 ; The util spawns a window we can look for..
-FindWindow $0 "GoXLR Utility"
+FindWindow $0 "GoXLR Desk"
 StrCmp $0 0 STOP
     ReserveFile "running-warn.ini"
     !insertmacro MUI_HEADER_TEXT "Preparing to Install" "Setup is preparing to install ${PRODUCT_NAME} on your computer."
@@ -290,18 +290,18 @@ FunctionEnd
 Var count
 !macro StopUtility un
 Function ${un}StopUtility
-DetailPrint "Checking for GoXLR Utility.."
+DetailPrint "Checking for GoXLR Desk.."
 
-FindWindow $0 "GoXLR Utility"
+FindWindow $0 "GoXLR Desk"
 StrCmp $0 0 END
-DetailPrint "GoXLR Utility Found, attempting to stop.."
+DetailPrint "GoXLR Desk Found, attempting to stop.."
 
 ; Util is running, send it a WM_CLOSE signal..
 SendMessage $0 ${WM_CLOSE} 0 0
 StrCpy $count 0
 
 LOOP:
-FindWindow $0 "GoXLR Utility"
+FindWindow $0 "GoXLR Desk"
 StrCmp $0 0 ENDSLEEP
 Sleep 100
 IntOp $count $count + 1
@@ -321,30 +321,6 @@ FunctionEnd
 !insertmacro StopUtility ""
 !insertmacro StopUtility "un."
 
-Function CleanOldInstaller
-    ; Basically, if the util has previously been installed by the InnoSetup binary, call a silent
-    ; uninstall on it to remove the various traces of it.
-    ReadRegStr $0 HKLM64 "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\GoXLR Utility_is1\" "QuietUninstallString"
-    ${If} ${Errors}
-        Goto END
-    ${EndIf}
-    DetailPrint "Uninstalling Previous InnoSetup install.."
-    Exec $0
-
-    ; Wait for the uninstall key to go away..
-    Loop:
-    ReadRegStr $0 HKLM64 "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\GoXLR Utility_is1\" "QuietUninstallString"
-    ${If} ${Errors}
-        Goto ENDSLEEP
-    ${EndIf}
-    Sleep 100
-    Goto Loop
-
-    ENDSLEEP:
-    ; Just in case..
-    Sleep 2000
-    END:
-FunctionEnd
 
 Function InstallWebView
     DetailPrint "Installing Edge Webview"
@@ -380,7 +356,6 @@ FunctionEnd
 
 Section "MainSection" SEC01
     Call StopUtility
-    Call CleanOldInstaller
 
     ; Make sure the Visual C++ Runtime is installed (TODO: Only on first install)
     Call InstallVCRuntime
@@ -401,7 +376,7 @@ Section "MainSection" SEC01
     File "..\..\target\release\goxlr-client-quiet.exe"
     File "..\..\target\release\goxlr-defaults.exe"
     File "..\..\target\release\goxlr-launcher.exe"
-    File "..\..\target\release\goxlr-utility-ui.exe"
+    File "..\..\target\release\goxlr-desk-ui.exe"
     ; Screen readers (x64 only: on ARM, Windows' own voice is used, see the README)
     File "..\..\target\release\SAAPI64.dll"
     File "..\..\target\release\nvdaControllerClient64.dll"
@@ -410,29 +385,29 @@ Section "MainSection" SEC01
 
     SetShellVarContext all
     CreateDirectory "$SMPROGRAMS\$StartMenuFolder"
-    CreateShortCut "$SMPROGRAMS\$StartMenuFolder\GoXLR Utility.lnk" "$INSTDIR\goxlr-launcher.exe"
+    CreateShortCut "$SMPROGRAMS\$StartMenuFolder\GoXLR Desk.lnk" "$INSTDIR\goxlr-launcher.exe"
 
-    ; Autostart, for the current user. The Utility starts from a logon task; when there's none
-    ; yet, a Startup shortcut, which the Utility turns into the task on its first start. Never
+    ; Autostart, for the current user. GoXLR Desk starts from a logon task; when there's none
+    ; yet, a Startup shortcut, which GoXLR Desk turns into the task on its first start. Never
     ; both, or it would be started twice.
     SetShellVarContext current
     ${If} $AUTO_START == 1
         nsExec::Exec 'schtasks /Query /TN "${AUTOSTART_TASK}"'
         Pop $0
         ${If} $0 == 0
-            Delete "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+            Delete "$SMPROGRAMS\Startup\GoXLR Desk.lnk"
         ${Else}
-            CreateShortCut "$SMPROGRAMS\Startup\GoXLR Utility.lnk" "$INSTDIR\goxlr-daemon.exe"
+            CreateShortCut "$SMPROGRAMS\Startup\GoXLR Desk.lnk" "$INSTDIR\goxlr-daemon.exe"
         ${EndIf}
     ${Else}
-        Delete "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+        Delete "$SMPROGRAMS\Startup\GoXLR Desk.lnk"
         nsExec::Exec 'schtasks /Delete /TN "${AUTOSTART_TASK}" /F'
     ${EndIf}
 
     ${If} $USE_APP == 1
-        nsExec::Exec "$INSTDIR\goxlr-utility-ui.exe --install"
+        nsExec::Exec "$INSTDIR\goxlr-desk-ui.exe --install"
     ${Else}
-        nsExec::Exec "$INSTDIR\goxlr-utility-ui.exe --remove"
+        nsExec::Exec "$INSTDIR\goxlr-desk-ui.exe --remove"
     ${EndIf}
 SectionEnd
 
@@ -472,7 +447,7 @@ Section Uninstall
   Delete "$INSTDIR\goxlr-client-quiet.exe"
   Delete "$INSTDIR\goxlr-defaults.exe"
   Delete "$INSTDIR\goxlr-launcher.exe"
-  Delete "$INSTDIR\goxlr-utility-ui.exe"
+  Delete "$INSTDIR\goxlr-desk-ui.exe"
   Delete "$INSTDIR\SAAPI64.dll"
   Delete "$INSTDIR\nvdaControllerClient64.dll"
   Delete "$INSTDIR\LICENSE"
@@ -482,14 +457,14 @@ Section Uninstall
 
   ${If} $StartMenuPath != ""
       SetShellVarContext all
-      Delete "$SMPROGRAMS\$StartMenuPath\GoXLR Utility.lnk"
+      Delete "$SMPROGRAMS\$StartMenuPath\GoXLR Desk.lnk"
       RMDir "$SMPROGRAMS\$StartMenuPath"
   ${EndIf}
 
   ; Autostart: the logon task and the shortcut of earlier versions
   nsExec::Exec 'schtasks /Delete /TN "${AUTOSTART_TASK}" /F'
   SetShellVarContext current
-  Delete "$SMPROGRAMS\Startup\GoXLR Utility.lnk"
+  Delete "$SMPROGRAMS\Startup\GoXLR Desk.lnk"
 
   DeleteRegKey HKLM64 "${PRODUCT_UNINST_KEY}"
   DeleteRegKey HKLM64 "${PRODUCT_REGKEY}"

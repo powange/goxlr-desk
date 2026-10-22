@@ -84,7 +84,7 @@ pub async fn run(tx: mpsc::Sender<EventTriggers>, mut stop: Shutdown) -> Result<
 
     // We need to temporarily hold on these events, to allow us to load settings.
     let what = "sleep";
-    let who = "GoXLR Utility";
+    let who = "GoXLR Desk";
     let why = "Applying Sleep Settings";
     let mode = "delay";
 

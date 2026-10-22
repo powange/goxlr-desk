@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=GoXLR Utility
-Comment=A Tool for Configuring a GoXLR
+Name=GoXLR Desk
+Comment=Configure and control a GoXLR or GoXLR Mini
 Path=/usr/bin
 Exec=/usr/bin/goxlr-launcher
 Terminal=false
-Icon=goxlr-utility
+Icon=goxlr-desk
 Categories=Utility

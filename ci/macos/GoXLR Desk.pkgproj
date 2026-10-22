@@ -9,7 +9,7 @@
 			<array>
 				<dict>
 					<key>APPLICATION_ID</key>
-					<string>com.github.goxlr-on-linux.goxlr-utility</string>
+					<string>com.github.powange.goxlr-desk</string>
 					<key>STATE</key>
 					<true/>
 				</dict>
@@ -45,7 +45,7 @@
 									<key>GID</key>
 									<integer>80</integer>
 									<key>PATH</key>
-									<string>GoXLR Utility.app</string>
+									<string>GoXLR Desk.app</string>
 									<key>PATH_TYPE</key>
 									<integer>1</integer>
 									<key>PERMISSIONS</key>
@@ -506,11 +506,11 @@
 				<key>FOLLOW_SYMBOLIC_LINKS</key>
 				<false/>
 				<key>IDENTIFIER</key>
-				<string>com.github.goxlr-on-linux.goxlr-utility</string>
+				<string>com.github.powange.goxlr-desk</string>
 				<key>LOCATION</key>
 				<integer>0</integer>
 				<key>NAME</key>
-				<string>GoXLR Utility</string>
+				<string>GoXLR Desk</string>
 				<key>OVERWRITE_PERMISSIONS</key>
 				<false/>
 				<key>PAYLOAD_SIZE</key>
@@ -573,7 +573,7 @@
 													<key>GID</key>
 													<integer>80</integer>
 													<key>PATH</key>
-													<string>GoXLR Utility.app/Contents/MacOS/goxlr-initialiser</string>
+													<string>GoXLR Desk.app/Contents/MacOS/goxlr-initialiser</string>
 													<key>PATH_TYPE</key>
 													<integer>1</integer>
 													<key>PERMISSIONS</key>
@@ -587,7 +587,7 @@
 											<key>GID</key>
 											<integer>80</integer>
 											<key>PATH</key>
-											<string>com.github.goxlr-on-linux.goxlr-utility</string>
+											<string>com.github.powange.goxlr-desk</string>
 											<key>PATH_TYPE</key>
 											<integer>2</integer>
 											<key>PERMISSIONS</key>
@@ -764,7 +764,7 @@
 											<key>GID</key>
 											<integer>0</integer>
 											<key>PATH</key>
-											<string>plist/com.github.goxlr-on-linux.goxlr-utility.initialiser.full.plist</string>
+											<string>plist/com.github.powange.goxlr-desk.initialiser.full.plist</string>
 											<key>PATH_TYPE</key>
 											<integer>1</integer>
 											<key>PERMISSIONS</key>
@@ -780,7 +780,7 @@
 											<key>GID</key>
 											<integer>0</integer>
 											<key>PATH</key>
-											<string>plist/com.github.goxlr-on-linux.goxlr-utility.initialiser.mini.plist</string>
+											<string>plist/com.github.powange.goxlr-desk.initialiser.mini.plist</string>
 											<key>PATH_TYPE</key>
 											<integer>1</integer>
 											<key>PERMISSIONS</key>
@@ -1064,7 +1064,7 @@
 				<key>FOLLOW_SYMBOLIC_LINKS</key>
 				<false/>
 				<key>IDENTIFIER</key>
-				<string>com.github.goxlr-on-linux.goxlr-utility.goxlr-initialiser</string>
+				<string>com.github.powange.goxlr-desk.goxlr-initialiser</string>
 				<key>LOCATION</key>
 				<integer>0</integer>
 				<key>NAME</key>
@@ -1555,7 +1555,7 @@
 				<key>FOLLOW_SYMBOLIC_LINKS</key>
 				<false/>
 				<key>IDENTIFIER</key>
-				<string>com.frostycoolslug.goxlr-utility-ui</string>
+				<string>com.github.powange.goxlr-desk-ui</string>
 				<key>LOCATION</key>
 				<integer>0</integer>
 				<key>NAME</key>
@@ -1788,7 +1788,7 @@
 						<key>LANGUAGE</key>
 						<string>English</string>
 						<key>VALUE</key>
-						<string>GoXLR Utility</string>
+						<string>GoXLR Desk</string>
 					</dict>
 				</array>
 			</dict>
@@ -1989,7 +1989,7 @@
 				</dict>
 			</array>
 			<key>NAME</key>
-			<string>GoXLR Utility</string>
+			<string>GoXLR Desk</string>
 			<key>PAYLOAD_ONLY</key>
 			<false/>
 			<key>TREAT_MISSING_PRESENTATION_DOCUMENTS_AS_WARNING</key>

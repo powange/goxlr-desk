@@ -60,11 +60,12 @@ mod settings;
 mod shutdown;
 mod tray;
 mod tts;
+mod utility_import;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[allow(dead_code)]
-const ICON: &[u8] = include_bytes!("../resources/goxlr-utility-large.png");
+const ICON: &[u8] = include_bytes!("../resources/goxlr-desk-large.png");
 #[cfg(target_os = "macos")]
 const ICON_MAC: &[u8] = include_bytes!("../resources/icon.icns");
 
@@ -118,7 +119,7 @@ async fn main() -> Result<()> {
         }
 
         // Message is Cross-Platform now :)
-        let message = format!("Error Starting the GoXLR Utility:\r\n\r\n{e}");
+        let message = format!("Error Starting GoXLR Desk:\r\n\r\n{e}");
         platform::display_error(message);
 
         // Kill the process with an error to ensure the entire runtime is stopped
@@ -132,6 +133,8 @@ async fn run_utility() -> Result<()> {
     // We're just going to re-parse the args here, while we've technically done it above,
     // they get moved into the settings loader, which just causes headaches :D
     let args: Cli = Cli::parse();
+    // Before the settings are read: on a first start, GoXLR Utility's are copied
+    let imported = utility_import::import_from_goxlr_utility(&args.config);
     let settings = SettingsHandle::load(args.config).await?;
 
     // Set the MacOS Aggregate management..
@@ -213,6 +216,15 @@ async fn run_utility() -> Result<()> {
     // Enable the PANIC logger..
     log_panics::init();
 
+    match imported {
+        Ok(Some(done)) => info!("{}", done),
+        Ok(None) => {}
+        Err(e) => warn!(
+            "Unable to import GoXLR Utility's settings and files: {:#}",
+            e
+        ),
+    }
+
     // Report anything that went wrong while reading the settings (before logging was set up).
     if let Some(warning) = settings::take_load_warning() {
         warn!("{}", warning);
@@ -230,9 +242,9 @@ async fn run_utility() -> Result<()> {
     }
     if is_root() {
         if args.force_root {
-            error!("GoXLR Utility running as root, this is generally considered bad.");
+            error!("GoXLR Desk running as root, this is generally considered bad.");
         } else {
-            error!("The GoXLR Utility Daemon is not designed to be run as root, and should run");
+            error!("The GoXLR Desk daemon is not designed to be run as root, and should run");
             error!("as the current active user. If you're having problems with permissions,");
             error!("please consult the 'Permissions' section of the README. Running as root");
             error!("*WILL* cause issues with the sampler, and may pose a security risk.");
@@ -259,7 +271,7 @@ async fn run_utility() -> Result<()> {
         OVERRIDE_SAMPLER_OUTPUT.lock().unwrap().replace(device);
     }
 
-    info!("Starting GoXLR Daemon v{}", VERSION);
+    info!("Starting GoXLR Desk v{}", VERSION);
     info!("System Locale: {}", *SYSTEM_LOCALE);
 
     // Before we do anything, perform platform pre-flight to make

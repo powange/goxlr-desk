@@ -68,6 +68,12 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Where GoXLR Desk keeps its settings and files (GoXLR Utility's are imported once, see
+/// utility_import).
+pub fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("org", "GoXLR-Desk", "GoXLR-Desk")
+}
+
 /// Settings which stay with the computer when a backup is restored on it.
 const MACHINE_SETTINGS: &[&str] = &[
     "network_token",
@@ -117,8 +123,7 @@ impl AsRef<Path> for Paths {
 impl SettingsHandle {
     pub async fn load(path: PathBuf) -> Result<SettingsHandle> {
         // This is only used for defaults
-        let proj_dirs = ProjectDirs::from("org", "GoXLR-on-Linux", "GoXLR-Utility")
-            .context("Couldn't find project directories")?;
+        let proj_dirs = project_dirs().context("Couldn't find project directories")?;
         let data_dir = proj_dirs.data_dir();
 
         let mut settings = Settings::read(&path)?.unwrap_or_else(|| {

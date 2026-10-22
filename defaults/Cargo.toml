@@ -17,3 +17,7 @@ include_dir = { workspace = true }
 
 [lints]
 workspace = true
+
+[build-dependencies]
+# The Windows icon and version information (ci/windows_resource.rs)
+embed-resource = { workspace = true }
