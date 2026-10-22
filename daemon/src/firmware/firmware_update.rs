@@ -598,6 +598,8 @@ fn private_download_dir() -> Result<PathBuf> {
             "goxlr-firmware-{}-{stamp}-{attempt}",
             std::process::id()
         ));
+        // Only changed on Unix (the folder's permissions)
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

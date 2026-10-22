@@ -34,6 +34,10 @@ unused_must_use = "deny"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# Cargo.lock: speech-dispatcher-sys (Linux text to speech) accepts any bindgen from 0.54, and
+# generates wrong callback types with bindgen 0.58 (size_t as u64): it's locked to bindgen 0.72.1,
+# the version coreaudio-sys uses. A full `cargo update` may move it again; the Linux CI check
+# (--all-features) fails if so.
 [workspace.dependencies]
 log = "0.4.28"
 
