@@ -20,7 +20,8 @@ async fn main() -> Result<(), String> {
 
     // Devices which couldn't be checked or initialised, they make the run fail (a non-zero exit
     // code, so whatever launched us can tell)
-    #[allow(unused_mut, unused_assignments)]
+    // Unused on Windows, where the run stops straight away
+    #[allow(unused_mut, unused_assignments, unused_variables)]
     let mut failures = 0;
 
     #[cfg(windows)]
