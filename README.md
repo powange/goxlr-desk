@@ -8,6 +8,8 @@
 GoXLR Desk configures and controls a TC-Helicon GoXLR or GoXLR Mini from Windows, Linux or macOS: profiles,
 routing, effects, sampler. Unofficial and open source.
 
+Website: [powange.github.io/goxlr-desk](https://powange.github.io/goxlr-desk/)
+
 > **A fork of GoXLR Utility.** GoXLR Desk is derived from [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility),
 > made by the GoXLR on Linux team (Nathan Adams, Craig McLure and contributors), and keeps its MIT licence. It is a
 > separate project, not supported by them: please report GoXLR Desk issues [here](https://github.com/powange/goxlr-desk/issues),

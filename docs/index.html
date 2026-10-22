@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoXLR Desk</title>
+<meta name="description" content="GoXLR Desk configures and controls a TC-Helicon GoXLR or GoXLR Mini from Windows, Linux or macOS. Unofficial and open source, a fork of GoXLR Utility.">
+<meta property="og:title" content="GoXLR Desk">
+<meta property="og:description" content="Configure and control your GoXLR from Windows, Linux or macOS. Unofficial and open source.">
+<meta property="og:image" content="https://powange.github.io/goxlr-desk/banner.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root {
+  --bg: #121618;
+  --panel: #1a2023;
+  --raised: #20282b;
+  --line: #2c3539;
+  --text: #e3e8e8;
+  --strong: #f2f5f5;
+  --muted: #9aa6a8;
+  --soft: #b7c1c2;
+  --accent: #4cc3c6;
+  --accent-ink: #0b1314;
+  --tile: #0d1416;
+  --rail: #34474b;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f8f8;
+    --panel: #ffffff;
+    --raised: #eef3f3;
+    --line: #d5e0e0;
+    --text: #1b2124;
+    --strong: #0f1416;
+    --muted: #5d686c;
+    --soft: #5d686c;
+    --accent: #0b7f84;
+    --accent-ink: #ffffff;
+  }
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Barlow, "Segoe UI", system-ui, sans-serif;
+  font-size: 18px;
+  line-height: 1.55;
+}
+a { color: var(--accent); }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+code, .mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; font-size: .86em; }
+.wrap { width: min(1120px, 100% - 32px); margin-inline: auto; }
+
+/* Header */
+.top { border-bottom: 1px solid var(--line); }
+.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 14px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 12px; text-decoration: none; color: var(--strong); }
+.wordmark { font-family: "Barlow Condensed", sans-serif; font-size: 28px; line-height: 1; }
+.wordmark .device { font-weight: 500; color: var(--soft); }
+.wordmark .product { font-weight: 700; }
+.top nav { display: flex; gap: 20px; flex-wrap: wrap; font-size: 16px; }
+.top nav a { color: var(--soft); text-decoration: none; }
+.top nav a:hover { color: var(--strong); }
+
+/* Hero */
+.hero { padding-block: 72px 48px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 40px; align-items: center; }
+.hero h1 { margin: 0 0 16px; font-family: "Barlow Condensed", sans-serif; font-size: clamp(56px, 9vw, 104px); line-height: .92; color: var(--strong); }
+.hero h1 .device { font-weight: 500; color: var(--soft); }
+.hero p.lede { margin: 0 0 28px; font-size: clamp(20px, 2.4vw, 25px); color: var(--text); max-width: 34ch; }
+.actions { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+.button { display: inline-flex; align-items: center; gap: 10px; padding: 13px 22px; border-radius: 10px; font-weight: 600; text-decoration: none; font-size: 17px; }
+.button.primary { background: var(--accent); color: var(--accent-ink); }
+.button.primary:hover { filter: brightness(1.08); }
+.button.ghost { border: 1px solid var(--line); color: var(--strong); }
+.button.ghost:hover { border-color: var(--accent); }
+.note { margin-top: 18px; font-size: 15px; color: var(--muted); }
+.hero-logo { width: 220px; height: 220px; }
+.slider { animation: slide 1.8s ease-in-out infinite alternate; }
+.slider:nth-of-type(2) { animation-delay: -.45s; }
+.slider:nth-of-type(3) { animation-delay: -.9s; }
+.slider:nth-of-type(4) { animation-delay: -1.35s; }
+@keyframes slide { from { transform: translateY(-5px); } to { transform: translateY(5px); } }
+@media (prefers-reduced-motion: reduce) { .slider { animation: none; } }
+
+/* Fork notice */
+.fork { display: flex; gap: 16px; align-items: flex-start; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; }
+.fork svg { flex: none; color: var(--accent); margin-top: 3px; }
+.fork p { margin: 0; }
+.fork strong { color: var(--strong); }
+
+/* Screenshot */
+.shot { margin: 48px 0 0; }
+.shot img { display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--line); box-shadow: 0 24px 60px rgba(0, 0, 0, .35); }
+.shot figcaption { margin-top: 10px; font-size: 15px; color: var(--muted); text-align: center; }
+
+/* Sections */
+section { padding-block: 72px 0; }
+h2 { margin: 0 0 10px; font-family: "Barlow Condensed", sans-serif; font-weight: 700; font-size: clamp(36px, 5vw, 48px); line-height: 1; color: var(--strong); }
+.section-lede { margin: 0 0 32px; color: var(--soft); max-width: 62ch; }
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+.card h3 { margin: 12px 0 6px; font-size: 19px; font-weight: 600; color: var(--strong); }
+.card p { margin: 0; font-size: 16px; color: var(--soft); }
+.card svg { color: var(--accent); }
+
+/* Install */
+.platforms { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.platform h3 { margin: 0 0 8px; font-size: 21px; color: var(--strong); }
+.platform ul { margin: 0; padding-left: 20px; font-size: 16px; color: var(--soft); }
+.platform li + li { margin-top: 6px; }
+
+/* Integrations */
+.links { display: flex; flex-wrap: wrap; gap: 10px; padding: 0; margin: 0; list-style: none; }
+.links a { display: inline-block; padding: 8px 14px; border: 1px solid var(--line); border-radius: 999px; text-decoration: none; color: var(--text); font-size: 16px; }
+.links a:hover { border-color: var(--accent); color: var(--strong); }
+
+/* Footer */
+footer { margin-top: 88px; border-top: 1px solid var(--line); padding-block: 32px 48px; font-size: 15px; color: var(--muted); }
+footer .wrap { display: grid; gap: 10px; }
+footer p { margin: 0; max-width: 90ch; }
+
+@media (max-width: 860px) {
+  .hero { grid-template-columns: 1fr; padding-top: 48px; }
+  .hero-logo { width: 140px; height: 140px; order: -1; }
+  .grid, .platforms { grid-template-columns: 1fr; }
+}
+@media (min-width: 861px) and (max-width: 1040px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg width="40" height="40" viewBox="0 0 64 64" aria-hidden="true"><rect x="2" y="2" width="60" height="60" rx="14" fill="#0d1416" stroke="#22303a"/><g stroke="#34474b" stroke-width="3.5" stroke-linecap="round"><line x1="17" y1="14" x2="17" y2="50"/><line x1="27" y1="14" x2="27" y2="50"/><line x1="37" y1="14" x2="37" y2="50"/><line x1="47" y1="14" x2="47" y2="50"/></g><g fill="#4cc3c6"><rect x="12" y="31" width="10" height="7" rx="2"/><rect x="22" y="19" width="10" height="7" rx="2"/><rect x="32" y="37" width="10" height="7" rx="2"/><rect x="42" y="25" width="10" height="7" rx="2"/></g></svg>
+      <span class="wordmark"><span class="device">GoXLR </span><span class="product">Desk</span></span>
+    </a>
+    <nav aria-label="Sections">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#integrations">Integrations</a>
+      <a href="https://github.com/powange/goxlr-desk">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <div>
+      <h1><span class="device">GoXLR </span>Desk</h1>
+      <p class="lede">Configure and control your GoXLR or GoXLR Mini from Windows, Linux or macOS.</p>
+      <div class="actions">
+        <a class="button primary" href="https://github.com/powange/goxlr-desk/releases/latest">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+          Download
+        </a>
+        <a class="button ghost" href="https://github.com/powange/goxlr-desk">Source code</a>
+      </div>
+      <p class="note">Free, open source (MIT) and unofficial.</p>
+    </div>
+    <svg class="hero-logo" viewBox="0 0 64 64" role="img" aria-label="GoXLR Desk logo">
+      <rect x="2" y="2" width="60" height="60" rx="14" fill="#0d1416" stroke="#22303a"/>
+      <g stroke="#34474b" stroke-width="3" stroke-linecap="round"><line x1="17" y1="14" x2="17" y2="50"/><line x1="27" y1="14" x2="27" y2="50"/><line x1="37" y1="14" x2="37" y2="50"/><line x1="47" y1="14" x2="47" y2="50"/></g>
+      <g fill="#4cc3c6"><rect class="slider" x="12" y="31" width="10" height="6" rx="2"/><rect class="slider" x="22" y="19" width="10" height="6" rx="2"/><rect class="slider" x="32" y="37" width="10" height="6" rx="2"/><rect class="slider" x="42" y="25" width="10" height="6" rx="2"/></g>
+    </svg>
+  </div>
+
+  <div class="fork">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2.5"/><circle cx="18" cy="5" r="2.5"/><circle cx="12" cy="19" r="2.5"/><path d="M6 7.5v1.5a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7.5"/><path d="M12 12v4.5"/></svg>
+    <p><strong>A fork of GoXLR Utility.</strong> GoXLR Desk is derived from <a href="https://github.com/GoXLR-on-Linux/goxlr-utility">GoXLR Utility</a>, made by the GoXLR on Linux team, and keeps its MIT licence. It is a separate project with a redesigned interface, sample management, scenes, backups and many fixes. Please report GoXLR Desk issues <a href="https://github.com/powange/goxlr-desk/issues">on its own repository</a>, not to GoXLR Utility.</p>
+  </div>
+
+  <figure class="shot">
+    <img src="screenshot.png" width="1440" height="900" alt="The GoXLR Desk interface on the Mixer page: a drawing of the GoXLR, scenes, and the four channels with their faders.">
+    <figcaption>The Mixer page. Every page follows the device: mixer, microphone, effects, sampler, routing.</figcaption>
+  </figure>
+
+  <section id="features" aria-labelledby="features-title">
+    <h2 id="features-title">Everything the GoXLR does, on your computer</h2>
+    <p class="section-lede">Full control of the GoXLR and GoXLR Mini, compatible with the profiles of the official app.</p>
+    <div class="grid">
+      <div class="card">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 3v18M12 3v18M19 3v18"/><path d="M3 8h4M10 15h4M17 10h4"/></svg>
+        <h3>Mixer and routing</h3>
+        <p>Volumes, mutes, faders, submixes and the full input and output routing matrix.</p>
+      </div>
+      <div class="card">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+        <h3>Microphone and effects</h3>
+        <p>Gate, compressor, equaliser, de-esser, and the reverb, echo, pitch, gender, megaphone, robot and hard tune effects.</p>
+      </div>
+      <div class="card">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h2l2-6 3 12 3-9 2 5h6"/></svg>
+        <h3>Sampler and sample library</h3>
+        <p>Browse, preview, trim, move and restore samples, drop them on the buttons, and record from before you press.</p>
+      </div>
+      <div class="card">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="M4 9h16M9 20V9"/></svg>
+        <h3>Profiles, scenes and undo</h3>
+        <p>Load and save profiles, switch scenes in one click, undo a change, and back up your settings.</p>
+      </div>
+      <div class="card">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="13" height="10" rx="2"/><rect x="15" y="10" width="6" height="10" rx="1.5"/><path d="M7 18h5"/></svg>
+        <h3>From any device</h3>
+        <p>Open the interface from a phone or another computer on your network, with an access link.</p>
+      </div>
+      <div class="card">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M13 6l-2 12"/></svg>
+        <h3>Scripts and automation</h3>
+        <p>An HTTP and WebSocket API and a command line client, for Stream Deck, OBS and your own scripts.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" aria-labelledby="install-title">
+    <h2 id="install-title">Install</h2>
+    <p class="section-lede">Get the file for your system from the <a href="https://github.com/powange/goxlr-desk/releases/latest">latest release</a>.</p>
+    <div class="platforms">
+      <div class="card platform">
+        <h3>Windows</h3>
+        <ul>
+          <li>The <code>.exe</code> installer, for x64 or ARM.</li>
+          <li>Needs TC-Helicon's GoXLR driver, installed with the official app.</li>
+          <li>The installer isn't signed yet: Windows may ask for confirmation (More info, Run anyway).</li>
+        </ul>
+      </div>
+      <div class="card platform">
+        <h3>Linux</h3>
+        <ul>
+          <li><code>.deb</code> for Debian 12+, Ubuntu 22.04+ and their derivatives.</li>
+          <li><code>.rpm</code> for Fedora and openSUSE.</li>
+          <li>The interface opens in your web browser.</li>
+        </ul>
+      </div>
+      <div class="card platform">
+        <h3>Coming from GoXLR Utility</h3>
+        <ul>
+          <li>GoXLR Desk installs next to it, with its own settings.</li>
+          <li>On its first start, it copies your profiles, samples and settings, once.</li>
+          <li>Only one of the two can control the GoXLR at a time.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="integrations" aria-labelledby="integrations-title">
+    <h2 id="integrations-title">Integrations</h2>
+    <p class="section-lede">Tools made for GoXLR Utility use the same API and work with GoXLR Desk.</p>
+    <ul class="links">
+      <li><a href="https://github.com/FrostyCoolSlug/goxlr-utility-streamdeck">Stream Deck</a></li>
+      <li><a href="https://github.com/parzival-space/obs-goxlr-fader-sync-plugin">OBS Fader Sync</a></li>
+      <li><a href="https://twitchat.fr/">twitchat</a></li>
+      <li><a href="https://www.macrograph.app/">MacroGraph</a></li>
+      <li><a href="https://github.com/timmo001/homeassistant-integration-goxlr-utility">Home Assistant</a></li>
+    </ul>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>GoXLR Desk is free software under the MIT licence, derived from GoXLR Utility. <a href="https://github.com/powange/goxlr-desk">Source code</a> · <a href="https://github.com/powange/goxlr-desk/issues">Issues</a> · <a href="https://github.com/powange/goxlr-desk/blob/main/LICENSE">Licence</a></p>
+    <p>Not supported by, or affiliated in any way with, TC-Helicon, nor with the GoXLR Utility project. GoXLR is a trademark of TC-Helicon, used here only to say which device this software works with.</p>
+  </div>
+</footer>
+
+</body>
+</html>
